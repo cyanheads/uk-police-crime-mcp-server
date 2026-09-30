@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "uk-police-crime-mcp-server",
+  "version": "0.1.0",
+  "description": "UK street-level crime, outcomes, and stop-and-search data for police forces in England, Wales, and Northern Ireland, plus neighbourhood teams and priorities.",
+  "author": {
+    "name": "cyanheads",
+    "email": "casey@caseyjhand.com",
+    "url": "https://github.com/cyanheads"
+  },
+  "homepage": "https://github.com/cyanheads/uk-police-crime-mcp-server",
+  "repository": "https://github.com/cyanheads/uk-police-crime-mcp-server",
+  "license": "Apache-2.0",
+  "keywords": [
+    "mcp",
+    "mcp-server",
+    "model-context-protocol",
+    "uk",
+    "police",
+    "crime",
+    "stop-and-search",
+    "open-data",
+    "geospatial"
+  ],
+  "mcpServers": {
+    "uk-police-crime-mcp-server": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@cyanheads/uk-police-crime-mcp-server"
+      ],
+      "env": {
+        "MCP_TRANSPORT_TYPE": "stdio"
+      }
+    }
+  }
+}

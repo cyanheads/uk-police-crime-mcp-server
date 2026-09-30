@@ -1,0 +1,37 @@
+{
+  "name": "uk-police-crime-mcp-server",
+  "version": "0.1.0",
+  "description": "UK street-level crime, outcomes, and stop-and-search data for police forces in England, Wales, and Northern Ireland, plus neighbourhood teams and priorities.",
+  "author": {
+    "name": "cyanheads",
+    "email": "casey@caseyjhand.com",
+    "url": "https://github.com/cyanheads"
+  },
+  "homepage": "https://github.com/cyanheads/uk-police-crime-mcp-server",
+  "repository": "https://github.com/cyanheads/uk-police-crime-mcp-server",
+  "license": "Apache-2.0",
+  "keywords": [
+    "mcp",
+    "mcp-server",
+    "model-context-protocol",
+    "uk",
+    "police",
+    "crime",
+    "stop-and-search",
+    "open-data",
+    "geospatial"
+  ],
+  "mcpServers": "./.codex-plugin/mcp.json",
+  "interface": {
+    "displayName": "uk-police-crime-mcp-server",
+    "shortDescription": "UK street-level crime, outcomes, and stop-and-search data",
+    "longDescription": "Query data.police.uk for monthly street-level crimes by point or polygon, the outcome trail for each case, and stop-and-search records with ethnicity, legislation, object of search, and outcome. Resolve a coordinate to its force and neighbourhood policing team, including boundary, contact details, and current priorities. Covers the 43 forces of England and Wales plus the Police Service of Northern Ireland, with the API's location anonymisation and per-month publication gaps carried in each response. No API key required.",
+    "developerName": "cyanheads",
+    "category": "Research",
+    "capabilities": [
+      "Read"
+    ],
+    "websiteURL": "https://github.com/cyanheads/uk-police-crime-mcp-server",
+    "defaultPrompt": []
+  }
+}

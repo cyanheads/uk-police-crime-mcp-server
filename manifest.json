@@ -1,0 +1,35 @@
+{
+  "manifest_version": "0.3",
+  "name": "uk-police-crime-mcp-server",
+  "version": "0.1.0",
+  "description": "UK street-level crime, outcomes, and stop-and-search data for police forces in England, Wales, and Northern Ireland, plus neighbourhood teams and priorities.",
+  "author": {
+    "name": "cyanheads"
+  },
+  "server": {
+    "type": "node",
+    "entry_point": "dist/index.js",
+    "mcp_config": {
+      "command": "node",
+      "args": ["${__dirname}/dist/index.js"],
+      "env": {
+        "MCP_TRANSPORT_TYPE": "stdio",
+        "MCP_AUTH_MODE": "none",
+        "NODE_ENV": "production"
+      }
+    }
+  },
+  "compatibility": {
+    "runtimes": {
+      "node": ">=24.0.0"
+    }
+  },
+  "tools_generated": true,
+  "prompts_generated": true,
+  "user_config": {},
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/cyanheads/uk-police-crime-mcp-server"
+  }
+}

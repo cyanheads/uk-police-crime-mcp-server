@@ -1,0 +1,9 @@
+{
+  "uk-police-crime-mcp-server": {
+    "command": "npx",
+    "args": ["-y", "@cyanheads/uk-police-crime-mcp-server"],
+    "env": {
+      "MCP_TRANSPORT_TYPE": "stdio"
+    }
+  }
+}
