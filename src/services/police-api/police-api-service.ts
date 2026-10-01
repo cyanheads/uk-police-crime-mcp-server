@@ -72,8 +72,10 @@ const CALL_BUDGET_MS = 50_000;
 const SERVICE_CALL_DEADLINE_MS = 45_000;
 /** One attempt's ceiling; the slowest successful call observed took 17.3 s. */
 const ATTEMPT_TIMEOUT_MS = 30_000;
-/** Longest a request waits in the pacer queue before it is shed. */
+/** Longest a request waits in the pacer queue before it is shed; an area request's wait for an area slot counts toward it. */
 const PACER_MAX_WAIT_MS = 20_000;
+/** In-flight slots area requests may hold, of the pacer's four, so cheap reads always have one. */
+const AREA_SLOTS = 3;
 /** Decoded body ceiling; the largest body observed is 8.3 MB (a Metropolitan stop-and-search month). */
 const MAX_BODY_BYTES = 32 * 1024 * 1024;
 /** `/crime-last-updated` is re-read at most this often when a month newer than the cache is asked for. */
@@ -221,13 +223,16 @@ async function areaCacheKey(
 
 /**
  * data.police.uk client. One instance per process: the pacer enforces the
- * upstream's per-IP limit (15 requests/s, burst 30) across every caller, and the
- * caches hold public data shared by every caller and tenant.
+ * upstream's per-IP limit (15 requests/s, burst 30) across every caller, area
+ * requests hold at most three of its four slots, and the caches hold public data
+ * shared by every caller and tenant.
  */
 export class PoliceApiService {
   private readonly fetchFn: PoliceApiServiceOptions['fetch'];
   private readonly now: () => number;
   private readonly pacer: Pacer;
+  /** Admits area requests to {@link pacer} at most {@link AREA_SLOTS} at a time. */
+  private readonly areaGate: Pacer;
   private lastRecheckAt = Number.NEGATIVE_INFINITY;
 
   private readonly availabilityCache: LruCache<Availability>;
@@ -237,6 +242,7 @@ export class PoliceApiService {
   private readonly neighbourhoodsCache: LruCache<Lookup<readonly Neighbourhood[]>>;
   private readonly boundaryCache: LruCache<Lookup<readonly MapPoint[]>>;
   private readonly locateCache: LruCache<Lookup<LocatedNeighbourhood>>;
+  private readonly crimeHistoryMissCache: LruCache<Miss>;
   private readonly areaCache: LruCache<readonly unknown[]>;
 
   constructor(options: PoliceApiServiceOptions) {
@@ -250,6 +256,11 @@ export class PoliceApiService {
       maxQueueDepth: 200,
       cooldown: { baseMs: 1000, maxMs: 15_000 },
     });
+    this.areaGate = createPacer({
+      name: 'data-police-uk-area',
+      maxConcurrent: AREA_SLOTS,
+      maxQueueDepth: 200,
+    });
     this.availabilityCache = new LruCache({ capacity: 1, ttlMs: HOUR_MS, now });
     this.forcesCache = new LruCache({ capacity: 1, ttlMs: DAY_MS, now });
     this.categoriesCache = new LruCache({ capacity: 1, ttlMs: DAY_MS, now });
@@ -257,6 +268,7 @@ export class PoliceApiService {
     this.neighbourhoodsCache = new LruCache({ capacity: 45, ttlMs: DAY_MS, now });
     this.boundaryCache = new LruCache({ capacity: 64, ttlMs: DAY_MS, now });
     this.locateCache = new LruCache({ capacity: 10_000, ttlMs: DAY_MS, now });
+    this.crimeHistoryMissCache = new LruCache({ capacity: 10_000, ttlMs: 15 * MINUTE_MS, now });
     this.areaCache = new LruCache({
       capacity: AREA_CACHE_CAPACITY,
       maxEntryWeight: AREA_CACHE_CAPACITY / 2,
@@ -270,8 +282,9 @@ export class PoliceApiService {
     return { deadlineAt: this.now() + CALL_BUDGET_MS };
   }
 
-  /** Releases the pacer: clears its timer and rejects queued requests. Wired to `createApp({ teardown })`. */
+  /** Releases both pacers: clears their timers and rejects queued requests. Wired to `createApp({ teardown })`. */
   dispose(): void {
+    this.areaGate.dispose();
     this.pacer.dispose();
   }
 
@@ -544,21 +557,25 @@ export class PoliceApiService {
   /**
    * `/outcomes-for-crime/{persistent_id}` — the crime data.police.uk holds for
    * the id and its outcomes in date order (`null` when it publishes none). 404
-   * (unknown or upper-cased id) → miss. Not cached.
+   * (unknown or upper-cased id) → miss, cached 15 min in an LRU capped at
+   * 10,000 ids; a found history is not cached.
    */
   async getCrimeHistory(
     persistentId: string,
     ctx: Context,
     budget: CallBudget,
   ): Promise<Lookup<CrimeHistory>> {
+    if (this.crimeHistoryMissCache.get(persistentId)) return MISS;
     const path = `/outcomes-for-crime/${encodeURIComponent(persistentId)}`;
     const answer = await this.send({ path, notFoundIsMiss: true }, ctx, budget);
-    return answer.kind === 'ok'
-      ? {
-          kind: 'found',
-          value: normalizeCrimeHistory(parseUpstream(RawCrimeHistory, answer.json, path)),
-        }
-      : MISS;
+    if (answer.kind === 'miss') {
+      this.crimeHistoryMissCache.set(persistentId, MISS);
+      return MISS;
+    }
+    return {
+      kind: 'found',
+      value: normalizeCrimeHistory(parseUpstream(RawCrimeHistory, answer.json, path)),
+    };
   }
 
   /**
@@ -698,7 +715,9 @@ export class PoliceApiService {
 
   /**
    * Sends one request: retry outside, pacer inside, status handling, the capped
-   * read and the JSON parse inside each attempt. The retry deadline is
+   * read and the JSON parse inside each attempt. An area request first waits for
+   * one of the {@link AREA_SLOTS} area slots, and that wait comes out of the same
+   * 20 s it may then wait for a pacer slot. The retry deadline is
    * `min(45 s, what remains of the call budget)`.
    */
   private send(
@@ -720,12 +739,21 @@ export class PoliceApiService {
       });
     }
     return await withRetry(
-      ({ signal, remainingMs: attemptBudgetMs }) =>
-        this.pacer.run(
-          (runSignal) =>
-            this.attempt(request, runSignal, Math.min(ATTEMPT_TIMEOUT_MS, attemptBudgetMs), ctx),
+      ({ signal, remainingMs: attemptBudgetMs }) => {
+        const paced = (pacedSignal: AbortSignal, maxWaitMs: number) =>
+          this.pacer.run(
+            (runSignal) =>
+              this.attempt(request, runSignal, Math.min(ATTEMPT_TIMEOUT_MS, attemptBudgetMs), ctx),
+            { signal: pacedSignal, maxWaitMs },
+          );
+        if (!request.area) return paced(signal, PACER_MAX_WAIT_MS);
+        const queuedAt = this.now();
+        return this.areaGate.run(
+          (gateSignal) =>
+            paced(gateSignal, Math.max(0, PACER_MAX_WAIT_MS - (this.now() - queuedAt))),
           { signal, maxWaitMs: PACER_MAX_WAIT_MS },
-        ),
+        );
+      },
       {
         maxRetries: 2,
         baseDelayMs: 1000,
@@ -771,7 +799,11 @@ export class PoliceApiService {
     }
   }
 
-  /** The URL and init for a request: GET carries params in the query, POST as a form body. */
+  /**
+   * The URL and init for a request: GET carries params in the query, POST as a
+   * form body. Redirects are returned, not followed, so every request stays on
+   * data.police.uk; {@link readAnswer} refuses them.
+   */
   private buildRequest(request: UpstreamRequest, signal: AbortSignal): [string, RequestInit] {
     const params = new URLSearchParams(request.params);
     const url = `${BASE_URL}${request.path}`;
@@ -785,6 +817,7 @@ export class PoliceApiService {
             'content-type': 'application/x-www-form-urlencoded',
           },
           body: params.toString(),
+          redirect: 'manual',
           signal,
         },
       ];
@@ -792,7 +825,7 @@ export class PoliceApiService {
     const query = params.toString();
     return [
       query ? `${url}?${query}` : url,
-      { method: 'GET', headers: { accept: 'application/json' }, signal },
+      { method: 'GET', headers: { accept: 'application/json' }, redirect: 'manual', signal },
     ];
   }
 
@@ -825,14 +858,23 @@ export class PoliceApiService {
         );
       }
     }
-    if ((status === 404 && request.notFoundIsMiss) || (status === 503 && request.area)) {
-      await response.body?.cancel();
-      return status === 404 ? MISS : { kind: 'overloaded' };
+    // Any other status is answered from the status code: its body is never read.
+    await response.body?.cancel();
+    if (status === 404 && request.notFoundIsMiss) return MISS;
+    if (status === 503 && request.area) return { kind: 'overloaded' };
+    if (status >= 300 && status < 400) {
+      throw serviceUnavailable(
+        `data.police.uk answered HTTP ${status}, a redirect this server does not follow.`,
+        { reason: 'unexpected_redirect', status, retryable: false },
+      );
     }
-    const error = await httpErrorFromResponse(response, {
+    // The framework classifies the status; the message is rebuilt so its reason phrase never reaches a caller.
+    const { code, data } = await httpErrorFromResponse(response, {
       service: 'data.police.uk',
-      bodyLimit: 300,
+      captureBody: false,
     });
+    const { statusText: _reasonPhrase, ...fields } = data ?? {};
+    const error = new McpError(code, `data.police.uk returned HTTP ${status}.`, fields);
     if (status === 400) {
       ctx.log.error('data.police.uk rejected a request this server built (HTTP 400)', error, {
         path: request.path,

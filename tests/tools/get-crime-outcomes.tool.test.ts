@@ -3,8 +3,9 @@
  * production parse of output extended with enrichment): input preprocessing
  * (strings split on commas and whitespace, lower-cased, blanks and repeats
  * dropped, cut at 26), the `persistent_id` alias, per-id isolation (404 is a
- * result, other failures are results, an all-ids failure rethrows the first, an
- * aborted signal throws), `outcomes: null`, request pacing, the enrichment
+ * result, other failures are results, an all-ids failure fails with the first
+ * one's class in server-written text, an aborted signal throws), `outcomes:
+ * null`, request pacing (four lookups per call, misses cached), the enrichment
  * fields on the zero-result page and the under-cap page, and `format()`
  * carrying the same data as `structuredContent` with upstream text kept inert.
  * @module tests/tools/get-crime-outcomes.tool.test
@@ -17,9 +18,10 @@ import {
   type MockContextLogger,
   runToolContract,
 } from '@cyanheads/mcp-ts-core/testing';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import type { z } from 'zod';
 import { getCrimeOutcomesTool } from '@/mcp-server/tools/definitions/get-crime-outcomes.tool.js';
+import { listReferenceTool } from '@/mcp-server/tools/definitions/list-reference.tool.js';
 import { ATTRIBUTION } from '@/mcp-server/tools/shared-schemas.js';
 import {
   emptyNotFound,
@@ -507,7 +509,49 @@ describe('ukcrime_get_crime_outcomes', () => {
     });
   });
 
-  describe('every id failing rethrows the first failure', () => {
+  describe('every id failing fails the call with the first failure', () => {
+    it.each<[string, Responder, number, Record<string, unknown>, string]>([
+      [
+        'a 502 carrying a reason phrase and a body',
+        () =>
+          new Response('upstream-body-text', {
+            status: 502,
+            statusText: 'Ask upstream-status-text',
+          }),
+        JsonRpcErrorCode.ServiceUnavailable,
+        {},
+        'data.police.uk is not answering (HTTP 502).',
+      ],
+      [
+        'a 429 with Retry-After',
+        rateLimited('60'),
+        JsonRpcErrorCode.RateLimited,
+        { retryAfter: '60' },
+        'data.police.uk rate-limited the lookup. Retry after 60 s.',
+      ],
+      [
+        'a body of the wrong shape',
+        jsonOk({ nope: true }),
+        JsonRpcErrorCode.ServiceUnavailable,
+        { reason: 'unexpected_response', retryable: false },
+        'data.police.uk answered in an unexpected shape.',
+      ],
+    ])(
+      'fails with server-written text for %s, keeping the code, reason, retryable and Retry-After',
+      async (_name, responder, code, fields, message) => {
+        h.upstream.route('GET', pathOf(A), responder);
+        const result = await call({ persistent_ids: [A] });
+        const error = errorOf(result);
+        expect(error.code).toBe(code);
+        expect(error.message).toBe(message);
+        expect(error.data).toMatchObject(fields);
+        const json = JSON.stringify(result);
+        expect(json).not.toContain('upstream-status-text');
+        expect(json).not.toContain('upstream-body-text');
+        expect(json).not.toContain('attempt');
+      },
+    );
+
     it.each<[string, Responder, number]>([
       ['a persistent 500', status(500), JsonRpcErrorCode.ServiceUnavailable],
       ['a 429', rateLimited('60'), JsonRpcErrorCode.RateLimited],
@@ -639,6 +683,47 @@ describe('ukcrime_get_crime_outcomes', () => {
       await call({ persistent_ids: [A] });
       await call({ persistent_ids: [A] });
       expect(h.upstream.count(pathOf(A))).toBe(2);
+    });
+
+    it('caches a miss for 15 minutes: two calls for the same unknown id ask upstream once', async () => {
+      h.upstream.route('GET', pathOf(A), plainNotFound);
+      expect(data(await call({ persistent_ids: [A] })).not_found).toEqual([A]);
+      expect(data(await call({ persistent_ids: [A] })).not_found).toEqual([A]);
+      expect(h.upstream.count(pathOf(A))).toBe(1);
+      await vi.advanceTimersByTimeAsync(15 * 60_000);
+      await call({ persistent_ids: [A] });
+      expect(h.upstream.count(pathOf(A))).toBe(2);
+    });
+
+    it('keeps at most four of its lookups queued or in flight at once', async () => {
+      const ids = persistentIds(25);
+      for (const id of ids) h.upstream.route('GET', pathOf(id), delayed(200, plainNotFound));
+      let outstanding = 0;
+      let peak = 0;
+      const lookup = h.service.getCrimeHistory.bind(h.service);
+      vi.spyOn(h.service, 'getCrimeHistory').mockImplementation((...args) => {
+        outstanding += 1;
+        peak = Math.max(peak, outstanding);
+        return lookup(...args).finally(() => {
+          outstanding -= 1;
+        });
+      });
+      const out = data(await call({ persistent_ids: ids }));
+      expect(out.not_found).toEqual(ids);
+      expect(peak).toBe(4);
+    });
+
+    it('leaves room in the shared queue for other callers while twelve 25-id calls run', async () => {
+      h.upstream.referenceRoutes();
+      const all = persistentIds(300);
+      for (const id of all) h.upstream.route('GET', pathOf(id), plainNotFound);
+      const lookups = Array.from({ length: 12 }, (_, n) =>
+        runToolContract(getCrimeOutcomesTool, { persistent_ids: all.slice(n * 25, n * 25 + 25) }),
+      );
+      const reference = runToolContract(listReferenceTool, { topic: 'forces' });
+      const [results, forces] = await settle(Promise.all([Promise.all(lookups), reference]));
+      expect(forces.isError, JSON.stringify(forces.structuredContent)).toBeFalsy();
+      for (const result of results) expect(data(result).failed).toEqual([]);
     });
 
     it('shares one 50 s budget: lookups that cannot finish inside it fail instead of running on', async () => {

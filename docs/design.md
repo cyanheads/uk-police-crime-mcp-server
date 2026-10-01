@@ -263,16 +263,16 @@ Upstream text: `name` (outcome label), `by_outcome[].name`, `crime.location.stre
 |:------|:-----|:------|
 | `crimes` | array, input order | `persistent_id`, `id`, `category`, `month`, `location?`, `context?`, `history_available` (boolean), `outcomes: { code, name, month }[]` (oldest first, upstream order within a month). Upstream `outcomes: null` (seen on Northern Ireland records) → `outcomes: []`, `history_available: false`. |
 | `not_found` | string[] | Ids that 404ed. |
-| `failed` | `{ persistent_id, error }[]` | Ids whose lookup still failed after retries for a reason other than a 404 (outage, timeout, rate limit). Empty when none. `error` is server-written from the failure's code, `reason`, HTTP status and `Retry-After` (`data.police.uk is not answering (HTTP 502).`), never the thrown message, which can carry the upstream's HTTP status text. |
+| `failed` | `{ persistent_id, error }[]` | Ids whose lookup still failed after retries for a reason other than a 404 (outage, timeout, rate limit). Empty when none. `error` is server-written from the failure's code, `reason`, HTTP status and `Retry-After` (`data.police.uk is not answering (HTTP 502).`), never the thrown message. |
 | `guidance` | string, optional | Present when `not_found` or `failed` is non-empty. Misses: `data.police.uk holds no crime for {n} of these ids. Take persistent ids from the persistent_id field of ukcrime_search_crimes or ukcrime_search_outcomes results; anti-social behaviour records carry none.` Failures: `{n} lookups failed upstream; call ukcrime_get_crime_outcomes again with just those ids.` |
 
-**Partial failure.** Each id is one request; a 404 is a result (`not_found`), any other failure after retries goes to `failed` and the call still succeeds. When every id failed, the handler rethrows the first failure instead, so an outage reads as an outage rather than an empty success. A cancelled request rethrows at once.
+**Partial failure.** Each id is one request, at most four queued or in flight per call (Design Decision 33); a 404 is a result (`not_found`, cached 15 minutes), any other failure after retries goes to `failed` and the call still succeeds. When every id failed, the call fails instead, with the first failure's code, `reason`, `retryable` and `retryAfter` and the same server-written text as `failed[].error` (Design Decision 35), so an outage reads as an outage rather than an empty success. A cancelled request rethrows at once.
 
 Upstream text: `outcomes[].name`, `location.street_name`, `location.subtype`, `context`.
 
 `data_note`: `Police outcomes only — court results are not published. Locations are anonymised map points, not crime sites. A crime returned here is the record data.police.uk holds for the id; for Northern Ireland ids it can differ from the record that carried the id, so compare category and month.`
 
-**Errors:** none declared. Misses are results (`not_found`), per-id upstream failures are results (`failed`), a malformed id is a schema rejection, and an all-ids failure bubbles as the baseline code it carries.
+**Errors:** none declared. Misses are results (`not_found`), per-id upstream failures are results (`failed`), a malformed id is a schema rejection, and an all-ids failure carries the first failure's baseline code.
 
 ### `ukcrime_search_stops`
 
@@ -361,15 +361,16 @@ Upstream text: `force.name`, `neighbourhood.name`, `description` (*HTML*), `cont
 
 **Known-gaps table.** One `verified` date for the whole table (2026-10-01) and one entry per force fact: `{ force, aspect: 'crime' | 'outcomes' | 'locations' | 'asb', text, source, nothingPublished? }`, where `nothingPublished: true` marks a force that publishes none of that aspect's data (so a zero count there is the gap itself) and `source` is the data.police.uk page the fact was read from: the changelog's Known Issues section (`/changelog/#known-issues`), the About page's Known Issues (`/about/#qa`), or the outcomes API documentation (`/docs/method/outcomes-at-location/`). Entries: Greater Manchester (crime, outcomes — nothing published; changelog), Northern Ireland (outcomes — none published; crimes carry the placeholder outcome and unreliable persistent ids; outcomes API docs), Devon and Cornwall (outcomes unreliable; changelog), Avon and Somerset (locations — about 2,000 crimes a month without coordinates; changelog), British Transport Police (asb — none, changelog; outcomes — none, About page). Stop-and-search publication has no entries: it is read live from `/crimes-street-dates`. **Refresh:** every maintenance release re-reads the three source pages, edits entries to match, and moves `verified` in the same commit; a unit test pins that each entry names a `source` and that `verified` parses as a date, and `setup()` logs one `warning` when `verified` is more than 180 days old, so a stale table shows in the operator's logs.
 
-**Request boundary.** A plain `fetch` (the injected one), not `fetchWithTimeout` — several non-2xx statuses are results here, and `fetchWithTimeout` throws on every non-2xx. Each call declares its accept-list:
+**Request boundary.** A plain `fetch` (the injected one), not `fetchWithTimeout` — several non-2xx statuses are results here, and `fetchWithTimeout` throws on every non-2xx. Every request is sent with `redirect: 'manual'`. Any status but 200 has its body cancelled unread. Each call declares its accept-list:
 
 | Status | Handling |
 |:-------|:---------|
 | 200 | Read the body under the byte ceiling, `JSON.parse`. Unparseable or non-JSON (an HTML page) → `ServiceUnavailable`, `data.reason: 'unreadable_response'` (transient, retried). Over the ceiling, never retried since the same request would be as large again: on an area route the attempt leaves as the value `{ kind: 'too_large' }` and `queryArea` throws `area_too_large` with the calling tool's recovery, or `tooLargeHint` (Design Decision 31); on any other route → `ServiceUnavailable`, `data.reason: 'response_too_large'`, `retryable: false`. |
-| 404 on a call that lists it (`locate`, `outcomes-for-crime`, `crimes-at-location`/`outcomes-at-location` by `location_id`, `/{force}/{id}`, `/{force}/{id}/boundary`, `/forces/{id}`, `/{force}/neighbourhoods` — not the `priorities`, `people` or `events` sections, Design Decision 26) | `{ kind: 'miss' }` — the caller turns it into a result or a declared reason. Body cancelled unread. |
+| 404 on a call that lists it (`locate`, `outcomes-for-crime`, `crimes-at-location`/`outcomes-at-location` by `location_id`, `/{force}/{id}`, `/{force}/{id}/boundary`, `/forces/{id}`, `/{force}/neighbourhoods` — not the `priorities`, `people` or `events` sections, Design Decision 26) | `{ kind: 'miss' }` — the caller turns it into a result or a declared reason. |
 | 503 on an area route (`crimes-street`, `crimes-at-location`, `crimes-no-location`, `outcomes-at-location`, `stops-street`, `stops-at-location`, `stops-force`) | Leaves the paced attempt as the value `{ kind: 'overloaded' }`, not a throw, so `withRetry` never repeats a query that took up to 9 s to refuse. Once the retry loop has settled, the service sends one health probe, `GET /crime-last-updated` (uncached), as its own `pacer.run` — never nested inside the area task, where simultaneous 503s would each hold a slot while waiting for a probe slot — with no retry and `deadlineMs` set to what remains of the call's budget. Probe 200 → `area_too_large`. Probe non-200, network error, timeout or pacer shed → `upstream_unavailable` (`retryable: true` for the caller; nothing inside the call retries it). |
+| 3xx | Not followed. `ServiceUnavailable`, `data: { reason: 'unexpected_redirect', status, retryable: false }`; the message names the status, never the `Location` (Design Decision 36). |
 | 429 | `RateLimited` with `data.retryAfter` from `Retry-After` when sent — closes the pacer's cooldown gate and is retried by `withRetry`. |
-| Anything else | `httpErrorFromResponse(response, { service: 'data.police.uk', bodyLimit: 300 })` — 5xx → `ServiceUnavailable` (retried), 400 → `InvalidParams` (not retried; inputs are validated first, so this is a server bug and logs at `error`). |
+| Anything else | `httpErrorFromResponse(response, { service: 'data.police.uk', captureBody: false })` classifies it — 5xx → `ServiceUnavailable` (retried), 400 → `InvalidParams` (not retried; inputs are validated first, so this is a server bug and logs at `error`). The message is rebuilt as `data.police.uk returned HTTP {status}.` and `data.statusText` dropped, so no reason phrase or body reaches a caller (Design Decision 35). |
 
 **Byte ceiling.** 32 MiB of decoded body per response, enforced while streaming. Every JSON response arrives gzip-compressed and `fetch` decompresses it, so the ceiling counts bytes after decompression and a small compressed body cannot expand past it. The largest body observed is 8.3 MB (one month of Metropolitan Police stop and search via `/stops-force`). No record cap bounds a crime area body: the crimes route has answered 13,889 crimes with a 200 (Status semantics), so the ceiling is what bounds it. An over-ceiling body cancels the stream; on an area route the caller gets `area_too_large`.
 
@@ -377,7 +378,7 @@ Upstream text: `force.name`, `neighbourhood.name`, `description` (*HTML*), `cont
 
 | Concern | Decision |
 |:--------|:---------|
-| Pacer | `createPacer({ name: 'data-police-uk', limits: [{ requests: 15, perMs: 1000 }], maxConcurrent: 4, maxQueueDepth: 200, cooldown: { baseMs: 1000, maxMs: 15000 } })`, `pacer.run(task, { signal, maxWaitMs: 20000 })`. One pacer per process — the limit is per egress IP. Every upstream request goes through it: area queries, the parallel locate, health probes, reference reads. Disposed in `createApp({ teardown })`. |
+| Pacer | `createPacer({ name: 'data-police-uk', limits: [{ requests: 15, perMs: 1000 }], maxConcurrent: 4, maxQueueDepth: 200, cooldown: { baseMs: 1000, maxMs: 15000 } })`, `pacer.run(task, { signal, maxWaitMs: 20000 })`. One pacer per process — the limit is per egress IP. Every upstream request goes through it: area queries, the parallel locate, health probes, reference reads. Area queries first pass `createPacer({ name: 'data-police-uk-area', maxConcurrent: 3, maxQueueDepth: 200 })`, so they hold at most three of the four slots; their wait there comes out of the same 20 s `maxWaitMs` (Design Decision 32). Both disposed in `createApp({ teardown })`. |
 | Retry boundary | `withRetry(({ signal, remainingMs }) => pacer.run(() => fetch → status → capped read → parse, { signal }), { maxRetries: 2, baseDelayMs: 1000, maxDelayMs: 10000, deadlineMs })` — retry outside, pacer inside, parse inside the retry. An area 503 leaves the loop as a value (above). |
 | Per-attempt timeout | `min(30000, remainingMs)` via an own `AbortController` + `setTimeout` (not `AbortSignal.timeout()`), combined with `attempt.signal`. Slowest successful call observed: 17.3 s (`stops-street`, large London polygon). |
 | Total deadline | Each tool opens a 50 s budget (inside a 60 s client timeout); every service call, the health probe included, gets `deadlineMs = min(45000, budget remaining)`. Parallel calls share the budget. |
@@ -393,6 +394,7 @@ Upstream text: `force.name`, `neighbourhood.name`, `description` (*HTML*), `cont
 | Neighbourhood lists | force id | 24 h | ≤ 45 entries (Metropolitan, the largest, ~680 rows) |
 | Boundaries | force + neighbourhood id | 24 h | 64 entries, LRU (≤ 130 KB each) |
 | Locate results | `lat,lng` at 6 dp | 24 h | 10,000 entries, LRU — the key space is unbounded, so the cap is what keeps it from growing with every distinct point |
+| Crime-history misses (404s only; a found history is not cached) | persistent id | 15 min | 10,000 entries, LRU (Design Decision 34) |
 | Area responses | SHA-256 of method, route and canonical params | 15 min from insert | 64 MiB of weight, LRU |
 
 Area-response rules:
@@ -403,7 +405,7 @@ Area-response rules:
 - Eviction: on insert, expired entries go first, then least-recently-used entries until the new one fits.
 - An entry weighing more than half the cap (32 MiB of weight, a body over about 25 MiB) is served to its caller and not cached, so one response never empties more than half the cache. The 8.3 MB Metropolitan stops month (about 10.4 MiB of weight) is cached.
 
-**Memory for a hosted process.** Steady state: at most 64 MiB of area entries plus about 15 MiB of reference caches (mostly the 64 boundaries; lists and locate entries are small), shared by all callers — paging and repeat queries add nothing. Transient: each in-flight call that missed the cache holds its parsed body until it returns, typically under 3 MiB and at most about 40 MiB at the byte ceiling; upstream downloads run at most four at once (pacer `maxConcurrent`), so four Metropolitan-sized force months add about 42 MiB and the pathological four ceiling-sized bodies about 160 MiB. Plan about 256 MiB of heap for a hosted instance (a 512 MiB container).
+**Memory for a hosted process.** Steady state: at most 64 MiB of area entries plus about 15 MiB of reference caches (mostly the 64 boundaries; lists and locate entries are small), shared by all callers — paging and repeat queries add nothing. Transient: each in-flight call that missed the cache holds its parsed body until it returns, typically under 3 MiB and at most about 40 MiB at the byte ceiling; upstream downloads run at most four at once (pacer `maxConcurrent`), three of them area responses, so three Metropolitan-sized force months add about 31 MiB and the pathological four ceiling-sized bodies about 160 MiB. Plan about 256 MiB of heap for a hosted instance (a 512 MiB container).
 
 ## Config
 
@@ -462,7 +464,7 @@ Each step is independently testable.
 
 2–7 run in parallel after 1; 3–7 and the cached `/forces` read behind the force name are `allSettled` and degrade to a notice.
 
-`ukcrime_get_crime_outcomes`: one `GET /outcomes-for-crime/{id}` per distinct id, in parallel through the pacer (25 ids ≈ 2–3 s at 15/s, `maxConcurrent` 4).
+`ukcrime_get_crime_outcomes`: one `GET /outcomes-for-crime/{id}` per distinct id not cached as a miss, four at a time through the pacer (25 ids ≈ 2–3 s at 15/s, `maxConcurrent` 4).
 
 **Request cost per call.** Upstream requests one tool call can make, every one of them through the shared pacer and inside the call's 50 s budget. "Reference" means the cached `/crimes-street-dates`, `/crime-categories` and `/forces` reads, needed only on a cold or expired cache; "re-check" is the at-most-once-a-minute `/crime-last-updated` read when `month` is newer than the cached latest. Each request is attempted at most three times on a transient failure; the area query that answered 503 and its health probe are each sent once.
 
@@ -520,6 +522,16 @@ Each step is independently testable.
 
 31. **An area answer over the byte ceiling is `area_too_large`, not an upstream fault.** With no record cap on the crimes route (Design Decision 30), a large enough area can come back as a 200 past the 32 MiB ceiling. As `ServiceUnavailable` with `response_too_large` it read as a data.police.uk failure, with a generic hint instead of the tool's split-the-area recovery and the point arm's own wording. The caller's next move is the same as after a 503 refusal, so it raises the same declared reason through the same helper, with a message that says why. No health probe runs, since the size alone decides it. Non-area routes keep `response_too_large`, without the area hint they used to carry, since no caller action shrinks a reference list or a crime history.
 
+32. **Area requests hold at most three of the four in-flight slots.** An area query can take 17 s to answer, so four at once would leave every other caller to wait out its 20 s and be shed. A second pacer with `maxConcurrent: 3` and no rate windows admits area requests to the shared one, so reference reads, locates, neighbourhood details and crime histories always have a slot. The framework pacer has no lanes, and a second pacer reuses its queueing, cancellation and shed semantics rather than adding a semaphore. The wait for an area slot comes out of the same 20 s an area request may wait for a pacer slot, and a shed from either carries `pacer_shed`, so a caller sees the same bound and the same recovery.
+
+33. **`ukcrime_get_crime_outcomes` keeps four lookups queued or in flight per call.** Sending all 25 at once would put 25 entries in the shared queue, so nine concurrent calls would fill its 200 and every other caller would be shed. Four workers over one iterator cap a call at four entries. A lone call takes no longer, since the pacer runs four requests at a time anyway.
+
+34. **A crime-history 404 is cached for 15 minutes.** An id data.police.uk does not hold answers 404 until a later publication at the earliest, so repeating the lookup only spends the shared rate limit. A found history stays uncached, since its outcome list can grow. 15 minutes matches the area cache.
+
+35. **Upstream failure text stays upstream.** A refused request's message names the HTTP status only (`data.police.uk returned HTTP 502.`), and its body is cancelled unread. No reason phrase or body excerpt reaches `error.data`, `content[]` or the client log that `ctx.log` mirrors, and every `ctx.log` call that carries an error logs this server-written message. `data` keeps the status, `Retry-After` and the retry verdict the framework derives. When every lookup of `ukcrime_get_crime_outcomes` fails, the call fails with the first failure's code, `reason`, `retryable` and `retryAfter` under the same text as `failed[].error`. data.police.uk's error bodies are empty or a stock HTML page, so a caller loses nothing it could act on.
+
+36. **Redirects are not followed.** Every route the server calls answers directly (checked 2026-10-01: `/api/forces` answers 200 and `/api/forces/` 404, neither redirected), so a 3xx means the upstream changed, and following it could send the request to another host. Requests go out with `redirect: 'manual'`, and a 3xx fails as non-retryable `unexpected_redirect` whose message names the status, never the `Location`.
+
 ## Known Limitations
 
 - Every location is an anonymised map point; nothing finer than "on or near" a street is available.
@@ -537,6 +549,7 @@ Each step is independently testable.
 - Crime records carry only the latest outcome's display name, not its code; codes come from the outcome routes.
 - Stop `datetime` is UTC while months bucket by UK local time.
 - No geocoding.
+- One pacer serves every caller of a process, and its queue holds 200 waiting requests. The server caps what one call holds (Design Decisions 32 and 33) but has no per-client limit, so a hosted deployment needs a per-client rate limit at its edge: otherwise a client that sends many calls at once can fill the queue, and other callers are refused with `pacer_shed`.
 
 ## API Reference
 

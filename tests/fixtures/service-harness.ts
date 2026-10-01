@@ -48,6 +48,8 @@ export interface UpstreamCall {
   /** Path under the API base, e.g. `/crimes-street/burglary`. */
   readonly path: string;
   readonly query: URLSearchParams;
+  /** The `redirect` mode the request was sent with. */
+  readonly redirect: RequestInit['redirect'];
   readonly signal: AbortSignal | undefined;
 }
 
@@ -107,6 +109,7 @@ export function createUpstream(): Upstream {
         query: url.searchParams,
         headers: new Headers(init?.headers),
         body: typeof init?.body === 'string' ? init.body : undefined,
+        redirect: init?.redirect,
         signal: init?.signal ?? undefined,
       });
       return mock.fetch(input, init);

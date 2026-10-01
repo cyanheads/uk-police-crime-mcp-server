@@ -544,6 +544,30 @@ describe('ukcrime_find_neighbourhood', () => {
       ).toHaveLength(2);
     });
 
+    it('logs a failed part with server-written text, never the upstream reason phrase or body', async () => {
+      routes();
+      h.upstream.route(
+        'GET',
+        `${P}/priorities`,
+        () =>
+          new Response('upstream-body-text', {
+            status: 502,
+            statusText: 'Ask upstream-status-text',
+          }),
+      );
+      const ctx = createMockContext({ errors: findNeighbourhoodTool.errors });
+      const input = findNeighbourhoodTool.input.parse({ ...BY_ID });
+      await settle(Promise.resolve(findNeighbourhoodTool.handler(input, ctx)));
+      const warnings = (ctx.log as MockContextLogger).calls.filter((c) => c.level === 'warning');
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]?.data).toMatchObject({
+        part: 'priorities',
+        error: expect.stringMatching(/^data\.police\.uk returned HTTP 502\./),
+      });
+      expect(JSON.stringify(warnings)).not.toContain('upstream-status-text');
+      expect(JSON.stringify(warnings)).not.toContain('upstream-body-text');
+    });
+
     it('omits the force url and telephone, but keeps its id and list name, when the force detail fails', async () => {
       routes();
       h.upstream.route('GET', '/forces/leicestershire', status(500));

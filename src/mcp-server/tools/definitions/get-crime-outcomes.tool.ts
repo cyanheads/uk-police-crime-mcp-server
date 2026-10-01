@@ -1,8 +1,8 @@
 /**
  * @fileoverview ukcrime_get_crime_outcomes — the full police outcome history of
- * up to 25 crimes by persistent_id, one paced upstream lookup per id. Misses
- * and per-id upstream failures are results; only an all-ids failure fails the
- * call.
+ * up to 25 crimes by persistent_id, one paced upstream lookup per id, four at a
+ * time. Misses and per-id upstream failures are results; only an all-ids
+ * failure fails the call, with server-written text.
  * @module mcp-server/tools/definitions/get-crime-outcomes.tool
  */
 
@@ -12,8 +12,11 @@ import { inline, quote } from '@/mcp-server/tools/format-helpers.js';
 import { LocationSchema, renderLocation } from '@/mcp-server/tools/search-output.js';
 import { ATTRIBUTION } from '@/mcp-server/tools/shared-schemas.js';
 import { getPoliceApiService } from '@/services/police-api/police-api-service.js';
+import type { CrimeHistory, Lookup } from '@/services/police-api/types.js';
 
 const MAX_IDS = 25;
+/** Lookups one call keeps queued or in flight, so it never holds more than this many of the shared pacer's entries. */
+const LOOKUPS_IN_FLIGHT = 4;
 
 const DATA_NOTE =
   'Police outcomes only — court results are not published. Locations are anonymised map points, not crime sites. A crime returned here is the record data.police.uk holds for the id; for Northern Ireland ids it can differ from the record that carried the id, so compare category and month.';
@@ -51,6 +54,8 @@ const UNAVAILABLE_BY_REASON: Readonly<Record<string, string>> = {
   response_too_large: 'data.police.uk sent a response too large to read.',
   unreadable_response: 'data.police.uk answered with a body that is not JSON.',
   unexpected_response: 'data.police.uk answered in an unexpected shape.',
+  unexpected_redirect:
+    'data.police.uk answered with a redirect, which this server does not follow.',
 };
 
 /**
@@ -81,6 +86,30 @@ function lookupFailure(error: unknown): string {
     default:
       return `data.police.uk refused the lookup${http}.`;
   }
+}
+
+/**
+ * The call's failure when every lookup failed: the first failure's code,
+ * `reason`, `retryable` and `retryAfter`, with {@link lookupFailure}'s text as
+ * the message. The original rides as `cause`, which only the server's own log
+ * reads.
+ */
+function allFailed(error: unknown): McpError {
+  const message = lookupFailure(error);
+  if (!(error instanceof McpError)) {
+    return new McpError(JsonRpcErrorCode.InternalError, message, undefined, { cause: error });
+  }
+  const { reason, retryable, retryAfter } = error.data ?? {};
+  return new McpError(
+    error.code,
+    message,
+    {
+      ...(reason === undefined ? {} : { reason }),
+      ...(retryable === undefined ? {} : { retryable }),
+      ...(retryAfter === undefined ? {} : { retryAfter }),
+    },
+    { cause: error },
+  );
 }
 
 const OutputSchema = z.object({
@@ -137,6 +166,11 @@ const OutputSchema = z.object({
 
 type CrimeOutcomesOutput = z.infer<typeof OutputSchema>;
 
+/** One id's lookup: its answer, or why it failed. */
+type LookupResult =
+  | { readonly id: string; readonly lookup: Lookup<CrimeHistory> }
+  | { readonly id: string; readonly error: unknown };
+
 export const getCrimeOutcomesTool = tool('ukcrime_get_crime_outcomes', {
   title: 'Get UK Crime Outcome Histories',
   description:
@@ -178,15 +212,19 @@ export const getCrimeOutcomesTool = tool('ukcrime_get_crime_outcomes', {
     ctx.enrich({ attribution: ATTRIBUTION, data_note: DATA_NOTE });
     const service = getPoliceApiService();
     const budget = service.openBudget();
-    // Per-id isolation: one failed lookup must not discard the others.
-    const results = await Promise.all(
-      input.persistent_ids.map((id) =>
-        service.getCrimeHistory(id, ctx, budget).then(
+    // Per-id isolation: one failed lookup must not discard the others. Four
+    // workers share one iterator and write each result at its id's index.
+    const pending = input.persistent_ids.entries();
+    const results: LookupResult[] = [];
+    const worker = async () => {
+      for (const [index, id] of pending) {
+        results[index] = await service.getCrimeHistory(id, ctx, budget).then(
           (lookup) => ({ id, lookup }),
           (error: unknown) => ({ id, error }),
-        ),
-      ),
-    );
+        );
+      }
+    };
+    await Promise.all(Array.from({ length: LOOKUPS_IN_FLIGHT }, worker));
     ctx.signal.throwIfAborted();
 
     const crimes: CrimeOutcomesOutput['crimes'] = [];
@@ -214,7 +252,7 @@ export const getCrimeOutcomesTool = tool('ukcrime_get_crime_outcomes', {
       }
     }
     // Every lookup failing reads as an outage, not as an empty success.
-    if (failures.length === results.length) throw failures[0];
+    if (failures.length === results.length) throw allFailed(failures[0]);
     if (failures.length > 0) {
       ctx.log.warning('Some crime outcome lookups failed upstream', {
         failed: failures.length,

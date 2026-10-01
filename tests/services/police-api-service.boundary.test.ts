@@ -1,9 +1,11 @@
 /**
  * @fileoverview PoliceApiService request boundary: per-call status accept-lists,
- * the decoded-byte ceiling, unreadable-body retries, the 503 area value and its
+ * failure text written from the status alone, redirects refused, the
+ * decoded-byte ceiling, unreadable-body retries, the 503 area value and its
  * separately paced health probe, the 429 cooldown, the per-call budget, attempt
- * timeouts, cancellation and the pacer. Upstream is a route-table fake; retry
- * backoff, pacer waits and timeouts run on a virtual clock.
+ * timeouts, cancellation, and the pacer with its three area slots. Upstream is a
+ * route-table fake; retry backoff, pacer waits and timeouts run on a virtual
+ * clock.
  * @module tests/services/police-api-service.boundary.test
  */
 
@@ -23,6 +25,7 @@ import {
   htmlOk,
   jsonOk,
   lastUpdatedBody,
+  locateBody,
   networkError,
   overloaded,
   plainNotFound,
@@ -200,6 +203,104 @@ describe('PoliceApiService request boundary', () => {
       expect(call?.method).toBe('GET');
       expect(call?.headers.get('accept')).toBe('application/json');
       expect(call?.body).toBeUndefined();
+    });
+  });
+
+  describe('failure text', () => {
+    /** A refusal carrying an upstream reason phrase and body, neither of which a caller should see. */
+    const wordy =
+      (code: number): Responder =>
+      () =>
+        new Response('upstream-body-text', { status: code, statusText: 'Upstream reason phrase' });
+
+    it.each([500, 502, 400, 403, 429])(
+      'names only the HTTP status in the message of a %i, with no reason phrase or body in data',
+      async (code) => {
+        h.upstream.route('GET', '/forces', wordy(code));
+        const error = await failure(h.service.getForces(h.ctx, h.budget()));
+        expect(error.message).toMatch(new RegExp(`^data\\.police\\.uk returned HTTP ${code}\\.`));
+        expect(error.data).toMatchObject({ status: code });
+        expect(error.data).not.toHaveProperty('statusText');
+        expect(error.data).not.toHaveProperty('body');
+        expect(error.data).not.toHaveProperty('responseBody');
+        const seen = JSON.stringify({ message: error.message, data: error.data });
+        expect(seen).not.toContain('Upstream reason phrase');
+        expect(seen).not.toContain('upstream-body-text');
+      },
+    );
+
+    it('cancels the body of a refusal without reading it', async () => {
+      let cancelled = false;
+      h.upstream.route('GET', '/forces', () => {
+        const body = new ReadableStream<Uint8Array>({
+          cancel() {
+            cancelled = true;
+          },
+        });
+        return new Response(body, { status: 400 });
+      });
+      await failure(h.service.getForces(h.ctx, h.budget()));
+      expect(cancelled).toBe(true);
+    });
+
+    it('keeps the reason phrase out of the 400 it logs at error', async () => {
+      h.upstream.route('GET', '/forces', wordy(400));
+      const error = await failure(h.service.getForces(h.ctx, h.budget()));
+      expect(error.message).toBe('data.police.uk returned HTTP 400.');
+      const log = h.ctx.log as MockContextLogger;
+      expect(log.calls.filter((call) => call.level === 'error')).toHaveLength(1);
+    });
+  });
+
+  describe('redirects', () => {
+    it('sends GET and POST requests with redirect: manual', async () => {
+      h.upstream.route('POST', '/crimes-street/all-crime', emptyArrayOk);
+      await settle(h.service.getForces(h.ctx, h.budget()));
+      await settle(area({ date: '2026-08', poly: '52,-1:52.1,-1:52,-1.1' }, { method: 'POST' }));
+      expect(h.upstream.calls.map((call) => [call.method, call.redirect])).toEqual([
+        ['GET', 'manual'],
+        ['POST', 'manual'],
+      ]);
+    });
+
+    it.each([301, 302, 303, 307, 308])(
+      'fails a %i as unexpected_redirect, not retried, naming the status and never the Location',
+      async (code) => {
+        h.upstream.route(
+          'GET',
+          '/forces',
+          () =>
+            new Response(null, {
+              status: code,
+              headers: { location: 'https://elsewhere.example/landing?token=abc' },
+            }),
+        );
+        const error = await failure(h.service.getForces(h.ctx, h.budget()));
+        expect(error.code).toBe(JsonRpcErrorCode.ServiceUnavailable);
+        expect(error.data).toMatchObject({
+          reason: 'unexpected_redirect',
+          status: code,
+          retryable: false,
+        });
+        expect(error.message).toContain(`HTTP ${code}`);
+        expect(JSON.stringify({ message: error.message, data: error.data })).not.toContain(
+          'elsewhere.example',
+        );
+        expect(h.upstream.count('/forces')).toBe(1);
+      },
+    );
+
+    it('fails a redirect on an area route the same way, without a health probe', async () => {
+      h.upstream.route(
+        'GET',
+        '/crimes-street/all-crime',
+        () =>
+          new Response(null, { status: 302, headers: { location: 'https://elsewhere.example/' } }),
+      );
+      const error = await failure(area());
+      expect(error.data).toMatchObject({ reason: 'unexpected_redirect', status: 302 });
+      expect(h.upstream.count('/crimes-street/all-crime')).toBe(1);
+      expect(h.upstream.count('/crime-last-updated')).toBe(0);
     });
   });
 
@@ -640,6 +741,91 @@ describe('PoliceApiService request boundary', () => {
         expect(inWindow).toBeLessThanOrEqual(15);
       }
       expect(Math.max(...starts) - Math.min(...starts)).toBeGreaterThanOrEqual(1000);
+    });
+
+    /** Resolves once `ready()` holds, polled on the virtual clock. */
+    const until = (ready: () => boolean) =>
+      settle(
+        new Promise<void>((resolve) => {
+          const check = () => (ready() ? resolve() : setTimeout(check, 10));
+          check();
+        }),
+      );
+
+    /** Routes the area endpoint to answer `[]` after `ms`, counting the requests it holds open. */
+    function heldAreaRoute(ms: number) {
+      const held = { now: 0, peak: 0 };
+      h.upstream.route('GET', '/crimes-street/all-crime', async (request) => {
+        held.now += 1;
+        held.peak = Math.max(held.peak, held.now);
+        try {
+          return await delayed(ms, emptyArrayOk)(request);
+        } finally {
+          held.now -= 1;
+        }
+      });
+      return held;
+    }
+
+    /** Four distinct area queries, each settling to when it settled (ms after `start`) and its error, if any. */
+    const fourAreas = (start: number) =>
+      Array.from({ length: 4 }, (_, i) =>
+        area({ date: '2026-08', n: String(i) }).then(
+          () => ({ at: Date.now() - start }),
+          (error: unknown) => ({ at: Date.now() - start, error }),
+        ),
+      );
+
+    it('holds at most three area queries in flight, so a cheap read never waits behind them', async () => {
+      const held = heldAreaRoute(10_000);
+      h.upstream.route('GET', '/locate-neighbourhood', jsonOk(locateBody()));
+      const areas = fourAreas(Date.now());
+      await until(() => held.now >= 3);
+      const start = Date.now();
+      const located = await settle(h.service.locate(52.63, -1.13, h.ctx, h.budget()));
+      expect(located.kind).toBe('found');
+      expect(Date.now() - start).toBeLessThan(1000);
+      expect(held.now).toBe(3);
+      const outcomes = await settle(Promise.all(areas));
+      expect(outcomes.every((outcome) => !('error' in outcome))).toBe(true);
+      expect(held.peak).toBe(3);
+    });
+
+    it('sheds an area query left waiting 20 s for an area slot as pacer_shed', async () => {
+      heldAreaRoute(25_000);
+      const outcomes = await settle(Promise.all(fourAreas(Date.now())));
+      const shed = outcomes.filter((outcome) => 'error' in outcome);
+      expect(shed).toHaveLength(1);
+      expect(shed[0]?.error).toMatchObject({
+        code: JsonRpcErrorCode.RateLimited,
+        data: { reason: 'pacer_shed' },
+      });
+      expect(shed[0]?.at).toBeGreaterThanOrEqual(20_000);
+      expect(shed[0]?.at).toBeLessThan(21_000);
+    });
+
+    it('counts the wait for an area slot against the same 20 s as the wait for a pacer slot', async () => {
+      const held = heldAreaRoute(15_000);
+      const ids = ['A', 'B', 'C', 'D'];
+      for (const id of ids) {
+        h.upstream.route(
+          'GET',
+          `/leicestershire/${id}/boundary`,
+          delayed(25_000, jsonOk(boundaryBody())),
+        );
+      }
+      const start = Date.now();
+      const areas = fourAreas(start);
+      await until(() => held.now >= 3);
+      // One slow read takes the free slot; three queue for the slots the areas release at 15 s,
+      // so the fourth area query, admitted to the pacer at 15 s, finds every slot taken.
+      const reads = ids.map((id) => h.service.getBoundary('leicestershire', id, h.ctx, h.budget()));
+      const [outcomes] = await settle(Promise.all([Promise.all(areas), Promise.all(reads)]));
+      const shed = outcomes.filter((outcome) => 'error' in outcome);
+      expect(shed).toHaveLength(1);
+      expect(shed[0]?.error).toMatchObject({ data: { reason: 'pacer_shed' } });
+      expect(shed[0]?.at).toBeGreaterThanOrEqual(20_000);
+      expect(shed[0]?.at).toBeLessThan(21_000);
     });
   });
 });

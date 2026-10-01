@@ -14,6 +14,7 @@ import {
   jsonOk,
   locateBody,
   neighbourhoodsBody,
+  plainNotFound,
   sizedJsonBody,
   textOk,
 } from '../fixtures/police-api-upstream.js';
@@ -101,6 +102,14 @@ describe('PoliceApiService caches', () => {
         ttl: DAY,
         register: (x) => x.upstream.route('GET', '/locate-neighbourhood', jsonOk(locateBody())),
         call: (x) => x.service.locate(52.63, -1.13, x.ctx, x.budget()),
+      },
+      {
+        name: 'crime-history miss',
+        path: `/outcomes-for-crime/${'0'.repeat(64)}`,
+        ttl: 15 * MINUTE,
+        register: (x) =>
+          x.upstream.route('GET', `/outcomes-for-crime/${'0'.repeat(64)}`, plainNotFound),
+        call: (x) => x.service.getCrimeHistory('0'.repeat(64), x.ctx, x.budget()),
       },
     ];
 
