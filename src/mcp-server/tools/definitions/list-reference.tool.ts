@@ -26,13 +26,11 @@ const OutputSchema = z.object({
       z
         .object({
           id: z.string().describe('Force id the other tools take as force.'),
-          name: z.string().describe('Force name as data.police.uk publishes it.'),
+          name: z.string().describe('Force name as published.'),
           gaps: z
             .string()
             .optional()
-            .describe(
-              'Known coverage gaps for this force, each ending with the date it was verified against data.police.uk. Absent when none are recorded.',
-            ),
+            .describe('Known coverage gaps, each ending with the date verified. Absent when none.'),
         })
         .describe('One police force.'),
     )
@@ -46,10 +44,8 @@ const OutputSchema = z.object({
         .object({
           slug: z
             .string()
-            .describe(
-              'Slug the category input takes, e.g. burglary; all-crime means every category.',
-            ),
-          name: z.string().describe('Display name, also accepted as the category input.'),
+            .describe('Slug the category input takes; all-crime means every category.'),
+          name: z.string().describe('Display name, also accepted as category.'),
         })
         .describe('One crime category.'),
     )
@@ -59,12 +55,8 @@ const OutputSchema = z.object({
     .object({
       latest_month: z
         .string()
-        .describe(
-          'Newest published month, YYYY-MM — what the search tools use when month is omitted.',
-        ),
-      earliest_month: z
-        .string()
-        .describe('Oldest month still served, YYYY-MM (a rolling 36-month window).'),
+        .describe('Newest published month, YYYY-MM; the searches default to it.'),
+      earliest_month: z.string().describe('Oldest month served, YYYY-MM (a rolling 36 months).'),
       months: z
         .array(
           z
@@ -72,12 +64,10 @@ const OutputSchema = z.object({
               month: z.string().describe('Published month, YYYY-MM.'),
               stop_search_forces_published: z
                 .number()
-                .describe(
-                  'Forces, British Transport Police included, that published stop and search for this month.',
-                ),
+                .describe('Forces, BTP included, that published stop and search.'),
               stop_search_not_published: z
                 .array(z.string())
-                .describe('Force ids that did not publish stop and search for this month.'),
+                .describe('Force ids that did not publish stop and search.'),
             })
             .describe('One published month.'),
         )
@@ -87,17 +77,15 @@ const OutputSchema = z.object({
       force: z
         .string()
         .optional()
-        .describe('The force id the next two lists describe, present when force was given.'),
+        .describe('The force the next two lists describe, when force was given.'),
       force_stop_search_published_months: z
         .array(z.string())
         .optional()
-        .describe('Months in the listed rows for which this force published stop and search.'),
+        .describe('Listed months in which this force published stop and search.'),
       force_stop_search_missing_months: z
         .array(z.string())
         .optional()
-        .describe(
-          'Months in the listed rows for which this force did not publish stop and search.',
-        ),
+        .describe('Listed months in which this force did not.'),
     })
     .optional()
     .describe(
@@ -107,10 +95,8 @@ const OutputSchema = z.object({
     .array(
       z
         .object({
-          id: z
-            .string()
-            .describe('Neighbourhood id the other tools take as neighbourhood_id; case-sensitive.'),
-          name: z.string().describe('Neighbourhood name as the force publishes it.'),
+          id: z.string().describe('Id the other tools take as neighbourhood_id; case-sensitive.'),
+          name: z.string().describe('Neighbourhood name as published.'),
         })
         .describe('One neighbourhood.'),
     )

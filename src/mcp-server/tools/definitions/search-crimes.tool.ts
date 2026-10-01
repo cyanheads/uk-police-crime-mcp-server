@@ -71,26 +71,21 @@ const CrimeSchema = z
       .string()
       .optional()
       .describe(
-        '64-character id that ukcrime_get_crime_outcomes takes. Absent when data.police.uk gives none, always for anti-social behaviour.',
+        'Id ukcrime_get_crime_outcomes takes. Absent when unpublished, always for anti-social behaviour.',
       ),
     category: z.string().describe('Category slug.'),
-    month: z.string().describe('Month the crime was recorded, YYYY-MM.'),
-    location: LocationSchema.optional().describe(
-      'Where data.police.uk places the crime. Absent for crimes the force could not place.',
-    ),
+    month: z.string().describe('Month recorded, YYYY-MM.'),
+    location: LocationSchema.optional().describe('Absent for crimes the force could not place.'),
     outcome: z
       .object({
-        name: z.string().describe('Latest police outcome as published.'),
-        month: z.string().describe('Month that outcome was recorded, YYYY-MM.'),
+        name: z.string().describe('Outcome as published.'),
+        month: z.string().describe('Month recorded, YYYY-MM.'),
       })
       .optional()
       .describe(
-        'The latest police outcome. Absent when data.police.uk publishes none — always for anti-social behaviour.',
+        'Latest police outcome. Absent when unpublished, always for anti-social behaviour.',
       ),
-    context: z
-      .string()
-      .optional()
-      .describe('Extra detail the force published, when any. Force-written text.'),
+    context: z.string().optional().describe('Force-written extra detail, when any.'),
   })
   .describe('One crime.');
 
@@ -106,26 +101,22 @@ const OutputSchema = z.object({
   total: z.number().describe('Crimes matched in the area and month.'),
   by_category: breakdownSchema('Matched crimes by category slug, most first.'),
   by_outcome: breakdownSchema(
-    "Matched crimes by latest police outcome, most first. A crime with no published outcome, which includes all anti-social behaviour, counts as '(not recorded)'.",
+    "Matched crimes by latest police outcome, most first; anti-social behaviour is always '(not recorded)'.",
   ),
   top_locations: z
     .array(
       z
         .object({
-          location_id: z
-            .string()
-            .describe("Map point id; pass it as location_id with area 'location'."),
-          street_name: z.string().describe('Street as data.police.uk publishes it.'),
-          count: z.number().describe('Matched crimes at this map point.'),
+          location_id: z.string().describe("Pass as location_id with area 'location'."),
+          street_name: z.string().describe('Street as published.'),
+          count: z.number().describe('Matched crimes here.'),
           map_point: z
             .object({
-              latitude: z.number().describe('Latitude, WGS84 decimal degrees.'),
-              longitude: z.number().describe('Longitude, WGS84 decimal degrees.'),
+              latitude: z.number().describe('Latitude, WGS84.'),
+              longitude: z.number().describe('Longitude, WGS84.'),
             })
             .optional()
-            .describe(
-              'Anonymised map point covering at least eight addresses — not where crimes happened.',
-            ),
+            .describe('Anonymised map point, not where crimes happened.'),
         })
         .describe('One map point and its crime count.'),
     )
@@ -135,7 +126,7 @@ const OutputSchema = z.object({
     ),
   crimes: z
     .array(CrimeSchema)
-    .describe('This page of matched crimes, sorted by category, then location_id, then id.'),
+    .describe('This page of matched crimes, by category, then location_id, then id.'),
   next_offset: z
     .number()
     .optional()
@@ -186,9 +177,9 @@ export const searchCrimesTool = tool('ukcrime_search_crimes', {
     neighbourhood_id: neighbourhoodIdField,
     month: monthField,
     category: categoryInput.describe(
-      "Crime category slug such as 'burglary', or its display name such as 'Violence and sexual offences'; case-insensitive. Omitted: every category (all-crime). ukcrime_list_reference topic 'categories' lists them.",
+      "Crime category slug such as 'burglary', or its display name such as 'Violence and sexual offences'; case-insensitive, and spaces, underscores and hyphens match each other ('vehicle_crime' finds 'vehicle-crime'). Omitted: every category (all-crime). ukcrime_list_reference topic 'categories' lists them.",
     ),
-    limit: limitInput(50).describe('Crimes on this page, 1–200. Default 50.'),
+    limit: limitInput(25).describe('Crimes on this page, 1–200. Default 25.'),
     offset: offsetField,
   }),
   inputAliases: AREA_INPUT_ALIASES,

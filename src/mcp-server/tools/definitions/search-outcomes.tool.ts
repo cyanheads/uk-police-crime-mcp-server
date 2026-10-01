@@ -62,7 +62,7 @@ const OutcomeSchema = z
   .object({
     code: z.string().describe('Outcome code, such as under-investigation or unable-to-prosecute.'),
     name: z.string().describe('Outcome as published.'),
-    month: z.string().describe('Month police recorded this outcome, YYYY-MM.'),
+    month: z.string().describe('Month recorded, YYYY-MM.'),
     crime: z
       .object({
         id: z.string().describe('data.police.uk crime id.'),
@@ -70,19 +70,12 @@ const OutcomeSchema = z
           .string()
           .optional()
           .describe(
-            '64-character id that ukcrime_get_crime_outcomes takes for the full history. Absent when data.police.uk gives none.',
+            'Id ukcrime_get_crime_outcomes takes for the full history. Absent when unpublished.',
           ),
         category: z.string().describe('Category slug.'),
-        month: z
-          .string()
-          .describe('Month the crime was recorded, YYYY-MM; can be years before the outcome.'),
-        location: LocationSchema.optional().describe(
-          'Where data.police.uk places the crime. Absent when it has no location.',
-        ),
-        context: z
-          .string()
-          .optional()
-          .describe('Extra detail the force published, when any. Force-written text.'),
+        month: z.string().describe('Month recorded, YYYY-MM; can be years before the outcome.'),
+        location: LocationSchema.optional().describe('Absent when the crime has no location.'),
+        context: z.string().optional().describe('Force-written extra detail, when any.'),
       })
       .describe('The crime this outcome was recorded for.'),
   })
@@ -93,7 +86,7 @@ const OutputSchema = z.object({
   area: AreaEchoSchema,
   category: z
     .object({
-      slug: z.string().describe('Category slug the outcomes were filtered to.'),
+      slug: z.string().describe('Category slug.'),
       name: z.string().describe('Category display name.'),
     })
     .optional()
@@ -110,19 +103,19 @@ const OutputSchema = z.object({
         .object({
           code: z.string().describe('Outcome code.'),
           name: z.string().describe('Outcome as published.'),
-          count: z.number().describe('Matched outcomes with this code.'),
+          count: z.number().describe('Matched outcomes.'),
         })
-        .describe('One outcome and how many matched outcomes carry it.'),
+        .describe('An outcome and its count.'),
     )
     .describe('Matched outcomes by outcome, most first.'),
   by_crime_month: z
     .array(
       z
         .object({
-          month: z.string().describe('Month the crimes were recorded, YYYY-MM.'),
-          count: z.number().describe('Matched outcomes for crimes recorded that month.'),
+          month: z.string().describe('Crime month, YYYY-MM.'),
+          count: z.number().describe('Matched outcomes.'),
         })
-        .describe('One crime month and how many matched outcomes belong to crimes from it.'),
+        .describe('A crime month and its count.'),
     )
     .describe('Matched outcomes by the month their crime was recorded, newest first.'),
   outcomes: z
@@ -181,9 +174,9 @@ export const searchOutcomesTool = tool('ukcrime_search_outcomes', {
     neighbourhood_id: neighbourhoodIdField,
     month: monthField,
     category: categoryInput.describe(
-      "Count only outcomes for crimes in this category: a slug such as 'burglary' or a display name such as 'Violence and sexual offences'; case-insensitive. Omitted or 'all-crime': every category. ukcrime_list_reference topic 'categories' lists them.",
+      "Count only outcomes for crimes in this category: a slug such as 'burglary' or a display name such as 'Violence and sexual offences'; case-insensitive, and spaces, underscores and hyphens match each other ('vehicle_crime' finds 'vehicle-crime'). Omitted or 'all-crime': every category. ukcrime_list_reference topic 'categories' lists them.",
     ),
-    limit: limitInput(50).describe('Outcomes on this page, 1–200. Default 50.'),
+    limit: limitInput(20).describe('Outcomes on this page, 1–200. Default 20.'),
     offset: offsetField,
   }),
   inputAliases: AREA_INPUT_ALIASES,

@@ -91,14 +91,9 @@ const OutputSchema = z.object({
           persistent_id: z.string().describe('The persistent id this record was fetched by.'),
           id: z.string().describe('data.police.uk crime id.'),
           category: z.string().describe('Category slug.'),
-          month: z.string().describe('Month the crime was recorded, YYYY-MM.'),
-          location: LocationSchema.optional().describe(
-            'Where data.police.uk places the crime. Absent when it has no location.',
-          ),
-          context: z
-            .string()
-            .optional()
-            .describe('Extra detail the force published, when any. Force-written text.'),
+          month: z.string().describe('Month recorded, YYYY-MM.'),
+          location: LocationSchema.optional().describe('Absent when the crime has no location.'),
+          context: z.string().optional().describe('Force-written extra detail, when any.'),
           history_available: z
             .boolean()
             .describe(
@@ -110,7 +105,7 @@ const OutputSchema = z.object({
                 .object({
                   code: z.string().describe('Outcome code, such as under-investigation.'),
                   name: z.string().describe('Outcome as published.'),
-                  month: z.string().describe('Month police recorded this outcome, YYYY-MM.'),
+                  month: z.string().describe('Month recorded, YYYY-MM.'),
                 })
                 .describe('One police outcome.'),
             )
@@ -120,16 +115,16 @@ const OutputSchema = z.object({
     )
     .describe('The crimes found, in the order their ids were given.'),
   not_found: z
-    .array(z.string().describe('A persistent id data.police.uk holds no crime for.'))
+    .array(z.string().describe('A persistent id.'))
     .describe('Ids data.police.uk holds no crime for.'),
   failed: z
     .array(
       z
         .object({
-          persistent_id: z.string().describe('The persistent id whose lookup failed.'),
+          persistent_id: z.string().describe('The persistent id.'),
           error: z.string().describe('Why the lookup failed upstream.'),
         })
-        .describe('One id whose lookup failed for a reason other than a missing crime.'),
+        .describe('One failed lookup.'),
     )
     .describe(
       'Ids whose lookup still failed after retries for a reason other than a missing crime (outage, timeout, rate limit). Empty when none.',
@@ -171,12 +166,8 @@ export const getCrimeOutcomesTool = tool('ukcrime_get_crime_outcomes', {
   inputAliases: { persistent_id: 'persistent_ids' },
   output: OutputSchema,
   enrichment: {
-    attribution: z
-      .string()
-      .describe('Open Government Licence attribution for data.police.uk data.'),
-    data_note: z
-      .string()
-      .describe('What these records can and cannot say; read it before drawing conclusions.'),
+    attribution: z.string().describe('Open Government Licence attribution.'),
+    data_note: z.string().describe('What these records can and cannot say; read it first.'),
   },
   enrichmentTrailer: {
     attribution: { label: 'Attribution' },

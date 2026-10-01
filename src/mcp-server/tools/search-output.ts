@@ -13,33 +13,26 @@ import { cell, inline } from './format-helpers.js';
 /** A record's location — the anonymised map point and its street. */
 export const LocationSchema = z
   .object({
-    location_id: z
-      .string()
-      .describe("Snapped map point id; pass it as location_id with area 'location'."),
-    street_name: z
-      .string()
-      .describe('Street as data.police.uk publishes it, always "On or near …".'),
+    location_id: z.string().describe("Map point id; pass it as location_id with area 'location'."),
+    street_name: z.string().describe('Street as published: "On or near …".'),
     map_point: z
       .object({
-        latitude: z.number().describe('Latitude, WGS84 decimal degrees.'),
-        longitude: z.number().describe('Longitude, WGS84 decimal degrees.'),
+        latitude: z.number().describe('Latitude, WGS84.'),
+        longitude: z.number().describe('Longitude, WGS84.'),
       })
       .optional()
       .describe(
-        'Anonymised map point covering at least eight addresses — not where the event happened. Absent when data.police.uk has no usable point.',
+        'Anonymised point covering at least eight addresses, not where it happened. Absent when unpublished.',
       ),
     type: z
       .enum(['Force', 'BTP'])
       .optional()
       .describe(
-        "'BTP' marks a British Transport Police record at a station; 'Force' a territorial force record.",
+        "'BTP': a British Transport Police station record; 'Force': a territorial force's.",
       ),
-    subtype: z
-      .string()
-      .optional()
-      .describe('Station or premises type, when data.police.uk publishes one.'),
+    subtype: z.string().optional().describe('Station or premises type, when published.'),
   })
-  .describe('Where data.police.uk places the record: an anonymised map point and its street.');
+  .describe('Where data.police.uk places the record.');
 
 export type LocationOutput = z.infer<typeof LocationSchema>;
 
@@ -47,28 +40,23 @@ export type LocationOutput = z.infer<typeof LocationSchema>;
 export const AreaEchoSchema = z
   .object({
     type: z.enum(AREA_KINDS).describe('The area arm searched.'),
-    lat: z.number().optional().describe("Latitude searched, for area 'point'."),
-    lng: z.number().optional().describe("Longitude searched, for area 'point'."),
+    lat: z.number().optional().describe("Latitude, for 'point'."),
+    lng: z.number().optional().describe("Longitude, for 'point'."),
     vertex_count: z
       .number()
       .optional()
-      .describe(
-        "Vertices in the polygon searched — the neighbourhood's boundary for area 'neighbourhood'.",
-      ),
-    location_id: z.string().optional().describe("Map point searched, for area 'location'."),
-    force: z.string().optional().describe('Force id searched, when the area names one.'),
-    neighbourhood_id: z
-      .string()
-      .optional()
-      .describe("Neighbourhood searched, for area 'neighbourhood'."),
+      .describe("Polygon vertices; the boundary's, for 'neighbourhood'."),
+    location_id: z.string().optional().describe("Map point, for 'location'."),
+    force: z.string().optional().describe('Force id, when the area names one.'),
+    neighbourhood_id: z.string().optional().describe("Neighbourhood id, for 'neighbourhood'."),
     located_force: z
       .string()
       .optional()
-      .describe("Force covering the point, for area 'point' when data.police.uk located it."),
+      .describe("Force covering the point, for 'point' when located."),
     located_neighbourhood: z
       .string()
       .optional()
-      .describe("Neighbourhood id covering the point, for area 'point' when located."),
+      .describe("Neighbourhood covering the point, for 'point' when located."),
   })
   .describe('The area as the server searched it.');
 
@@ -86,32 +74,24 @@ export const breakdownSchema = (description: string) =>
     .array(
       z
         .object({
-          value: z
-            .string()
-            .describe("The value as published; '(not recorded)' counts records that carry none."),
-          count: z.number().describe('Matched records with this value.'),
+          value: z.string().describe("As published; '(not recorded)' when absent."),
+          count: z.number().describe('Matched records.'),
         })
-        .describe('One value and how many matched records carry it.'),
+        .describe('A value and its count.'),
     )
     .describe(description);
 
 /** The enrichment block every search tool declares; each writes the required fields first. */
 export const SEARCH_ENRICHMENT = {
-  attribution: z.string().describe('Open Government Licence attribution for data.police.uk data.'),
-  data_note: z
-    .string()
-    .describe('What these records can and cannot say; read it before drawing conclusions.'),
-  truncated: z
-    .boolean()
-    .describe('True when more rows remain after this page (offset + shown < total).'),
+  attribution: z.string().describe('Open Government Licence attribution.'),
+  data_note: z.string().describe('What these records can and cannot say; read it first.'),
+  truncated: z.boolean().describe('True when more rows remain after this page.'),
   shown: z.number().describe('Rows on this page.'),
-  cap: z.number().describe('The limit applied to this page.'),
+  cap: z.number().describe('Page limit applied.'),
   notice: z
     .string()
     .optional()
-    .describe(
-      'The month searched when none was given, known coverage gaps, why a result is empty, and how to page on.',
-    ),
+    .describe('Defaulted month, coverage gaps, why a result is empty, and how to page on.'),
 };
 
 /** Trailer labels for {@link SEARCH_ENRICHMENT}. */

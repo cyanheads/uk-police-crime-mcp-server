@@ -939,12 +939,12 @@ describe('ukcrime_search_stops', () => {
       );
     });
 
-    it('uses a default page of 25', async () => {
+    it('uses a default page of 15', async () => {
       forceRoute(manyStops(60));
       const out = data(await call({ ...FORCE, month: '2026-07' }));
-      expect(out.stops).toHaveLength(25);
-      expect(out.cap).toBe(25);
-      expect(out.next_offset).toBe(25);
+      expect(out.stops).toHaveLength(15);
+      expect(out.cap).toBe(15);
+      expect(out.next_offset).toBe(15);
     });
 
     it.each<[string, Record<string, unknown>]>([
@@ -1148,7 +1148,7 @@ describe('ukcrime_search_stops', () => {
         expect(out.data_note, input.area).toBeTruthy();
         expect(out.truncated, input.area).toBe(false);
         expect(out.shown, input.area).toBe(0);
-        expect(out.cap, input.area).toBe(25);
+        expect(out.cap, input.area).toBe(15);
         expect(out.notice, input.area).toBeTruthy();
       }
     });
@@ -1214,7 +1214,7 @@ describe('ukcrime_search_stops', () => {
         data_note: expect.any(String),
         truncated: false,
         shown: 0,
-        cap: 25,
+        cap: 15,
       });
     });
 

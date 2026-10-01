@@ -88,8 +88,8 @@ const listParts = (parts: readonly string[]): string =>
   parts.length <= 1 ? (parts[0] ?? '') : `${parts.slice(0, -1).join(', ')} and ${parts.at(-1)}`;
 
 const MapPointSchema = z.object({
-  latitude: z.number().describe('Latitude, WGS84 decimal degrees.'),
-  longitude: z.number().describe('Longitude, WGS84 decimal degrees.'),
+  latitude: z.number().describe('Latitude, WGS84.'),
+  longitude: z.number().describe('Longitude, WGS84.'),
 });
 
 const OutputSchema = z.object({
@@ -110,12 +110,12 @@ const OutputSchema = z.object({
   force: z
     .object({
       id: z.string().describe("Force id the other tools take as force, such as 'leicestershire'."),
-      name: z.string().describe('Force name as published.'),
-      url: z.string().optional().describe('Force website, when published.'),
-      telephone: z.string().optional().describe('Force switchboard number, when published.'),
+      name: z.string().describe('Force name.'),
+      url: z.string().optional().describe('Force website.'),
+      telephone: z.string().optional().describe('Force switchboard number.'),
     })
     .optional()
-    .describe('The police force the neighbourhood belongs to.'),
+    .describe('The police force the neighbourhood belongs to, as published.'),
   neighbourhood: z
     .object({
       id: z
@@ -123,38 +123,28 @@ const OutputSchema = z.object({
         .describe(
           "Neighbourhood id; pass it with force as neighbourhood_id to the search tools' area 'neighbourhood'.",
         ),
-      name: z.string().describe('Neighbourhood name as published.'),
-      url: z.string().optional().describe("The team's page on the force website, when published."),
-      centre: MapPointSchema.optional().describe(
-        "The neighbourhood's published centre point, when given.",
-      ),
-      population: z
-        .number()
-        .optional()
-        .describe('Resident population as published; absent when given as 0 or not given.'),
-      description: z
-        .string()
-        .optional()
-        .describe('The team or area description, as plain text. Force-written text.'),
+      name: z.string().describe('Neighbourhood name.'),
+      url: z.string().optional().describe("The team's page on the force website."),
+      centre: MapPointSchema.optional().describe("The neighbourhood's centre point."),
+      population: z.number().optional().describe('Resident population; absent when given as 0.'),
+      description: z.string().optional().describe('The team or area description, as plain text.'),
       contact: z
         .array(
           z
             .object({
-              channel: z
-                .string()
-                .describe('Channel as published, such as email, telephone, twitter or facebook.'),
-              value: z.string().describe('Address, number or account URL as published.'),
+              channel: z.string().describe('Channel, such as email, telephone or facebook.'),
+              value: z.string().describe('Address, number or account URL.'),
             })
             .describe('One team-level contact channel.'),
         )
-        .describe('Team-level contact channels; empty when none are published.'),
+        .describe('Team-level contact channels; empty when none.'),
       links: z
         .array(
           z
             .object({
-              title: z.string().describe('Link title as published.'),
-              url: z.string().describe('Link URL as published.'),
-              description: z.string().optional().describe('Link description, when published.'),
+              title: z.string().describe('Link title.'),
+              url: z.string().describe('Link URL.'),
+              description: z.string().optional().describe('Link description.'),
             })
             .describe('One link the force publishes for the team.'),
         )
@@ -163,53 +153,46 @@ const OutputSchema = z.object({
         .array(
           z
             .object({
-              type: z.string().optional().describe('Station or base type, when published.'),
-              name: z.string().optional().describe('Station name, when published.'),
-              address: z.string().optional().describe('Street address, when published.'),
-              postcode: z.string().optional().describe('Postcode, when published.'),
-              description: z
-                .string()
-                .optional()
-                .describe('Opening hours or other detail, when published. Force-written text.'),
+              type: z.string().optional().describe('Station or base type.'),
+              name: z.string().optional().describe('Station name.'),
+              address: z.string().optional().describe('Street address.'),
+              postcode: z.string().optional().describe('Postcode.'),
+              description: z.string().optional().describe('Opening hours or other detail.'),
             })
             .describe('One police station or base the team works from.'),
         )
         .describe('Police stations and bases listed for the team; empty when none.'),
     })
     .optional()
-    .describe('The neighbourhood policing team and its public channels.'),
+    .describe(
+      'The neighbourhood policing team and its public channels, as the force publishes them; an optional field is absent when unpublished, and all text is force-written.',
+    ),
   priorities: z
     .array(
       z
         .object({
-          issue: z.string().describe('The priority as plain text. Force-written text.'),
+          issue: z.string().describe('The priority, as plain text.'),
           issue_date: z
             .string()
             .optional()
-            .describe('When it was set, YYYY-MM-DDTHH:MM:SS as published (no time zone).'),
-          action: z
-            .string()
-            .optional()
-            .describe('Action taken, as plain text, when published. Force-written text.'),
-          action_date: z
-            .string()
-            .optional()
-            .describe('When the action was recorded, as published, when given.'),
+            .describe('When it was set, YYYY-MM-DDTHH:MM:SS (no time zone).'),
+          action: z.string().optional().describe('Action taken, as plain text.'),
+          action_date: z.string().optional().describe('When the action was recorded.'),
         })
-        .describe('One current neighbourhood priority.'),
+        .describe('One current priority.'),
     )
     .optional()
     .describe(
-      "The team's current priorities; present when include has 'priorities' and they loaded.",
+      "The team's current priorities, force-written; present when include has 'priorities' and they loaded.",
     ),
   team: z
     .array(
       z
         .object({
-          rank: z.string().describe('Rank as published; can include a collar number.'),
-          name: z.string().describe('Name as published.'),
+          rank: z.string().describe('Rank; can include a collar number.'),
+          name: z.string().describe('Name.'),
         })
-        .describe('One team member, as the force publishes them for public contact.'),
+        .describe('One team member, as the force publishes them.'),
     )
     .optional()
     .describe("Team members' ranks and names; present when include has 'team' and they loaded."),
@@ -217,20 +200,14 @@ const OutputSchema = z.object({
     .array(
       z
         .object({
-          title: z.string().describe('Event title as published.'),
-          type: z.string().optional().describe('Event type, such as meeting, when published.'),
-          start: z
-            .string()
-            .optional()
-            .describe('Start, YYYY-MM-DDTHH:MM:SS as published (no time zone).'),
-          end: z.string().optional().describe('End, as published, when given.'),
-          address: z.string().optional().describe('Where it takes place, when published.'),
-          description: z
-            .string()
-            .optional()
-            .describe('Event description as plain text, when published. Force-written text.'),
+          title: z.string().describe('Event title.'),
+          type: z.string().optional().describe('Event type, such as meeting.'),
+          start: z.string().optional().describe('Start, YYYY-MM-DDTHH:MM:SS (no time zone).'),
+          end: z.string().optional().describe('End.'),
+          address: z.string().optional().describe('Where it takes place.'),
+          description: z.string().optional().describe('Event description, as plain text.'),
         })
-        .describe('One upcoming engagement event.'),
+        .describe('One upcoming engagement event, force-written.'),
     )
     .optional()
     .describe(
@@ -246,7 +223,7 @@ const OutputSchema = z.object({
       polygon: z
         .string()
         .describe(
-          "The boundary as 'lat,lng:lat,lng:…' at 6 dp — the string form the search tools' polygon input accepts. The ring repeats its first vertex last.",
+          "The boundary as 'lat,lng:lat,lng:…' at 6 dp, the form the search tools' polygon takes. The first vertex repeats last.",
         ),
     })
     .optional()

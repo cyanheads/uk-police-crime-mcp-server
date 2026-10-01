@@ -66,7 +66,7 @@ The three search tools share one area vocabulary so an agent learns it once.
 | `neighbourhood_id` | string ≤ 100, optional, pattern rejecting `/`, `\`, `?`, `#`, control characters, and a whole value of `.` or `..` | blank → unset; trim only — ids are case-sensitive (`AB12`; Northern Ireland ids are place names with spaces) | Path-encoded with `encodeURIComponent` (a space becomes `%20`). The pattern exists because `encodeURIComponent` leaves `.` alone and a `..` segment would climb the upstream path. |
 | `month` | string `^\d{4}-(0[1-9]\|1[0-2])$`, optional | blank → unset; trim | Omitted → latest published month, resolved server-side and echoed. |
 | `category` | string ≤ 100, optional (crimes, outcomes) | blank → unset; trim, lower-case | No schema pattern. The handler matches a slug (`burglary`), or a display name (`Violence and sexual offences` → `violent-crime`), against the cached vocabulary, folding each run of spaces, underscores and hyphens to one `-` on both sides (`vehicle_crime`, `anti social behaviour`, `violence-and-sexual-offences` all resolve); anything else → `unknown_category`. Default `all-crime`. |
-| `limit` | int 1..200 | — | Rows on this page. Default 50 (stops 25). |
+| `limit` | int 1..200 | — | Rows on this page. Default 25 for crimes, 20 for outcomes, 15 for stops — each sized so a default call on a dense area stays under about 24 KB. |
 | `offset` | int ≥ 0 | — | Rows to skip. Default 0. |
 
 `blankAsUnset` (`add-tool` § empty values) maps `''`, a whitespace-only string and `null` to `undefined` and trims every other string; then the field's own normalization and pattern run. Every normalization a `.describe()` promises lives in that `z.preprocess`, before the pattern, so the handler sees only canonical values. Every pattern (`force`, `month`, `location_id`, `neighbourhood_id`, each `persistent_ids` item) carries a message naming the expected shape (`Expected a month as YYYY-MM, such as 2026-07.`), since Zod's default prints the raw regex; the `persistent_ids` one says it is the 64-character id from a crime record, not the record's numeric `id`, the usual mix-up. No optional field carries `.min(1)`. Every array input carries `.max()` and its preprocess cuts the list to max + 1 first, because the framework renders one issue per invalid element with no cap. The polygon preprocess also parses each vertex and raises the first malformed one's issues itself, which stops the parse before the list's length checks: a list of `[lat, lng]` pairs then yields one issue, not one per vertex, and no `expected array to have >=3 items` count that the vertex error caused.
@@ -176,7 +176,7 @@ The service always sends `date` explicitly. The upstream serves its latest month
 | `lat`, `lng`, `polygon`, `location_id`, `force`, `neighbourhood_id` | per arm | Shared vocabulary. |
 | `month` | `date` | Resolved server-side. |
 | `category` | path segment `/crimes-street/{category}`, `crimes-no-location` `category` | Default `all-crime`. `area: 'location'` has no upstream category parameter — filtered locally. Validated: upstream silently treats an unknown slug as all crime. |
-| `limit`, `offset` | local slice | Default 50, max 200. |
+| `limit`, `offset` | local slice | Default 25, max 200. |
 
 **Output:**
 
@@ -237,7 +237,7 @@ The `when` column is the contract text callers read in `tools/list`, so it names
 | area fields | per arm | Shared vocabulary. |
 | `month` | `date` | The month outcomes were recorded. |
 | `category` | local filter on `crime.category` | The upstream route has no category parameter. `all-crime` or omitted → no filter. Breakdowns computed after it. |
-| `limit`, `offset` | local slice | Default 50, max 200. |
+| `limit`, `offset` | local slice | Default 20, max 200. |
 
 **Output:** `month`; `area` (echo, as above); `category?` (`{ slug, name }` when filtered); `total` (after filter); `unfiltered_total`; `by_outcome` (`{ code, name, count }[]`); `by_crime_month` (`{ month, count }[]`, newest first); `outcomes` (sorted by `crime.month` descending, then `crime.id`; each `{ code, name, month, crime: { id, persistent_id?, category, month, location?, context? } }`); `next_offset?`. Upstream `person_id` is always `null` and is dropped.
 
@@ -284,7 +284,7 @@ Upstream text: `outcomes[].name`, `location.street_name`, `location.subtype`, `c
 | area fields | | Shared vocabulary; `area: 'force'` also accepts `btp`. |
 | `month` | `YYYY-MM` | |
 | `filters` | array 0..8 of `{ field, value }` | `field` ∈ `type`, `officer_defined_ethnicity`, `self_defined_ethnicity`, `outcome`, `object_of_search`, `legislation`, `age_range`, `gender`. `value` string 1..200, trimmed; matched case-insensitively against the record's exact value; `(not recorded)` matches an absent value. Several filters AND together. A blank, whitespace-only string or `null` is unset. Cut to 9 before validation. The nested object is `.strict()`. |
-| `limit`, `offset` | | Default 25, max 200. |
+| `limit`, `offset` | | Default 15, max 200. |
 
 **Output:**
 

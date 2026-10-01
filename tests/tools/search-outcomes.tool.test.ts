@@ -874,7 +874,7 @@ describe('ukcrime_search_outcomes', () => {
         expect(out.data_note, input.area).toBeTruthy();
         expect(out.truncated, input.area).toBe(false);
         expect(out.shown, input.area).toBe(0);
-        expect(out.cap, input.area).toBe(50);
+        expect(out.cap, input.area).toBe(20);
         expect(out.notice, input.area).toBeTruthy();
       }
     });
@@ -948,14 +948,14 @@ describe('ukcrime_search_outcomes', () => {
         data_note: expect.any(String),
         truncated: false,
         shown: 0,
-        cap: 50,
+        cap: 20,
       });
     });
 
     it('leaves truncated false and shown 0 when a later step fails', async () => {
       const { ctx, output } = await run({ ...POINT, month: '2026-09' });
       expect(output).toMatchObject({ data: { reason: 'month_not_published' } });
-      expect(getEnrichment(ctx)).toMatchObject({ truncated: false, shown: 0, cap: 50 });
+      expect(getEnrichment(ctx)).toMatchObject({ truncated: false, shown: 0, cap: 20 });
       expect(getEnrichment(ctx)).not.toHaveProperty('notice');
     });
 

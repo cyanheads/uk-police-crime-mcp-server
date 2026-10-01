@@ -720,12 +720,12 @@ describe('ukcrime_search_crimes', () => {
       expect(out.notice).toBe('Showing 1–200 of 1500; call again with offset 200 for more.');
     });
 
-    it('uses a default page of 50', async () => {
+    it('uses a default page of 25', async () => {
       pointRoutes(manyCrimes(120));
       const out = data(await call({ ...POINT, month: '2026-07' }));
-      expect(out.crimes).toHaveLength(50);
-      expect(out.cap).toBe(50);
-      expect(out.next_offset).toBe(50);
+      expect(out.crimes).toHaveLength(25);
+      expect(out.cap).toBe(25);
+      expect(out.next_offset).toBe(25);
     });
 
     it.each<[string, Record<string, unknown>]>([
@@ -983,7 +983,7 @@ describe('ukcrime_search_crimes', () => {
         expect(out.data_note, input.area).toBeTruthy();
         expect(out.truncated, input.area).toBe(false);
         expect(out.shown, input.area).toBe(0);
-        expect(out.cap, input.area).toBe(50);
+        expect(out.cap, input.area).toBe(25);
         expect(out.notice, input.area).toBeTruthy();
       }
     });
@@ -1057,14 +1057,14 @@ describe('ukcrime_search_crimes', () => {
         data_note: expect.any(String),
         truncated: false,
         shown: 0,
-        cap: 50,
+        cap: 25,
       });
     });
 
     it('leaves truncated false and shown 0 when a later step fails', async () => {
       const { ctx, output } = await run({ ...POINT, month: '2026-09' });
       expect(output).toMatchObject({ data: { reason: 'month_not_published' } });
-      expect(getEnrichment(ctx)).toMatchObject({ truncated: false, shown: 0, cap: 50 });
+      expect(getEnrichment(ctx)).toMatchObject({ truncated: false, shown: 0, cap: 25 });
       expect(getEnrichment(ctx)).not.toHaveProperty('notice');
     });
 

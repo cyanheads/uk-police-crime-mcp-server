@@ -95,55 +95,30 @@ const StopFilterInput = z
 const StopSchema = z
   .object({
     datetime: z.string().describe('When the stop happened, UTC ISO 8601 as published.'),
-    type: z
-      .string()
-      .optional()
-      .describe('Person search, vehicle search, or both, as published. Absent when not recorded.'),
-    involved_person: z
-      .boolean()
-      .optional()
-      .describe('Whether a person was searched. Absent when not recorded.'),
-    gender: z.string().optional().describe('Gender as recorded. Absent when not recorded.'),
-    age_range: z.string().optional().describe('Age range as recorded. Absent when not recorded.'),
-    self_defined_ethnicity: z
-      .string()
-      .optional()
-      .describe('Ethnicity as the person defined it. Absent when not recorded.'),
+    type: z.string().optional().describe('Person search, vehicle search, or both.'),
+    involved_person: z.boolean().optional().describe('Whether a person was searched.'),
+    gender: z.string().optional().describe('Gender.'),
+    age_range: z.string().optional().describe('Age range.'),
+    self_defined_ethnicity: z.string().optional().describe('Ethnicity as the person defined it.'),
     officer_defined_ethnicity: z
       .string()
       .optional()
-      .describe('Ethnicity as the officer perceived it. Absent when not recorded.'),
-    legislation: z
-      .string()
-      .optional()
-      .describe('Power the search was made under. Absent when not recorded.'),
-    object_of_search: z
-      .string()
-      .optional()
-      .describe('What the officer was searching for. Absent when not recorded.'),
-    outcome: z
-      .string()
-      .optional()
-      .describe('Outcome as published. Absent when the force left it blank.'),
+      .describe('Ethnicity as the officer perceived it.'),
+    legislation: z.string().optional().describe('Power the search was made under.'),
+    object_of_search: z.string().optional().describe('What the officer was searching for.'),
+    outcome: z.string().optional().describe('Outcome.'),
     outcome_linked_to_object_of_search: z
       .boolean()
       .optional()
-      .describe(
-        'Whether the outcome related to the object searched for. Absent when not recorded.',
-      ),
+      .describe('Whether the outcome related to the object searched for.'),
     removal_of_more_than_outer_clothing: z
       .boolean()
       .optional()
-      .describe('Whether more than outer clothing was removed. Absent when not recorded.'),
-    operation_name: z
-      .string()
-      .optional()
-      .describe('Name of the policing operation, when the stop was part of one.'),
-    location: LocationSchema.optional().describe(
-      'Where data.police.uk places the stop. Absent for stops the force could not place.',
-    ),
+      .describe('Whether more than outer clothing was removed.'),
+    operation_name: z.string().optional().describe('Policing operation the stop was part of.'),
+    location: LocationSchema.optional().describe('Absent for stops the force could not place.'),
   })
-  .describe('One stop and search.');
+  .describe('One stop and search, values as published; a field is absent when not recorded.');
 
 const OutputSchema = z.object({
   month: z.string().describe('The month searched, YYYY-MM.'),
@@ -153,11 +128,11 @@ const OutputSchema = z.object({
       z
         .object({
           field: z.enum(STOP_FIELDS).describe('Field matched.'),
-          value: z.string().describe('Value matched, case-insensitively.'),
+          value: z.string().describe('Value matched.'),
         })
         .describe('One applied filter.'),
     )
-    .describe('Filters applied; empty when none.'),
+    .describe('Filters applied, case-insensitively; empty when none.'),
   total: z.number().describe('Stops matched after filters.'),
   unfiltered_total: z.number().describe('Stops in the area and month before filters.'),
   unplaced: z
@@ -167,7 +142,7 @@ const OutputSchema = z.object({
     .boolean()
     .optional()
     .describe(
-      "Whether the area's force (named, or located for a point) is in this month's stop-and-search publisher list. Absent when the force is not known.",
+      "Whether the area's force (named, or located for a point) published stop and search this month. Absent when the force is unknown.",
     ),
   by_type: breakdownSchema('Matched stops by search type, most first.'),
   by_self_defined_ethnicity: breakdownSchema(
@@ -177,7 +152,7 @@ const OutputSchema = z.object({
     'Matched stops by ethnicity as the officer perceived it, most first.',
   ),
   by_outcome: breakdownSchema(
-    "Matched stops by outcome, most first; a blank outcome counts as '(not recorded)' and is often the largest bucket.",
+    "Matched stops by outcome, most first; '(not recorded)' is often the largest.",
   ),
   by_object_of_search: breakdownSchema('Matched stops by object of search, most first.'),
   by_legislation: breakdownSchema('Matched stops by legislation, most first.'),
@@ -185,7 +160,7 @@ const OutputSchema = z.object({
   by_gender: breakdownSchema('Matched stops by gender, most first.'),
   stops: z
     .array(StopSchema)
-    .describe('This page of matched stops, sorted by datetime, oldest first, then location_id.'),
+    .describe('This page of matched stops, oldest first, then by location_id.'),
   next_offset: z
     .number()
     .optional()
@@ -260,7 +235,7 @@ export const searchStopsTool = tool('ukcrime_search_stops', {
       .describe(
         'Up to 8 filters, all of which a stop must match; they narrow the counts and the page together. Fields: type, self_defined_ethnicity, officer_defined_ethnicity, outcome, object_of_search, legislation, age_range, gender.',
       ),
-    limit: limitInput(25).describe('Stops on this page, 1–200. Default 25.'),
+    limit: limitInput(15).describe('Stops on this page, 1–200. Default 15.'),
     offset: offsetField,
   }),
   inputAliases: AREA_INPUT_ALIASES,
