@@ -169,6 +169,21 @@ describe('neighbourhoodIdInput', () => {
     accepted(neighbourhoodIdInput, 'N'.repeat(100));
     rejected(neighbourhoodIdInput, 'N'.repeat(101));
   });
+
+  it.each([
+    ['a lone high surrogate', 'NX\u{D800}01'],
+    ['a lone low surrogate', 'NX\u{DC00}01'],
+    ['a surrogate pair in the wrong order', 'NX\u{DC00}\u{D800}'],
+  ])('rejects %s as an input error, before any path is built', (_name, id) => {
+    const issues = rejected(neighbourhoodIdInput, id);
+    expect(issues.map((issue) => issue.message)).toEqual([
+      'A neighbourhood id must be well-formed text; this one contains an unpaired UTF-16 surrogate.',
+    ]);
+  });
+
+  it('accepts a character outside the Basic Multilingual Plane (a well-formed surrogate pair)', () => {
+    expect(accepted(neighbourhoodIdInput, 'NX\u{1F46E}')).toBe('NX\u{1F46E}');
+  });
 });
 
 describe('locationIdInput', () => {

@@ -292,7 +292,7 @@ export const getCrimeOutcomesTool = tool('ukcrime_get_crime_outcomes', {
         `**persistent_id:** ${inline(crime.persistent_id)} · **id:** ${inline(crime.id)}`,
       );
       if (crime.location) lines.push(`**Location:** ${renderLocation(crime.location)}`);
-      if (crime.context) lines.push('**Context:**', quote(crime.context));
+      if (crime.context) lines.push('**Context:**', quote(crime.context), '');
       if (!crime.history_available) {
         lines.push('**Outcome history:** not published by data.police.uk for this crime.');
       } else if (crime.outcomes.length === 0) {

@@ -40,6 +40,7 @@ import {
   wireLocation,
 } from '../fixtures/police-api-upstream.js';
 import { manyOutcomes, outcomeFor } from '../fixtures/police-api-upstream-w3.js';
+import { quoteRunOns } from '../fixtures/quote-run-ons.js';
 import { settle, useToolHarness } from '../fixtures/service-harness.js';
 
 type Input = z.input<typeof searchOutcomesTool.input>;
@@ -1451,6 +1452,18 @@ describe('ukcrime_search_outcomes', () => {
       expect(rendered).toContain('  - Context:\n    > First line\n    > Second line');
       expect(rendered).not.toContain('persistent_id');
       expect(rendered).not.toContain('Location:');
+    });
+
+    it('ends every quoted context with a blank line, so no server line renders inside it', async () => {
+      pointRoutes(
+        [1, 2, 3].map((id) =>
+          areaOutcomeRecord({ crime: crimeRecord({ id, context: `Context ${id}` }) }),
+        ),
+      );
+      const rendered = text(await call({ ...POINT, month: '2026-07', limit: 2 }));
+      expect(quoteRunOns(rendered)).toEqual([]);
+      expect(rendered).toContain('    > Context 1\n\n- **');
+      expect(rendered).toContain('    > Context 2\n\n**Next offset:** 2');
     });
 
     it('keeps upstream text verbatim in structuredContent and inert in the markdown', async () => {

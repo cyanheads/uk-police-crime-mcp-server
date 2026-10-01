@@ -46,6 +46,18 @@ export function toCoordinate(value: string | null | undefined): number | undefin
 const present = (value: string | null | undefined): string | undefined =>
   value?.trim() ? value : undefined;
 
+/**
+ * An upstream URL, trimmed, when it parses as an absolute `http:` or `https:`
+ * URL; otherwise `undefined`, so a `javascript:`, `data:`, relative or
+ * scheme-less value never reaches a `url` field a client could open.
+ */
+export function webUrl(value: string | null | undefined): string | undefined {
+  const trimmed = value?.trim();
+  if (!trimmed) return;
+  const protocol = URL.parse(trimmed)?.protocol;
+  return protocol === 'http:' || protocol === 'https:' ? trimmed : undefined;
+}
+
 /** Longest HTML field converted, in UTF-16 code units; a longer one is cut there. */
 const MAX_HTML_FIELD = 65_536;
 
@@ -202,13 +214,14 @@ const STATION_FIELDS = ['type', 'name', 'address', 'postcode', 'description'] as
 
 /**
  * `/{force}/{id}`: identity as published, the HTML description as text, and
- * `"0"` populations, unparseable centres and blank fields as absent. Links
- * without a title or url and stations with nothing published are dropped.
+ * `"0"` populations, unparseable centres, blank fields and URLs that are not
+ * `http:` or `https:` as absent. Links without a title or such a URL and
+ * stations with nothing published are dropped.
  */
 export function normalizeNeighbourhood(
   raw: z.output<typeof RawNeighbourhoodDetail>,
 ): NeighbourhoodDetail {
-  const url = raw.url_force?.trim();
+  const url = webUrl(raw.url_force);
   const latitude = toCoordinate(raw.centre?.latitude);
   const longitude = toCoordinate(raw.centre?.longitude);
   const population = Number(raw.population);
@@ -227,7 +240,7 @@ export function normalizeNeighbourhood(
     ),
     links: (raw.links ?? []).flatMap((link) => {
       const title = present(link.title);
-      const href = link.url?.trim();
+      const href = webUrl(link.url);
       const about = present(link.description);
       return title && href ? [{ title, url: href, ...(about ? { description: about } : {}) }] : [];
     }),

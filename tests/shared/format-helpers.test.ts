@@ -363,6 +363,16 @@ describe('printUrl', () => {
     expect(printUrl('https://example.test/a%20b%5Bc')).toBe('https://example.test/a%20b%5Bc');
   });
 
+  it('escapes the ampersand of a character reference rather than encoding it, so the query is unchanged', () => {
+    expect(printUrl('https://example.test/a?b=1&lrm;c=2&#x202E;d=3&#8238;&amp;e=4')).toBe(
+      'https://example.test/a?b=1\\&lrm;c=2\\&#x202E;d=3\\&#8238;\\&amp;e=4',
+    );
+  });
+
+  it('escapes a backslash, so one before a character reference cannot cancel its escape', () => {
+    expect(printUrl('https://example.test/a\\&lrm;b')).toBe('https://example.test/a\\\\\\&lrm;b');
+  });
+
   it('leaves nothing a renderer could read as link or HTML syntax', () => {
     const out = printUrl('<https://evil.test/ x>[a](b)\n\t');
     expect(out).not.toMatch(/[[\]<>\s]/u);

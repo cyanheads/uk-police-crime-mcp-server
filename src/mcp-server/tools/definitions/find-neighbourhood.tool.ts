@@ -478,7 +478,9 @@ export const findNeighbourhoodTool = tool('ukcrime_find_neighbourhood', {
       lines.push('', '### Police stations');
       if (neighbourhood.stations.length === 0) lines.push('', '_None published._');
       else lines.push('');
-      for (const station of neighbourhood.stations) {
+      for (const [index, station] of neighbourhood.stations.entries()) {
+        // A blank line closes the previous station's quoted description.
+        if (neighbourhood.stations[index - 1]?.description) lines.push('');
         const parts = [station.name, station.type, station.address, station.postcode]
           .filter((part): part is string => part !== undefined)
           .map(inline);
@@ -504,11 +506,12 @@ export const findNeighbourhoodTool = tool('ukcrime_find_neighbourhood', {
         lines.push(quote(priority.issue));
         if (priority.action) {
           lines.push(
+            '',
             `**Action taken**${priority.action_date ? ` (${inline(priority.action_date)})` : ''}:`,
             quote(priority.action),
           );
         } else if (priority.action_date) {
-          lines.push(`**Action recorded:** ${inline(priority.action_date)}`);
+          lines.push('', `**Action recorded:** ${inline(priority.action_date)}`);
         }
       }
     }
@@ -527,7 +530,9 @@ export const findNeighbourhoodTool = tool('ukcrime_find_neighbourhood', {
       lines.push('', `### Upcoming events (${result.events.length} of ${total})`);
       if (result.events.length === 0) lines.push('', '_None published._');
       else lines.push('');
-      for (const event of result.events) {
+      for (const [index, event] of result.events.entries()) {
+        // A blank line closes the previous event's quoted description.
+        if (result.events[index - 1]?.description) lines.push('');
         const parts = [`**${inline(event.title)}**`];
         if (event.type) parts.push(inline(event.type));
         if (event.start) parts.push(`starts ${inline(event.start)}`);

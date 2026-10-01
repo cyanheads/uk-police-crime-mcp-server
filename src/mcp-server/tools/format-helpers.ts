@@ -69,11 +69,15 @@ export function quote(text: string): string {
 /**
  * Renders an upstream URL as plain text, never a markdown link: breaks, control
  * and format characters removed, whitespace and `[`, `]`, `<`, `>`
- * percent-encoded so no renderer turns it into link or HTML syntax.
+ * percent-encoded so no renderer turns it into link or HTML syntax, and `\` and
+ * a character reference's `&` backslash-escaped rather than encoded, so the
+ * reference prints as written and the URL addresses the same resource.
  */
 export function printUrl(url: string): string {
-  return url
-    .replace(BREAKS, '')
-    .replace(STRIPPED, '')
-    .replace(/[[\]<>\s]/gu, encodeURIComponent);
+  return escapeMarkdown(
+    url
+      .replace(BREAKS, '')
+      .replace(STRIPPED, '')
+      .replace(/[[\]<>\s]/gu, encodeURIComponent),
+  );
 }

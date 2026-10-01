@@ -47,7 +47,11 @@ export const forceInput = blankAsUnset(
   (value) => value.toLowerCase().replace(/[\s_]+/g, '-'),
 );
 
-/** Neighbourhood id: trimmed only (ids are case-sensitive); path-safe — no `/`, `\`, `?`, `#`, control characters, or a whole `.`/`..`. */
+/**
+ * Neighbourhood id: trimmed only (ids are case-sensitive); path-safe — no `/`,
+ * `\`, `?`, `#`, control characters, or a whole `.`/`..` — and well-formed
+ * UTF-16, since `encodeURIComponent` throws on an unpaired surrogate.
+ */
 export const neighbourhoodIdInput = blankAsUnset(
   z
     .string()
@@ -58,6 +62,10 @@ export const neighbourhoodIdInput = blankAsUnset(
     )
     .refine((value) => value !== '.' && value !== '..' && !/\p{Cc}/u.test(value), {
       message: "A neighbourhood id cannot be '.' or '..' or contain control characters.",
+    })
+    .refine((value) => value.isWellFormed(), {
+      message:
+        'A neighbourhood id must be well-formed text; this one contains an unpaired UTF-16 surrogate.',
     })
     .optional(),
 );

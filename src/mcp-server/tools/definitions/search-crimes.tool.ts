@@ -401,7 +401,9 @@ export const searchCrimesTool = tool('ukcrime_search_crimes', {
     lines.push('', `### Crimes on this page (${result.crimes.length})`);
     if (result.crimes.length === 0) lines.push('', '_None._');
     else lines.push('');
-    for (const crime of result.crimes) {
+    for (const [index, crime] of result.crimes.entries()) {
+      // A blank line closes the previous crime's quoted context.
+      if (result.crimes[index - 1]?.context) lines.push('');
       const head = [`**${inline(crime.category)}**`, `id ${inline(crime.id)}`, inline(crime.month)];
       if (crime.persistent_id) head.push(`persistent_id ${inline(crime.persistent_id)}`);
       lines.push(`- ${head.join(' · ')}`);

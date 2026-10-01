@@ -39,10 +39,11 @@ import {
   outcomesBody,
   overloaded,
   plainNotFound,
+  type Responder,
   status,
   stopsBody,
 } from '../fixtures/police-api-upstream.js';
-import { settle, useServiceHarness } from '../fixtures/service-harness.js';
+import { settle, untilReal, useServiceHarness } from '../fixtures/service-harness.js';
 
 const POINT: AreaSpec = { kind: 'point', lat: 52.63, lng: -1.13 };
 const RING: AreaSpec = {
@@ -166,22 +167,37 @@ describe('monthFailureMessage', () => {
 describe('runAreaQuery', () => {
   const h = useServiceHarness();
 
-  const crimes = (spec: AreaSpec, category = 'all-crime', ctx = h.ctx) =>
-    settle(
-      runAreaQuery(
-        spec,
-        (target) => crimesQuery(target, category, '2026-08'),
-        h.service,
-        ctx,
-        h.budget(),
-      ),
+  /** Starts the query without moving the virtual clock; {@link crimes} also drives it to completion. */
+  const startCrimes = (spec: AreaSpec, category = 'all-crime', ctx = h.ctx) =>
+    runAreaQuery(
+      spec,
+      (target) => crimesQuery(target, category, '2026-08'),
+      h.service,
+      ctx,
+      h.budget(),
     );
+  const crimes = (spec: AreaSpec, category = 'all-crime', ctx = h.ctx) =>
+    settle(startCrimes(spec, category, ctx));
 
   describe('point arm', () => {
     it('sends the area query and the locate together, and returns both', async () => {
-      h.upstream.route('GET', '/crimes-street/all-crime', jsonOk(crimesBody()));
-      h.upstream.route('GET', '/locate-neighbourhood', jsonOk(locateBody()));
-      const run = await crimes(POINT);
+      // Both answers wait until both requests are out, so neither request can wait on the other's answer.
+      let release = () => {};
+      const answered = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const held =
+        (respond: Responder): Responder =>
+        async (request) => {
+          await answered;
+          return respond(request);
+        };
+      h.upstream.route('GET', '/crimes-street/all-crime', held(jsonOk(crimesBody())));
+      h.upstream.route('GET', '/locate-neighbourhood', held(jsonOk(locateBody())));
+      const pending = startCrimes(POINT);
+      await untilReal(() => h.upstream.calls.length === 2);
+      release();
+      const run = await settle(pending);
       if (run.kind !== 'ok') throw new Error(`got ${run.kind}`);
       expect(run.records).toHaveLength(7);
       expect(run.target).toBe(POINT);
@@ -199,7 +215,9 @@ describe('runAreaQuery', () => {
         return jsonOk(crimesBody())(request);
       });
       h.upstream.route('GET', '/locate-neighbourhood', jsonOk(locateBody()));
-      const run = await crimes(POINT);
+      const pending = startCrimes(POINT);
+      await untilReal(() => h.upstream.calls.length === 2);
+      const run = await settle(pending);
       expect(run.kind).toBe('ok');
       const locate = h.upstream.callsTo('/locate-neighbourhood')[0];
       const area = h.upstream.callsTo('/crimes-street/all-crime')[0];
@@ -259,9 +277,11 @@ describe('runAreaQuery', () => {
       const ctx = h.ctxWith(controller.signal);
       h.upstream.route('GET', '/crimes-street/all-crime', jsonOk(crimesBody()));
       h.upstream.route('GET', '/locate-neighbourhood', hang);
+      const pending = startCrimes(POINT, 'all-crime', ctx);
+      await untilReal(() => h.upstream.calls.length === 2);
       // The area query has long since answered when the caller cancels.
       setTimeout(() => controller.abort(), 1000);
-      const error = await crimes(POINT, 'all-crime', ctx).catch((e: unknown) => e);
+      const error = await settle(pending).catch((e: unknown) => e);
       expect(error).toBeInstanceOf(Error);
       expect(error).not.toHaveProperty('kind');
       expect(ctx.signal.aborted).toBe(true);

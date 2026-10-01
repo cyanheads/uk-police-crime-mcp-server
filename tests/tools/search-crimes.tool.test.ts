@@ -43,6 +43,7 @@ import {
   unplacedCrimesBody,
   wireLocation,
 } from '../fixtures/police-api-upstream.js';
+import { quoteRunOns } from '../fixtures/quote-run-ons.js';
 import { settle, useToolHarness } from '../fixtures/service-harness.js';
 
 type Input = z.input<typeof searchCrimesTool.input>;
@@ -1656,6 +1657,14 @@ describe('ukcrime_search_crimes', () => {
       pointRoutes();
       const rendered = text(await call({ ...POINT }));
       expect(rendered).toContain('  - Context:\n    > Line one\n    > Line two');
+    });
+
+    it('ends every quoted context with a blank line, so no server line renders inside it', async () => {
+      pointRoutes([1, 2, 3].map((id) => crimeRecord({ id, context: `Context ${id}` })));
+      const rendered = text(await call({ ...POINT, limit: 2 }));
+      expect(quoteRunOns(rendered)).toEqual([]);
+      expect(rendered).toContain('    > Context 1\n\n- **');
+      expect(rendered).toContain('    > Context 2\n\n**Next offset:** 2');
     });
 
     it('renders none markers for an empty result', async () => {

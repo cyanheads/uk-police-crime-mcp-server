@@ -384,6 +384,20 @@ describe('PoliceApiService reference methods', () => {
     });
 
     it.each([
+      'javascript:alert(1)',
+      'data:text/html,<b>x</b>',
+      '/relative',
+      'www.example-force.police.test',
+    ])('omits a url that is not http or https: %j', async (url) => {
+      h.upstream.route('GET', '/forces/leicestershire', jsonOk(forceDetailBody({ url })));
+      const lookup = await settle(h.service.getForceDetail('leicestershire', h.ctx, h.budget()));
+      expect(lookup).toEqual({
+        kind: 'found',
+        value: { id: 'leicestershire', name: 'Leicestershire Police', telephone: '101' },
+      });
+    });
+
+    it.each([
       ['null', null],
       ['an empty string', ''],
       ['whitespace', '   '],

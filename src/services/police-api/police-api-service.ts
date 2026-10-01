@@ -46,6 +46,7 @@ import {
   normalizeNeighbourhood,
   normalizePriorities,
   toCoordinate,
+  webUrl,
 } from './records.js';
 import type {
   Availability,
@@ -417,7 +418,10 @@ export class PoliceApiService {
     );
   }
 
-  /** `/forces/{id}` — website and switchboard. 404 (unknown force, or `btp`) → miss. Cached 24 h. */
+  /**
+   * `/forces/{id}` — website (only an `http:` or `https:` URL) and switchboard.
+   * 404 (unknown force, or `btp`) → miss. Cached 24 h.
+   */
   async getForceDetail(id: string, ctx: Context, budget: CallBudget): Promise<Lookup<ForceDetail>> {
     const cached = this.forceDetailCache.get(id);
     if (cached) return cached;
@@ -426,12 +430,13 @@ export class PoliceApiService {
     let result: Lookup<ForceDetail> = MISS;
     if (answer.kind === 'ok') {
       const raw = parseUpstream(RawForceDetail, answer.json, path);
+      const url = webUrl(raw.url);
       result = {
         kind: 'found',
         value: {
           id: raw.id,
           name: raw.name,
-          ...(raw.url?.trim() ? { url: raw.url.trim() } : {}),
+          ...(url ? { url } : {}),
           ...(raw.telephone?.trim() ? { telephone: raw.telephone.trim() } : {}),
         },
       };

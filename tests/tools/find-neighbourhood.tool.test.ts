@@ -47,6 +47,7 @@ import {
   neighbourhoodRoutes,
   peopleWithPrivateFields,
 } from '../fixtures/police-api-upstream-w3.js';
+import { quoteRunOns } from '../fixtures/quote-run-ons.js';
 import { settle, useToolHarness } from '../fixtures/service-harness.js';
 
 type Input = z.input<typeof findNeighbourhoodTool.input>;
@@ -1057,6 +1058,36 @@ describe('ukcrime_find_neighbourhood', () => {
       expect(rendered).toContain('### Police stations\n\n_None published._');
       h.upstream.route('GET', `${P}/priorities`, jsonOk([]));
       expect(text(await call({ ...BY_ID }))).toContain('### Priorities (0)\n\n_None published._');
+    });
+
+    it('ends every quoted block with a blank line, so no server line renders inside it', async () => {
+      routes();
+      const station = (name: string) => ({ type: 'station', name, description: `${name} hours` });
+      h.upstream.route(
+        'GET',
+        P,
+        jsonOk(neighbourhoodDetailBody({ locations: [station('North'), station('South')] })),
+      );
+      h.upstream.route(
+        'GET',
+        `${P}/priorities`,
+        jsonOk([
+          { issue: 'With an action', action: 'Patrols', 'action-date': '2026-08-01T00:00:00' },
+          { issue: 'With an action date', action: null, 'action-date': '2026-08-02T00:00:00' },
+          { issue: 'Issue only', action: null },
+        ]),
+      );
+      h.upstream.route('GET', `${P}/events`, jsonOk(manyEvents(3)));
+      for (const include of [undefined, [], ['priorities'], ['events']] as const) {
+        const rendered = text(await call({ ...BY_ID, include: include && [...include] }));
+        expect(quoteRunOns(rendered), JSON.stringify(include)).toEqual([]);
+      }
+      const rendered = text(await call({ ...BY_ID }));
+      expect(rendered).toContain('> With an action\n\n**Action taken** (2026-08-01T00:00:00):');
+      expect(rendered).toContain(
+        '> With an action date\n\n**Action recorded:** 2026-08-02T00:00:00',
+      );
+      expect(rendered).toContain('  > North hours\n\n- South');
     });
 
     it('omits the headings of sections that were not loaded', async () => {

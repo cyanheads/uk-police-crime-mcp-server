@@ -291,6 +291,29 @@ describe('normalizeNeighbourhood', () => {
     it('trims url_force', () => {
       expect(hood({ url_force: '  https://example.test/a  ' }).url).toBe('https://example.test/a');
     });
+
+    it.each([
+      'http://example.test/a',
+      'https://example.test/a?b=1&c=2#d',
+      'HTTPS://Example.test/A',
+    ])('keeps the http or https url_force %j as published', (url_force) => {
+      expect(hood({ url_force }).url).toBe(url_force);
+    });
+
+    it.each<[string, string]>([
+      ['a javascript: url', 'javascript:alert(1)'],
+      ['a javascript: url split by a tab', 'java\tscript:alert(1)'],
+      ['a data: url', 'data:text/html,<b>x</b>'],
+      ['a vbscript: url', 'vbscript:msgbox(1)'],
+      ['a file: url', 'file:///etc/passwd'],
+      ['an ftp: url', 'ftp://example.test/a'],
+      ['a mailto: url', 'mailto:team@example.test'],
+      ['a relative path', '/neighbourhood/nx01'],
+      ['a host without a scheme', 'www.example.test/nx01'],
+      ['an unparseable url', 'https://exa mple.test/'],
+    ])('drops %s', (_name, url_force) => {
+      expect(hood({ url_force })).not.toHaveProperty('url');
+    });
   });
 
   describe('description', () => {
@@ -400,6 +423,19 @@ describe('normalizeNeighbourhood', () => {
         ],
       });
       expect(result.links).toEqual([{ title: 'Keeper', url: 'https://example.test/k' }]);
+    });
+
+    it('drops a link whose url is not http or https', () => {
+      const result = hood({
+        links: [
+          { title: 'Script', url: 'javascript:alert(1)', description: null },
+          { title: 'Data', url: 'data:text/html,<b>x</b>', description: null },
+          { title: 'Relative', url: '/a', description: null },
+          { title: 'No scheme', url: 'www.example.test/a', description: null },
+          { title: 'Keeper', url: ' http://example.test/k ', description: null },
+        ],
+      });
+      expect(result.links).toEqual([{ title: 'Keeper', url: 'http://example.test/k' }]);
     });
 
     it.each<[string, unknown]>([

@@ -44,6 +44,7 @@ import {
   persistentIds,
   trackInFlight,
 } from '../fixtures/police-api-upstream-w3.js';
+import { quoteRunOns } from '../fixtures/quote-run-ons.js';
 import { settle, useToolHarness } from '../fixtures/service-harness.js';
 
 type Input = z.input<typeof getCrimeOutcomesTool.input>;
@@ -813,6 +814,20 @@ describe('ukcrime_get_crime_outcomes', () => {
         '**Location:** On or near Example Street · location_id 1000001 · anonymised map point 52.63, -1.13 · Force',
       );
       expect(rendered).toContain('**Context:**\n> Some context');
+    });
+
+    it('ends the quoted context with a blank line, so the outcome history line renders outside it', async () => {
+      const crime = { context: 'Force-written context' };
+      h.upstream.route('GET', pathOf(A), jsonOk(crimeHistoryBody(A, { crime })));
+      h.upstream.route('GET', pathOf(B), jsonOk(crimeHistoryBody(B, { crime, outcomes: [] })));
+      h.upstream.route('GET', pathOf(C), jsonOk(crimeHistoryBody(C, { crime, outcomes: null })));
+      const rendered = text(await call({ persistent_ids: [A, B, C] }));
+      expect(quoteRunOns(rendered)).toEqual([]);
+      expect(rendered).toContain('> Force-written context\n\n**Outcome history:**\n');
+      expect(rendered).toContain('> Force-written context\n\n**Outcome history:** none recorded.');
+      expect(rendered).toContain(
+        '> Force-written context\n\n**Outcome history:** not published by data.police.uk for this crime.',
+      );
     });
 
     it('lists outcomes in the order structuredContent carries them', async () => {

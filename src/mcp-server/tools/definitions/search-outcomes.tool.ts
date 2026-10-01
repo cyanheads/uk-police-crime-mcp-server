@@ -388,8 +388,10 @@ export const searchOutcomesTool = tool('ukcrime_search_outcomes', {
     lines.push('', `### Outcomes on this page (${result.outcomes.length})`);
     if (result.outcomes.length === 0) lines.push('', '_None._');
     else lines.push('');
-    for (const outcome of result.outcomes) {
+    for (const [index, outcome] of result.outcomes.entries()) {
       const { crime } = outcome;
+      // A blank line closes the previous outcome's quoted crime context.
+      if (result.outcomes[index - 1]?.crime.context) lines.push('');
       lines.push(
         `- **${inline(outcome.name)}** (${inline(outcome.code)}) · recorded ${inline(outcome.month)}`,
       );

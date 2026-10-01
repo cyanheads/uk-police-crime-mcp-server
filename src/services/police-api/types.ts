@@ -61,7 +61,7 @@ export interface ForceDetail {
   readonly name: string;
   /** Force switchboard number as published, when non-empty. Upstream text. */
   readonly telephone?: string;
-  /** Force website, when non-empty. Upstream URL. */
+  /** Force website, when it is an `http:` or `https:` URL. Upstream URL. */
   readonly url?: string;
 }
 
@@ -207,7 +207,7 @@ export interface NeighbourhoodDetail {
   /** Plain text converted from HTML; absent when missing, null or empty. */
   readonly description?: string;
   readonly id: string;
-  /** Links the force publishes for the team; entries without a title or url are dropped. */
+  /** Links the force publishes for the team; entries without a title or an `http:`/`https:` url are dropped. */
   readonly links: readonly {
     readonly description?: string;
     readonly title: string;
@@ -217,7 +217,7 @@ export interface NeighbourhoodDetail {
   /** Absent when upstream sends `"0"` or a non-number. */
   readonly population?: number;
   readonly stations: readonly Station[];
-  /** The team's page on the force website (upstream `url_force`). */
+  /** The team's page on the force website (upstream `url_force`), when it is an `http:` or `https:` URL. */
   readonly url?: string;
 }
 

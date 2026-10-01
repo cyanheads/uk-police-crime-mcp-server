@@ -163,6 +163,21 @@ export async function settle<T>(promise: Promise<T>, stepMs = 50, limitMs = 300_
   return promise;
 }
 
+/**
+ * Waits real time with the virtual clock held still until `ready()` holds, so
+ * native work a request waits on (an area query's SHA-256 cache key) finishes
+ * before {@link settle} moves the clock. Fails after `limitMs` real milliseconds.
+ */
+export async function untilReal(ready: () => boolean, limitMs = 2000): Promise<void> {
+  const start = performance.now();
+  while (!ready()) {
+    if (performance.now() - start > limitMs) {
+      throw new Error(`untilReal: the condition still did not hold after ${limitMs} ms`);
+    }
+    await new Promise<void>((resolve) => realSetTimeout(resolve, 1));
+  }
+}
+
 /** A service wired to a fresh upstream and a mock context, rebuilt for every test. */
 export interface ServiceHarness {
   /** A budget opened now (50 s on the virtual clock). */
