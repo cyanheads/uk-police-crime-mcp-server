@@ -115,10 +115,10 @@ ENV NODE_ENV=production
 # OCI image metadata (https://github.com/opencontainers/image-spec/blob/main/annotations.md)
 ARG APP_VERSION
 LABEL org.opencontainers.image.title="uk-police-crime-mcp-server"
-LABEL org.opencontainers.image.description=""
+LABEL org.opencontainers.image.description="Search UK street-level crime, police outcomes, stop and search, and neighbourhood teams from data.police.uk: England, Wales and Northern Ireland forces, plus British Transport Police (Scotland's only coverage), via MCP. STDIO or Streamable HTTP."
 LABEL org.opencontainers.image.licenses="Apache-2.0"
 LABEL org.opencontainers.image.version="${APP_VERSION}"
-LABEL org.opencontainers.image.source=""
+LABEL org.opencontainers.image.source="https://github.com/cyanheads/uk-police-crime-mcp-server"
 
 # The manifest comes from the build context: the deps stage's copy was rewritten
 # by the OTel install, and the runtime reads only its name, version, and type.

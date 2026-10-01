@@ -1,8 +1,9 @@
 {
   "manifest_version": "0.3",
   "name": "uk-police-crime-mcp-server",
+  "display_name": "uk-police-crime-mcp-server",
   "version": "0.1.0",
-  "description": "UK street-level crime, outcomes, and stop-and-search data for police forces in England, Wales, and Northern Ireland, plus neighbourhood teams and priorities.",
+  "description": "Search UK street-level crime, police outcomes, stop and search, and neighbourhood teams from data.police.uk: England, Wales and Northern Ireland forces, plus British Transport Police (Scotland's only coverage), via MCP. STDIO or Streamable HTTP.",
   "author": {
     "name": "cyanheads"
   },
@@ -25,8 +26,25 @@
     }
   },
   "tools_generated": true,
-  "prompts_generated": true,
+  "prompts_generated": false,
   "user_config": {},
+  "keywords": [
+    "mcp",
+    "mcp-server",
+    "model-context-protocol",
+    "typescript",
+    "uk",
+    "police",
+    "crime",
+    "crime-data",
+    "data-police-uk",
+    "stop-and-search",
+    "police-outcomes",
+    "neighbourhood-policing",
+    "open-data",
+    "geospatial"
+  ],
+  "homepage": "https://github.com/cyanheads/uk-police-crime-mcp-server#readme",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",

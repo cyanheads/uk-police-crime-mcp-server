@@ -1,6 +1,6 @@
 # uk-police-crime-mcp-server - Directory Structure
 
-Generated on: 2026-10-01 15:17:39
+Generated on: 2026-10-01 16:13:11
 
 ```text
 uk-police-crime-mcp-server/
@@ -24,6 +24,7 @@ uk-police-crime-mcp-server/
 │   ├── extensions.json
 │   └── settings.json
 ├── changelog/
+│   ├── 0.1.x/
 │   └── template.md
 ├── docs/
 │   └── design.md
@@ -194,12 +195,14 @@ uk-police-crime-mcp-server/
 ├── biome.json
 ├── bun.lock
 ├── bunfig.toml
+├── CHANGELOG.md
 ├── CLAUDE.md
 ├── devcheck.config.json
 ├── Dockerfile
 ├── LICENSE
 ├── manifest.json
 ├── package.json
+├── README.md
 ├── server.json
 ├── tsconfig.build.json
 ├── tsconfig.json
