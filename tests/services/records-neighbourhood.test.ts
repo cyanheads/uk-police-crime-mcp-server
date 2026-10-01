@@ -669,3 +669,38 @@ describe('raw schemas for the neighbourhood sections', () => {
     expect(RawNeighbourhoodDetail.safeParse({ id: 'NX01', name: 'Example' }).success).toBe(true);
   });
 });
+
+describe('HTML field length', () => {
+  const LIMIT = 65_536;
+  const MARK = '[Cut: the published field is longer than 65,536 characters.]';
+
+  const FIELDS: readonly [string, (html: string) => string | undefined][] = [
+    ['a neighbourhood description', (html) => hood({ description: html }).description],
+    ['a priority issue', (html) => priorities({ issue: html })[0]?.issue],
+    ['a priority action', (html) => priorities({ issue: 'Issue', action: html })[0]?.action],
+    [
+      'an event description',
+      (html) => events({ title: 'Event', description: html })[0]?.description,
+    ],
+  ];
+
+  it.each(FIELDS)('cuts %s at 65,536 characters of HTML and marks the cut', (_name, convert) => {
+    expect(convert(`<p>${'a'.repeat(LIMIT)}</p>`)).toBe(`${'a'.repeat(LIMIT - 3)}\n${MARK}`);
+  });
+
+  it.each(FIELDS)('leaves %s of exactly 65,536 characters whole', (_name, convert) => {
+    expect(convert('a'.repeat(LIMIT))).toBe('a'.repeat(LIMIT));
+  });
+
+  it('never cuts between the two halves of a surrogate pair', () => {
+    const text = hood({ description: `${'a'.repeat(LIMIT - 1)}\u{1F600}b` }).description;
+    expect(text).toBe(`${'a'.repeat(LIMIT - 1)}\n${MARK}`);
+    expect(text?.isWellFormed()).toBe(true);
+  });
+
+  it('bounds the work on a field made of unclosed tags', () => {
+    const start = performance.now();
+    expect(hood({ description: '<script>'.repeat(500_000) })).not.toHaveProperty('description');
+    expect(performance.now() - start).toBeLessThan(250);
+  });
+});

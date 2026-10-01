@@ -1,11 +1,12 @@
 /**
  * @fileoverview PoliceApiService — the only path to data.police.uk. Owns the
- * request boundary (per-call status accept-lists, a decoded-byte ceiling, the
- * 503 overload value and its separately paced health probe), the process-wide
- * pacer, retry and per-call budget, and every in-process cache. Reference
- * methods (availability, forces, categories, force detail, neighbourhood lists),
- * the locate and boundary lookups, and the generic area query live here; tools
- * add nothing between themselves and the upstream.
+ * request boundary (per-call status accept-lists, a decoded-byte ceiling, tag
+ * characters dropped at the parse, the 503 overload value and its separately
+ * paced health probe), the process-wide pacer, retry and per-call budget, and
+ * every in-process cache. Reference methods (availability, forces, categories,
+ * force detail, neighbourhood lists), the locate and boundary lookups, and the
+ * generic area query live here; tools add nothing between themselves and the
+ * upstream.
  * @module services/police-api/police-api-service
  */
 
@@ -202,6 +203,29 @@ async function readCapped(
     chunk = await reader.read();
   }
   return { bytes, text: text + decoder.decode() };
+}
+
+/** Tag characters (U+E0000–U+E007F): invisible, and able to spell out text no reader sees. */
+const TAG_CHARACTERS = /[\u{E0000}-\u{E007F}]/gu;
+
+/** A literal tag character, or the `\uDB40` escape that opens every escaped one. */
+const MAY_CARRY_TAG_CHARACTERS = /[\u{E0000}-\u{E007F}]|\\u[dD][bB]40/u;
+
+/**
+ * `JSON.parse` with tag characters dropped from every string, keys included,
+ * whether the body writes them literally or as escaped surrogate pairs; every
+ * other character stays as received. A body with neither form skips the
+ * reviver, which costs several times the parse itself on a large area answer.
+ */
+function parseBody(text: string): unknown {
+  if (!MAY_CARRY_TAG_CHARACTERS.test(text)) return JSON.parse(text);
+  return JSON.parse(text, (_key, value: unknown) => {
+    if (typeof value === 'string') return value.replace(TAG_CHARACTERS, '');
+    if (value === null || typeof value !== 'object' || Array.isArray(value)) return value;
+    return Object.fromEntries(
+      Object.entries(value).map(([key, field]) => [key.replace(TAG_CHARACTERS, ''), field]),
+    );
+  });
 }
 
 /** Cache key for an area request: SHA-256 of method, route and the sorted, encoded params. */
@@ -847,7 +871,7 @@ export class PoliceApiService {
         });
       }
       try {
-        return { kind: 'ok', json: JSON.parse(body.text), bytes: body.bytes };
+        return { kind: 'ok', json: parseBody(body.text), bytes: body.bytes };
       } catch (error) {
         throw serviceUnavailable(
           'data.police.uk answered with a body that is not JSON.',

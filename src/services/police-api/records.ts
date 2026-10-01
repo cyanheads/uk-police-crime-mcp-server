@@ -4,9 +4,9 @@
  * neighbourhood team's profile, priorities, members and events. Each maps one
  * parsed response body's upstream sentinels to absence (`""` persistent ids
  * and outcomes, `0,0` map points, null or blank fields, `"0"` populations),
- * converts the HTML fields to plain text, and writes the tools' wire shape in
- * the calling tool's order. Area records are what the area cache stores and
- * shares read-only.
+ * converts the HTML fields to plain text (each cut at 65,536 characters first),
+ * and writes the tools' wire shape in the calling tool's order. Area records are
+ * what the area cache stores and shares read-only.
  * @module services/police-api/records
  */
 
@@ -45,6 +45,26 @@ export function toCoordinate(value: string | null | undefined): number | undefin
 /** `value` when it is a non-blank string, otherwise `undefined`. */
 const present = (value: string | null | undefined): string | undefined =>
   value?.trim() ? value : undefined;
+
+/** Longest HTML field converted, in UTF-16 code units; a longer one is cut there. */
+const MAX_HTML_FIELD = 65_536;
+
+/** The line that ends the text of a field cut at {@link MAX_HTML_FIELD}. */
+const CUT_MARK = '[Cut: the published field is longer than 65,536 characters.]';
+
+/**
+ * An HTML field as text, cut at {@link MAX_HTML_FIELD} before conversion so the
+ * field's length bounds both the work and the text a caller receives. The cut
+ * never splits a surrogate pair, and the text of a cut field ends with
+ * {@link CUT_MARK} on its own line.
+ */
+function fieldText(html: string | null | undefined): string | undefined {
+  if (html == null || html.length <= MAX_HTML_FIELD) return htmlToText(html);
+  const last = html.charCodeAt(MAX_HTML_FIELD - 1);
+  const end = last >= 0xd800 && last <= 0xdbff ? MAX_HTML_FIELD - 1 : MAX_HTML_FIELD;
+  const text = htmlToText(html.slice(0, end));
+  return text && `${text}\n${CUT_MARK}`;
+}
 
 /** Code-unit order, so the sort never depends on the runtime's locale. */
 export const compareText = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
@@ -192,7 +212,7 @@ export function normalizeNeighbourhood(
   const latitude = toCoordinate(raw.centre?.latitude);
   const longitude = toCoordinate(raw.centre?.longitude);
   const population = Number(raw.population);
-  const description = htmlToText(raw.description);
+  const description = fieldText(raw.description);
   return {
     id: raw.id,
     name: raw.name,
@@ -226,10 +246,10 @@ export function normalizeNeighbourhood(
 /** `/{force}/{id}/priorities`: issue and action as text, dates as published; a priority whose issue is empty is dropped. */
 export function normalizePriorities(raw: z.output<typeof RawPriorities>): readonly Priority[] {
   return raw.flatMap((entry) => {
-    const issue = htmlToText(entry.issue);
+    const issue = fieldText(entry.issue);
     if (!issue) return [];
     const issueDate = present(entry['issue-date']);
-    const action = htmlToText(entry.action);
+    const action = fieldText(entry.action);
     const actionDate = present(entry['action-date']);
     return [
       {
@@ -250,7 +270,7 @@ export function normalizeEvents(raw: z.output<typeof RawEvents>): readonly Neigh
       const start = present(entry.start_date);
       const end = present(entry.end_date);
       const address = present(entry.address);
-      const description = htmlToText(entry.description);
+      const description = fieldText(entry.description);
       return {
         title: entry.title,
         ...(type ? { type } : {}),

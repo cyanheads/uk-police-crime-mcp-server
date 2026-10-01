@@ -50,13 +50,15 @@ function preparePersistentIds(value: unknown): unknown {
 }
 
 /** Server-written failure text for the service's `ServiceUnavailable` reasons. */
-const UNAVAILABLE_BY_REASON: Readonly<Record<string, string>> = {
-  response_too_large: 'data.police.uk sent a response too large to read.',
-  unreadable_response: 'data.police.uk answered with a body that is not JSON.',
-  unexpected_response: 'data.police.uk answered in an unexpected shape.',
-  unexpected_redirect:
+const UNAVAILABLE_BY_REASON: ReadonlyMap<string, string> = new Map([
+  ['response_too_large', 'data.police.uk sent a response too large to read.'],
+  ['unreadable_response', 'data.police.uk answered with a body that is not JSON.'],
+  ['unexpected_response', 'data.police.uk answered in an unexpected shape.'],
+  [
+    'unexpected_redirect',
     'data.police.uk answered with a redirect, which this server does not follow.',
-};
+  ],
+]);
 
 /**
  * Why one lookup failed, written from the error's code, `reason`, HTTP status
@@ -80,7 +82,7 @@ function lookupFailure(error: unknown): string {
         : 'data.police.uk did not answer in time.';
     case JsonRpcErrorCode.ServiceUnavailable:
       return (
-        (typeof reason === 'string' ? UNAVAILABLE_BY_REASON[reason] : undefined) ??
+        (typeof reason === 'string' ? UNAVAILABLE_BY_REASON.get(reason) : undefined) ??
         `data.police.uk is not answering${http}.`
       );
     default:

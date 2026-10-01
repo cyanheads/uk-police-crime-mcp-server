@@ -1,7 +1,8 @@
 /**
  * @fileoverview format-helpers: the escaping that keeps upstream-authored text
  * inert inside `content[]` — line breaks flattened in inline slots, control and
- * bidi characters stripped, markdown link/image/HTML openers and backslashes
+ * format characters stripped (the two zero-width joiners kept), markdown
+ * link/image/HTML openers, character-reference ampersands and backslashes
  * escaped, table pipes escaped, free text quoted line by line, URLs printed as
  * plain text.
  * @module tests/shared/format-helpers.test
@@ -50,6 +51,19 @@ const CONTROL_CHARS = [
   '\u0080',
   '\u009f',
 ] as const;
+
+/** Format characters that render as nothing; every helper must strip them. */
+const INVISIBLE_CHARS = [
+  '\u{E0001}',
+  '\u{E0041}',
+  '\u{E007F}',
+  '\u{200B}',
+  '\u{2060}',
+  '\u{FEFF}',
+] as const;
+
+/** Joiners that scripts and emoji sequences need; every helper keeps them. */
+const JOINER_CHARS = ['\u{200C}', '\u{200D}'] as const;
 
 /** Splits a markdown table row on pipes that are not backslash-escaped. */
 function splitRow(row: string): string[] {
@@ -160,6 +174,33 @@ describe('inline', () => {
   it('strips controls after flattening, so a break next to a control still yields one space', () => {
     expect(inline('a\u0000\nb')).toBe('a b');
   });
+
+  it.each(INVISIBLE_CHARS)('strips the invisible character %j', (char) => {
+    expect(inline(`a${char}b`)).toBe('ab');
+  });
+
+  it('strips a run of tag characters spelling hidden text', () => {
+    expect(inline('Ward panel\u{E0049}\u{E0047}\u{E004E}\u{E004F}\u{E0052}\u{E0045}')).toBe(
+      'Ward panel',
+    );
+  });
+
+  it.each(JOINER_CHARS)('keeps the joiner %j', (char) => {
+    expect(inline(`a${char}b`)).toBe(`a${char}b`);
+  });
+
+  it.each([
+    ['a numeric reference', '&#x202E;'],
+    ['a decimal reference', '&#8238;'],
+    ['a named reference', '&lrm;'],
+    ['an escaped ampersand', '&amp;'],
+  ])('escapes the ampersand of %s, so no renderer decodes it', (_name, ref) => {
+    expect(inline(`a${ref}b`)).toBe(`a\\${ref}b`);
+  });
+
+  it('leaves an ampersand that starts no reference alone', () => {
+    expect(inline('Fish & chips &x &#; & ;')).toBe('Fish & chips &x &#; & ;');
+  });
 });
 
 describe('cell', () => {
@@ -183,6 +224,14 @@ describe('cell', () => {
   it('cannot let a trailing backslash escape the cell delimiter that follows it', () => {
     const row = `| ${cell('ends with a backslash\\')} | other |`;
     expect(splitRow(row)).toEqual(['', ' ends with a backslash\\\\ ', ' other ', '']);
+  });
+
+  it.each(INVISIBLE_CHARS)('strips the invisible character %j', (char) => {
+    expect(cell(`a${char}|b`)).toBe('a\\|b');
+  });
+
+  it.each(JOINER_CHARS)('keeps the joiner %j', (char) => {
+    expect(cell(`a${char}b`)).toBe(`a${char}b`);
   });
 });
 
@@ -260,6 +309,22 @@ describe('quote', () => {
   it('leaves no carriage return or Unicode line separator in the output', () => {
     expect(quote('a\r\nb\rc\u2028d\u2029e')).not.toMatch(/[\r\u2028\u2029\u0085]/u);
   });
+
+  it.each(INVISIBLE_CHARS)('strips the invisible character %j', (char) => {
+    expect(quote(`a${char}b`)).toBe('> ab');
+  });
+
+  it('renders a line of only invisible characters as a bare ">"', () => {
+    expect(quote(`one\n${INVISIBLE_CHARS.join('')}\ntwo`)).toBe('> one\n>\n> two');
+  });
+
+  it.each(JOINER_CHARS)('keeps the joiner %j', (char) => {
+    expect(quote(`a${char}b`)).toBe(`> a${char}b`);
+  });
+
+  it('escapes the ampersand of a character reference inside the blockquote', () => {
+    expect(quote('see &#x202E;txt.exe &amp;lt;')).toBe('> see \\&#x202E;txt.exe \\&amp;lt;');
+  });
 });
 
 describe('printUrl', () => {
@@ -290,7 +355,7 @@ describe('printUrl', () => {
     },
   );
 
-  it.each([...CONTROL_CHARS, ...BIDI_CHARS])('strips %j', (char) => {
+  it.each([...CONTROL_CHARS, ...BIDI_CHARS, ...INVISIBLE_CHARS])('strips %j', (char) => {
     expect(printUrl(`https://example.test/a${char}b`)).toBe('https://example.test/ab');
   });
 

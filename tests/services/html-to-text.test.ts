@@ -1,7 +1,9 @@
 /**
  * @fileoverview htmlToText: the plain text `structuredContent` carries for the
  * HTML fields data.police.uk serves — tags dropped, block ends to newlines,
- * entities decoded once, blank-line runs collapsed, empty to undefined.
+ * entities decoded once (never to an invisible or control character), invisible
+ * characters removed, blank-line runs collapsed, empty to undefined, in time
+ * linear in the input.
  * @module tests/services/html-to-text.test
  */
 
@@ -118,6 +120,46 @@ describe('htmlToText', () => {
     it('drops comments, multi-line ones included', () => {
       expect(htmlToText('a<!-- hidden\nacross lines -->b')).toBe('ab');
     });
+
+    it.each([
+      ['an unclosed comment', 'kept<!-- dropped <p>still dropped</p>'],
+      ['an unclosed script', 'kept<script>dropped<p>still dropped</p>'],
+      ['an unclosed style', 'kept<STYLE type="text/css">p{}</p>'],
+      ['a script opener with no ">"', 'kept<script src=x'],
+      ['a script closed by another element only', 'kept<script>a</style>b</template>c'],
+    ])('drops everything after %s', (_name, html) => {
+      expect(htmlToText(html)).toBe('kept');
+    });
+
+    it('closes an element on its own closing tag, whatever the case and trailing space', () => {
+      expect(htmlToText('a<SCRIPT>x</Script >b<template>y</TEMPLATE>c')).toBe('abc');
+    });
+
+    it('removes comments and non-text elements in document order', () => {
+      expect(htmlToText('a<!-- <script> -->b</script>c')).toBe('abc');
+      expect(htmlToText('a<script>x<!-- y</script>b-->')).toBe('ab-->');
+    });
+  });
+
+  describe('time stays linear in the input', () => {
+    /** Loose enough for a busy machine; a quadratic scan takes seconds on these inputs. */
+    const BOUND_MS = 250;
+
+    it.each([
+      ['<script>', '<script>'.repeat(100_000)],
+      ['<!--', '<!--'.repeat(100_000)],
+      ['<br', '<br'.repeat(100_000)],
+      ['<a', '<a'.repeat(100_000)],
+      ['<a closed by one final ">"', `${'<a'.repeat(100_000)}>`],
+      ['<br closed by one final ">"', `${'<br'.repeat(100_000)}>`],
+      ['unclosed quoted values', `${'<a href="x '.repeat(100_000)}`],
+      ['</p with no ">"', '</p '.repeat(100_000)],
+      ['entity-like text', '&a'.repeat(100_000)],
+    ])('converts 100,000 repeats of %s in under 250 ms', (_name, html) => {
+      const start = performance.now();
+      htmlToText(html);
+      expect(performance.now() - start).toBeLessThan(BOUND_MS);
+    });
   });
 
   describe('entities', () => {
@@ -166,10 +208,25 @@ describe('htmlToText', () => {
       ['NUL', '&#0;'],
       ['a C0 control', '&#7;'],
       ['an escape', '&#27;'],
+      ['a C1 control', '&#x9B;'],
+      ['a zero-width space', '&#x200B;'],
+      ['a word joiner', '&#x2060;'],
+      ['a byte order mark', '&#xFEFF;'],
+      ['a right-to-left override', '&#x202E;'],
+      ['a tag character', '&#xE0041;'],
       ['a lone surrogate', '&#xD800;'],
+      ['a noncharacter', '&#xFDD0;'],
+      ['a plane-end noncharacter', '&#x1FFFF;'],
       ['a code point beyond Unicode', '&#1114112;'],
-    ])('drops %s', (_name, entity) => {
-      expect(htmlToText(`a${entity}b`)).toBe('ab');
+    ])('leaves the numeric entity for %s as written', (_name, entity) => {
+      expect(htmlToText(`a${entity}b`)).toBe(`a${entity}b`);
+    });
+
+    it.each([
+      ['zero-width non-joiner', '&#x200C;', '\u{200C}'],
+      ['zero-width joiner', '&#x200D;', '\u{200D}'],
+    ])('decodes the %s', (_name, entity, char) => {
+      expect(htmlToText(`a${entity}b`)).toBe(`a${char}b`);
     });
 
     it('keeps an encoded newline as a line break', () => {
@@ -178,6 +235,57 @@ describe('htmlToText', () => {
 
     it('treats a non-breaking space as whitespace', () => {
       expect(htmlToText('a&nbsp;&nbsp;b')).toBe('a b');
+    });
+
+    it.each(['constructor', 'toString', 'valueOf', 'hasOwnProperty', 'CONSTRUCTOR'])(
+      'leaves &%s; as written rather than reading an object property',
+      (name) => {
+        expect(htmlToText(`&${name};`)).toBe(`&${name};`);
+        expect(htmlToText(`<p>Hello &${name};</p>`)).toBe(`Hello &${name};`);
+      },
+    );
+  });
+
+  describe('invisible characters', () => {
+    it.each([
+      ['a tag character', '\u{E0041}'],
+      ['the cancel tag', '\u{E007F}'],
+      ['the language tag', '\u{E0001}'],
+      ['a zero-width space', '\u{200B}'],
+      ['a word joiner', '\u{2060}'],
+      ['a byte order mark', '\u{FEFF}'],
+      ['a right-to-left override', '\u{202E}'],
+      ['a left-to-right mark', '\u{200E}'],
+      ['a C0 control', '\u{7}'],
+      ['a C1 control', '\u{9B}'],
+    ])('removes %s from the text', (_name, char) => {
+      expect(htmlToText(`<p>a${char}b</p>`)).toBe('ab');
+    });
+
+    it('removes a run of tag characters spelling hidden text', () => {
+      expect(
+        htmlToText('Ward panel\u{E0049}\u{E0047}\u{E004E}\u{E004F}\u{E0052}\u{E0045} end'),
+      ).toBe('Ward panel end');
+    });
+
+    it.each([
+      ['zero-width non-joiner', '\u{200C}'],
+      ['zero-width joiner', '\u{200D}'],
+    ])('keeps the %s', (_name, char) => {
+      expect(htmlToText(`a${char}b`)).toBe(`a${char}b`);
+    });
+
+    it('keeps an emoji joined by zero-width joiners whole', () => {
+      const family = '\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}';
+      expect(htmlToText(`<p>${family}</p>`)).toBe(family);
+    });
+
+    it('turns a next-line character into a line break rather than joining the words', () => {
+      expect(htmlToText('a\u{85}b')).toBe('a\nb');
+    });
+
+    it('still turns a tab between words into a space', () => {
+      expect(htmlToText('one\ttwo')).toBe('one two');
     });
   });
 

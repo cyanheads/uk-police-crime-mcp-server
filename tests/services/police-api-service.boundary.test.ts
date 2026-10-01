@@ -1,11 +1,11 @@
 /**
  * @fileoverview PoliceApiService request boundary: per-call status accept-lists,
- * failure text written from the status alone, redirects refused, the
- * decoded-byte ceiling, unreadable-body retries, the 503 area value and its
- * separately paced health probe, the 429 cooldown, the per-call budget, attempt
- * timeouts, cancellation, and the pacer with its three area slots. Upstream is a
- * route-table fake; retry backoff, pacer waits and timeouts run on a virtual
- * clock.
+ * failure text written from the status alone, redirects refused, tag characters
+ * dropped at the parse, the decoded-byte ceiling, unreadable-body retries, the
+ * 503 area value and its separately paced health probe, the 429 cooldown, the
+ * per-call budget, attempt timeouts, cancellation, and the pacer with its three
+ * area slots. Upstream is a route-table fake; retry backoff, pacer waits and
+ * timeouts run on a virtual clock.
  * @module tests/services/police-api-service.boundary.test
  */
 
@@ -343,6 +343,59 @@ describe('PoliceApiService request boundary', () => {
       expect(error.data).toMatchObject({ reason: 'unreadable_response' });
       expect(error.message).toContain('failed after 3 attempts');
       expect(h.upstream.count('/forces')).toBe(3);
+    });
+  });
+
+  describe('tag characters in a 200 body', () => {
+    it('drops literal tag characters from every string value', async () => {
+      h.upstream.route(
+        'GET',
+        '/forces',
+        jsonOk([
+          { id: 'leicestershire', name: 'Leicestershire\u{E0049}\u{E0047}\u{E004E} Police' },
+        ]),
+      );
+      const forces = await settle(h.service.getForces(h.ctx, h.budget()));
+      expect(forces).toEqual([{ id: 'leicestershire', name: 'Leicestershire Police' }]);
+    });
+
+    it('drops tag characters written as escaped surrogate pairs, in either case', async () => {
+      h.upstream.route(
+        'GET',
+        '/forces',
+        textOk(
+          '[{"id":"leicestershire","name":"Leicestershire\\udb40\\udc49\\uDB40\\uDC47 Police"}]',
+        ),
+      );
+      const forces = await settle(h.service.getForces(h.ctx, h.budget()));
+      expect(forces).toEqual([{ id: 'leicestershire', name: 'Leicestershire Police' }]);
+    });
+
+    it('drops them from object keys too, so a contact channel name carries none', async () => {
+      h.upstream.route(
+        'GET',
+        '/leicestershire/NX01',
+        textOk(
+          `{"id":"NX01","name":"Example\u{E0041} Central","contact_details":{"e\\udb40\\udc41mail":"nx01@example.test\\udb40\\udc7f"}}`,
+        ),
+      );
+      const result = await settle(
+        h.service.getNeighbourhood('leicestershire', 'NX01', h.ctx, h.budget()),
+      );
+      expect(result).toMatchObject({
+        kind: 'found',
+        value: {
+          name: 'Example Central',
+          contact: [{ channel: 'email', value: 'nx01@example.test' }],
+        },
+      });
+    });
+
+    it('keeps every other character as received, invisible ones included', async () => {
+      const name = 'Leicestershire\u{200B}\u{2060}\u{FEFF}\u{202E} Police\u{1F46E}';
+      h.upstream.route('GET', '/forces', jsonOk([{ id: 'leicestershire', name }]));
+      const forces = await settle(h.service.getForces(h.ctx, h.budget()));
+      expect(forces).toEqual([{ id: 'leicestershire', name }]);
     });
   });
 
