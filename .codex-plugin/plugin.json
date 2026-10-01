@@ -1,6 +1,6 @@
 {
   "name": "uk-police-crime-mcp-server",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Search UK street-level crime, police outcomes, stop and search, and neighbourhood teams from data.police.uk: England, Wales and Northern Ireland forces, plus British Transport Police (Scotland's only coverage), via MCP. STDIO or Streamable HTTP.",
   "author": {
     "name": "cyanheads",

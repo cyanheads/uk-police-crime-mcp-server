@@ -1,6 +1,6 @@
 # uk-police-crime-mcp-server - Directory Structure
 
-Generated on: 2026-10-01 16:13:11
+Generated on: 2026-10-01 17:42:43
 
 ```text
 uk-police-crime-mcp-server/
@@ -162,6 +162,7 @@ uk-police-crime-mcp-server/
 │   ├── fixtures/
 │   │   ├── police-api-upstream-w3.ts
 │   │   ├── police-api-upstream.ts
+│   │   ├── quote-run-ons.ts
 │   │   └── service-harness.ts
 │   ├── services/
 │   │   ├── area.test.ts
