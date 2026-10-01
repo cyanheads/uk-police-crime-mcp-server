@@ -198,7 +198,7 @@ bun install
 
 ## Configuration
 
-The server reads no environment variables of its own. data.police.uk allows 15 requests a second with a burst of 30 per client IP; the server paces every request process-wide under that limit, so a hosted deployment shares one budget behind its egress IP, and requests queue for their turn. That one pacer serves every caller, so a hosted deployment needs a per-client rate limit at its edge to keep one client from filling the queue.
+The server reads no environment variables of its own. data.police.uk allows 15 requests a second with a burst of 30 per client IP; the server paces every request process-wide under that limit, so a hosted deployment shares one budget behind its egress IP, and requests queue for their turn.
 
 | Variable | Description | Default |
 |:---|:---|:---|

@@ -560,7 +560,7 @@ Each step is independently testable.
 - Crime records carry only the latest outcome's display name, not its code; codes come from the outcome routes.
 - Stop `datetime` is UTC while months bucket by UK local time.
 - No geocoding.
-- One pacer serves every caller of a process, and its queue holds 200 waiting requests. The server caps what one call holds (Design Decisions 32 and 33) but has no per-client limit, so a hosted deployment needs a per-client rate limit at its edge: otherwise a client that sends many calls at once can fill the queue, and other callers are refused with `pacer_shed`.
+- One pacer serves every caller of a process, and its queue holds 200 waiting requests. The server caps what one call holds (Design Decisions 32 and 33) but has no per-client limit: a client that sends many calls at once can fill the queue, and other callers are refused with `pacer_shed`.
 
 ## API Reference
 
