@@ -490,6 +490,13 @@ describe('ukcrime_search_outcomes', () => {
         'violent-crime',
         'Violence and sexual offences',
       ],
+      ['a slug with underscores', 'vehicle_crime', 'vehicle-crime', 'Vehicle crime'],
+      [
+        'a display name with hyphens',
+        'violence-and-sexual-offences',
+        'violent-crime',
+        'Violence and sexual offences',
+      ],
     ])('matches %s against the cached vocabulary', async (_name, category, slug, name) => {
       pointRoutes(mixed());
       const out = data(await call({ ...POINT, month: '2026-07', category }));

@@ -155,7 +155,10 @@ export const getCrimeOutcomesTool = tool('ukcrime_get_crime_outcomes', {
           .array(
             z
               .string()
-              .regex(/^[0-9a-f]{64}$/)
+              .regex(
+                /^[0-9a-f]{64}$/,
+                "Expected the 64-character hexadecimal persistent_id from a crime record, not the record's numeric id.",
+              )
               .describe('A 64-character hexadecimal persistent id.'),
           )
           .min(1)

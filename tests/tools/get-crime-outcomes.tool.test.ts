@@ -351,6 +351,15 @@ describe('ukcrime_get_crime_outcomes', () => {
       expect(error.data.reason).toBe('invalid_arguments');
       expect(h.upstream.calls).toHaveLength(0);
     });
+
+    it('names the 64-character persistent_id, not the numeric crime id, when an id has the wrong shape', async () => {
+      const result = await callRaw({ persistent_ids: ['118254032'] });
+      const error = errorOf(result);
+      expect(error.message).toContain(
+        "persistent_ids.0: Expected the 64-character hexadecimal persistent_id from a crime record, not the record's numeric id.",
+      );
+      expect(text(result)).not.toContain('must match pattern');
+    });
   });
 
   describe('not_found: a 404 is a result', () => {

@@ -120,7 +120,7 @@ export interface AreaQuery<T> {
 }
 
 interface UpstreamRequest {
-  /** An area route: a 503 leaves the attempt as `overloaded` instead of failing it. */
+  /** An area route: a 503 leaves the attempt as `overloaded`, and a body over the ceiling as `too_large`, instead of failing it. */
   readonly area?: boolean;
   readonly method?: 'GET' | 'POST';
   /** A 404 is an answer: returned as `miss`, body unread. */
@@ -137,9 +137,11 @@ interface Body {
 }
 type Miss = { readonly kind: 'miss' };
 type Overloaded = { readonly kind: 'overloaded' };
-type Answer = Body | Miss | Overloaded;
+type TooLarge = { readonly kind: 'too_large' };
+type Answer = Body | Miss | Overloaded | TooLarge;
 
 const MISS: Miss = { kind: 'miss' };
+const TOO_LARGE: TooLarge = { kind: 'too_large' };
 
 /**
  * Validates an upstream body against its raw schema. A mismatch means the
@@ -161,6 +163,16 @@ export function parseUpstream<S extends z.ZodType>(
       .map((issue) => `${issue.path.map(String).join('.')}: ${issue.message}`),
   });
 }
+
+/** The `area_too_large` refusal, carrying the query's own recovery hint when it has one. */
+const areaTooLarge = (query: AreaQuery<unknown>, message: string): McpError =>
+  validationError(message, {
+    reason: 'area_too_large',
+    ...(query.tooLargeHint ? { recovery: { hint: query.tooLargeHint } } : {}),
+  });
+
+/** A category's match key: lower-cased, each run of spaces, underscores and hyphens folded to one `-`. */
+const categoryKey = (value: string): string => value.toLowerCase().replace(/[\s_-]+/g, '-');
 
 /** A neighbourhood route, `/{force}/{id}` or one of its sections, with both ids path-encoded. */
 const neighbourhoodPath = (force: string, neighbourhoodId: string, section?: string): string =>
@@ -350,20 +362,20 @@ export class PoliceApiService {
   }
 
   /**
-   * Matches a category input — already trimmed and lower-cased by the tool
-   * schema — against a slug (`burglary`) or a display name (`violence and sexual
-   * offences`). `undefined` when nothing matches; the upstream would silently
-   * read an unknown slug as all crime.
+   * Matches a category input against a slug (`burglary`) or a display name
+   * (`Violence and sexual offences`), both sides folded by {@link categoryKey},
+   * so `vehicle_crime`, `anti social behaviour` and `violence-and-sexual-offences`
+   * each reach their one category. `undefined` when nothing matches; the
+   * upstream would silently read an unknown slug as all crime.
    */
   async findCategory(
     input: string,
     ctx: Context,
     budget: CallBudget,
   ): Promise<Category | undefined> {
-    const wanted = input.replace(/\s+/g, ' ');
+    const wanted = categoryKey(input);
     return (await this.getCategories(ctx, budget)).find(
-      (category) =>
-        category.slug === wanted || category.name.toLowerCase().replace(/\s+/g, ' ') === wanted,
+      (category) => categoryKey(category.slug) === wanted || categoryKey(category.name) === wanted,
     );
   }
 
@@ -556,12 +568,14 @@ export class PoliceApiService {
    * from insert; weight = decoded bytes × 1.25; an entry over half the 64 MiB
    * cap is returned uncached).
    *
-   * A 404 on a `notFoundIsMiss` route returns `miss`. A 503 leaves the retry
-   * loop as a value, then one health probe (`/crime-last-updated`, paced on its
-   * own, never retried) decides: probe 200 → throws `ValidationError` with
-   * `data.reason: 'area_too_large'` (the hint from `tooLargeHint` when given);
-   * otherwise → `ServiceUnavailable` with `data.reason: 'upstream_unavailable'`,
-   * `retryable: true`. Other failures bubble as baseline errors.
+   * A 404 on a `notFoundIsMiss` route returns `miss`. A body over the 32 MiB
+   * ceiling throws `ValidationError` with `data.reason: 'area_too_large'` (the
+   * hint from `tooLargeHint` when given), neither retried nor probed. A 503
+   * leaves the retry loop as a value, then one health probe
+   * (`/crime-last-updated`, paced on its own, never retried) decides: probe 200
+   * → the same `area_too_large`; otherwise → `ServiceUnavailable` with
+   * `data.reason: 'upstream_unavailable'`, `retryable: true`. Other failures
+   * bubble as baseline errors.
    */
   async queryArea<T>(
     query: AreaQuery<T>,
@@ -586,6 +600,12 @@ export class PoliceApiService {
     );
     if (answer.kind === 'miss') return answer;
     if (answer.kind === 'overloaded') return this.refuseOverloaded(query, ctx, budget);
+    if (answer.kind === 'too_large') {
+      throw areaTooLarge(
+        query,
+        'data.police.uk answered with more than the 32 MiB this server reads for one area, so the area is too large to answer.',
+      );
+    }
     const records = query.normalize(answer.json);
     const cachedNow = this.areaCache.set(key, records, answer.bytes * AREA_WEIGHT_PER_BYTE);
     if (!cachedNow)
@@ -634,12 +654,9 @@ export class PoliceApiService {
     const healthy = await this.probeHealthy(ctx, budget);
     ctx.log.notice('Area route answered 503', { path: query.path, upstreamHealthy: healthy });
     if (healthy) {
-      throw validationError(
+      throw areaTooLarge(
+        query,
         'data.police.uk refused this area as too large to answer, though the service itself is up.',
-        {
-          reason: 'area_too_large',
-          ...(query.tooLargeHint ? { recovery: { hint: query.tooLargeHint } } : {}),
-        },
       );
     }
     throw serviceUnavailable(
@@ -788,10 +805,11 @@ export class PoliceApiService {
     if (status === 200) {
       const body = await readCapped(response, MAX_BODY_BYTES);
       if (!body) {
+        // The same request would be as large again: a value on an area route, never retried.
+        if (request.area) return TOO_LARGE;
         throw serviceUnavailable('data.police.uk sent more than 32 MiB for one response.', {
           reason: 'response_too_large',
           retryable: false,
-          recovery: { hint: 'Search a smaller area or a single neighbourhood.' },
         });
       }
       try {

@@ -39,7 +39,10 @@ export const forceInput = blankAsUnset(
   z
     .string()
     .max(100)
-    .regex(/^[a-z]+(-[a-z]+)*$/)
+    .regex(
+      /^[a-z]+(-[a-z]+)*$/,
+      "Expected a force id: lower-case words joined by hyphens, such as 'leicestershire' or 'devon-and-cornwall'.",
+    )
     .optional(),
   (value) => value.toLowerCase().replace(/[\s_]+/g, '-'),
 );
@@ -49,7 +52,10 @@ export const neighbourhoodIdInput = blankAsUnset(
   z
     .string()
     .max(100)
-    .regex(/^[^/\\?#]+$/)
+    .regex(
+      /^[^/\\?#]+$/,
+      "Expected a neighbourhood id such as 'NX01' from ukcrime_list_reference topic 'neighbourhoods'; it cannot contain /, \\, ? or #.",
+    )
     .refine((value) => value !== '.' && value !== '..' && !/\p{Cc}/u.test(value), {
       message: "A neighbourhood id cannot be '.' or '..' or contain control characters.",
     })
@@ -60,7 +66,7 @@ export const neighbourhoodIdInput = blankAsUnset(
 export const locationIdInput = blankAsUnset(
   z
     .string()
-    .regex(/^\d{1,12}$/)
+    .regex(/^\d{1,12}$/, 'Expected 1–12 digits: the location.location_id of an earlier result.')
     .optional(),
 );
 
@@ -68,7 +74,7 @@ export const locationIdInput = blankAsUnset(
 export const monthInput = blankAsUnset(
   z
     .string()
-    .regex(/^\d{4}-(0[1-9]|1[0-2])$/)
+    .regex(/^\d{4}-(0[1-9]|1[0-2])$/, 'Expected a month as YYYY-MM, such as 2026-07.')
     .optional(),
 );
 
@@ -98,19 +104,27 @@ export const latInput = blankAsUnset(z.number().min(-90).max(90).optional());
 export const lngInput = blankAsUnset(z.number().min(-180).max(180).optional());
 
 const PolygonVertex = z
-  .object({
-    lat: z.number().min(-90).max(90).describe('Latitude, WGS84 decimal degrees.'),
-    lng: z.number().min(-180).max(180).describe('Longitude, WGS84 decimal degrees.'),
-  })
+  .object(
+    {
+      lat: z.number().min(-90).max(90).describe('Latitude, WGS84 decimal degrees.'),
+      lng: z.number().min(-180).max(180).describe('Longitude, WGS84 decimal degrees.'),
+    },
+    {
+      error:
+        'Each polygon vertex is a { lat, lng } object such as { "lat": 52.634, "lng": -1.136 }, or lat,lng in the string form; [lat, lng] pairs are not accepted because GeoJSON writes [lng, lat].',
+    },
+  )
   .describe('One polygon vertex as { lat, lng }.');
 
 /**
  * Accepts the upstream string form `lat,lng:lat,lng:…` (split on `:` then `,`),
- * treats a blank string or empty list as unset, and cuts the list at its first
- * malformed vertex and at max + 1 entries, so a list of `[lng, lat]` pairs
- * yields one issue rather than one per vertex.
+ * treats a blank string or empty list as unset, and cuts the list at max + 1
+ * entries. A malformed vertex among those is reported alone: its own issues are
+ * raised here, which stops the parse before the list's length checks, so a list
+ * of `[lat, lng]` pairs yields one issue rather than one per vertex plus a
+ * vertex count.
  */
-function preparePolygon(value: unknown): unknown {
+function preparePolygon(value: unknown, ctx: z.core.$RefinementCtx): unknown {
   if (value === null) return;
   let vertices = value;
   if (typeof vertices === 'string') {
@@ -129,9 +143,15 @@ function preparePolygon(value: unknown): unknown {
   }
   if (!Array.isArray(vertices)) return vertices;
   if (vertices.length === 0) return;
-  const firstBad = vertices.findIndex((vertex) => !PolygonVertex.safeParse(vertex).success);
-  const end = firstBad === -1 ? vertices.length : firstBad + 1;
-  return vertices.slice(0, Math.min(end, POLYGON_MAX_VERTICES + 1));
+  const capped = vertices.slice(0, POLYGON_MAX_VERTICES + 1);
+  for (const [index, vertex] of capped.entries()) {
+    const parsed = PolygonVertex.safeParse(vertex);
+    if (parsed.success) continue;
+    for (const issue of parsed.error.issues)
+      ctx.addIssue({ ...issue, path: [index, ...issue.path] });
+    break;
+  }
+  return capped;
 }
 
 /** Polygon ring of 3–2,500 `{ lat, lng }` vertices (closed upstream). */

@@ -38,6 +38,7 @@ import {
   sequence,
   sparseCrimeRecord,
   status,
+  streamOfBytes,
   streetDatesBody,
   unplacedCrimesBody,
   wireLocation,
@@ -460,6 +461,20 @@ describe('ukcrime_search_crimes', () => {
       expect(out.notice).toBeUndefined();
     });
 
+    it('lets the gap note explain an empty list for a force that publishes no crime data, without pointing at crimes it placed', async () => {
+      h.upstream.route('GET', '/crimes-no-location', jsonOk([]));
+      h.upstream.route(
+        'GET',
+        '/forces',
+        jsonOk([{ id: 'greater-manchester', name: 'Greater Manchester Police' }]),
+      );
+      const out = data(await call({ ...UNPLACED, force: 'greater-manchester' }));
+      expect(out.total).toBe(0);
+      expect(out.notice).toBe(coverageNotes('greater-manchester', ['crime', 'asb']).join(' '));
+      expect(out.notice).toContain('Greater Manchester Police publishes no crime data');
+      expect(out.notice).not.toContain('the crimes it placed');
+    });
+
     it('says the force recorded none when the list is empty', async () => {
       h.upstream.route('GET', '/crimes-no-location', jsonOk([]));
       const out = data(await call({ ...UNPLACED }));
@@ -507,6 +522,19 @@ describe('ukcrime_search_crimes', () => {
       ],
       ['the explicit all-crime slug', 'all-crime', 'all-crime', 'All crime'],
       ['the all-crime display name', 'ALL CRIME', 'all-crime', 'All crime'],
+      ['a slug with underscores', 'vehicle_crime', 'vehicle-crime', 'Vehicle crime'],
+      [
+        'a slug with spaces',
+        'anti social behaviour',
+        'anti-social-behaviour',
+        'Anti-social behaviour',
+      ],
+      [
+        'a display name with hyphens',
+        'violence-and-sexual-offences',
+        'violent-crime',
+        'Violence and sexual offences',
+      ],
     ])('matches %s', async (_name, input, slug, name) => {
       pointRoutes(crimesBody(), slug);
       const out = data(await call({ ...POINT, category: input, month: '2026-07' }));
@@ -1259,6 +1287,33 @@ describe('ukcrime_search_crimes', () => {
       expect(h.upstream.calls).toHaveLength(0);
     });
 
+    it.each<[string, unknown, string]>([
+      [
+        'month',
+        { ...POINT, month: '2026-7' },
+        'month: Expected a month as YYYY-MM, such as 2026-07.',
+      ],
+      [
+        'force',
+        { area: 'force_unplaced', force: 'avon & somerset' },
+        "force: Expected a force id: lower-case words joined by hyphens, such as 'leicestershire' or 'devon-and-cornwall'.",
+      ],
+      [
+        'location_id',
+        { area: 'location', location_id: '12ab' },
+        'location_id: Expected 1–12 digits: the location.location_id of an earlier result.',
+      ],
+      [
+        'neighbourhood_id',
+        { area: 'neighbourhood', force: 'leicestershire', neighbourhood_id: 'a/b' },
+        "neighbourhood_id: Expected a neighbourhood id such as 'NX01' from ukcrime_list_reference topic 'neighbourhoods'; it cannot contain /, \\, ? or #.",
+      ],
+    ])('names the expected shape of %s rather than its pattern', async (_name, input, line) => {
+      const result = await callRaw(input);
+      expect(errorOf(result).message).toContain(line);
+      expect(text(result)).not.toContain('must match pattern');
+    });
+
     it('normalizes a spoken force name', async () => {
       h.upstream.route('GET', '/crimes-no-location', jsonOk([]));
       h.upstream.route(
@@ -1277,6 +1332,23 @@ describe('ukcrime_search_crimes', () => {
       const error = errorOf(await callRaw({ area: 'polygon', polygon: ring }));
       expect(error.data.reason).toBe('invalid_arguments');
       expect((error.data.issues as unknown[]).length).toBeLessThanOrEqual(3);
+    });
+
+    it('answers a polygon of coordinate pairs by saying vertices are { lat, lng } objects, with no vertex count', async () => {
+      const result = await callRaw({
+        area: 'polygon',
+        polygon: [
+          [52.634, -1.136],
+          [52.64, -1.13],
+          [52.63, -1.12],
+        ],
+      });
+      const error = errorOf(result);
+      expect(error.data.reason).toBe('invalid_arguments');
+      expect(error.message).toContain('polygon.0: Each polygon vertex is a { lat, lng } object');
+      expect(text(result)).not.toContain('>=3');
+      expect(text(result)).not.toContain('Too small');
+      expect(h.upstream.calls).toHaveLength(0);
     });
 
     it('treats a number where the category text goes as the text it prints as (unknown_category)', async () => {
@@ -1408,10 +1480,22 @@ describe('ukcrime_search_crimes', () => {
       expect(error.code).toBe(JsonRpcErrorCode.ValidationError);
       expect(error.data.reason).toBe('area_too_large');
       expect(error.data.recovery?.hint).toBe(
-        "A 1-mile circle here holds more than 10,000 crimes; search area 'polygon' with a smaller ring around the point.",
+        "A 1-mile circle here holds too many crimes for data.police.uk to answer (it can refuse an area holding more than about 10,000); search area 'polygon' with a smaller ring around the point.",
       );
       expect(h.upstream.count('/crimes-street/all-crime')).toBe(1);
       expect(h.upstream.count('/crime-last-updated')).toBe(1);
+    });
+
+    it('states the 10,000-crime refusal as one data.police.uk can make, not one it always makes', () => {
+      expect(searchCrimesTool.description).toContain(
+        'data.police.uk can refuse an area holding more than about 10,000 crimes',
+      );
+      expect(searchCrimesTool.description).not.toContain('is refused upstream');
+      const entry = searchCrimesTool.errors?.find((e) => e.reason === 'area_too_large');
+      expect(entry?.when).toBe(
+        'the area is too large to answer: data.police.uk can refuse one holding more than about 10,000 crimes',
+      );
+      expect(entry?.recovery).not.toContain('cap');
     });
 
     it.each<[string, Input, string, () => void]>([
@@ -1441,10 +1525,12 @@ describe('ukcrime_search_crimes', () => {
       expect(error.code).toBe(JsonRpcErrorCode.ValidationError);
       expect(error.data.reason).toBe('area_too_large');
       expect(error.data.recovery?.hint).toContain('split the polygon into smaller polygons');
-      expect(error.data.recovery?.hint).toContain('The 10,000-crime cap counts every category');
+      expect(error.data.recovery?.hint).toContain(
+        'The limit of about 10,000 crimes counts every category',
+      );
     });
 
-    it('does not read a narrower category as the way out (the cap counts every category)', async () => {
+    it('does not read a narrower category as the way out (the limit counts every category)', async () => {
       h.upstream.route('GET', '/crimes-street/burglary', overloaded);
       h.upstream.route('GET', '/locate-neighbourhood', jsonOk(locateBody()));
       const error = errorOf(await call({ ...POINT, category: 'burglary', month: '2026-07' }));
@@ -1464,6 +1550,34 @@ describe('ukcrime_search_crimes', () => {
       expect(error.data.reason).toBe('upstream_unavailable');
       expect(error.data.retryable).toBe(true);
       expect(error.data.recovery?.hint).toContain('call this tool again in a few minutes');
+    });
+  });
+
+  describe('an area answer over the 32 MiB body ceiling', () => {
+    const oversized = () => streamOfBytes(64 * 1024 * 1024).respond;
+
+    it('polygon: area_too_large with the declared split-the-area recovery, not retried', async () => {
+      h.upstream.route('POST', '/crimes-street/all-crime', oversized());
+      const result = await call({ area: 'polygon', polygon: RING, month: '2026-07' });
+      const error = errorOf(result);
+      expect(error.code).toBe(JsonRpcErrorCode.ValidationError);
+      expect(error.message).toContain('too large to answer');
+      expect(error.data.reason).toBe('area_too_large');
+      expect(error.data.recovery?.hint).toContain('split the polygon into smaller polygons');
+      expect(text(result)).toContain('split the polygon into smaller polygons');
+      expect(h.upstream.count('/crimes-street/all-crime')).toBe(1);
+      expect(h.upstream.count('/crime-last-updated')).toBe(0);
+    });
+
+    it('point: area_too_large with the point wording as the recovery hint', async () => {
+      h.upstream.route('GET', '/crimes-street/all-crime', oversized());
+      h.upstream.route('GET', '/locate-neighbourhood', jsonOk(locateBody()));
+      const error = errorOf(await call({ ...POINT, month: '2026-07' }));
+      expect(error.code).toBe(JsonRpcErrorCode.ValidationError);
+      expect(error.data.reason).toBe('area_too_large');
+      expect(error.data.recovery?.hint).toContain(
+        "search area 'polygon' with a smaller ring around the point",
+      );
     });
   });
 

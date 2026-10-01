@@ -502,7 +502,7 @@ export const rateLimited =
       ...(retryAfter === undefined ? {} : { headers: { 'retry-after': retryAfter } }),
     });
 
-/** 503 with an empty body and no `Retry-After`: an area over the 10,000-record cap, or an outage. */
+/** 503 with an empty body and no `Retry-After`: an area data.police.uk refuses as too large, or an outage. */
 export const overloaded: Responder = () => new Response(null, { status: 503 });
 
 /** A bare status with an empty body (500, 502, 504 …). */

@@ -252,32 +252,45 @@ describe('PoliceApiService request boundary', () => {
       expect(result.kind).toBe('found');
     });
 
-    it('refuses a body one byte over 32 MiB as response_too_large, not retried', async () => {
+    it('answers an area body one byte over 32 MiB as area_too_large, neither retried nor probed', async () => {
       h.upstream.route('GET', '/crimes-street/all-crime', textOk(sizedJsonBody(BODY_CEILING + 1)));
       const error = await failure(area());
-      expect(error.code).toBe(JsonRpcErrorCode.ServiceUnavailable);
-      expect(error.data).toMatchObject({
-        reason: 'response_too_large',
-        retryable: false,
-        recovery: { hint: 'Search a smaller area or a single neighbourhood.' },
-      });
+      expect(error.code).toBe(JsonRpcErrorCode.ValidationError);
+      expect(error.message).toContain('too large to answer');
+      expect(error.data).toMatchObject({ reason: 'area_too_large' });
+      expect(error.data).not.toHaveProperty('recovery');
       expect(h.upstream.count('/crimes-street/all-crime')).toBe(1);
+      expect(h.upstream.count('/crime-last-updated')).toBe(0);
+    });
+
+    it('carries tooLargeHint as the recovery hint on an over-ceiling area body', async () => {
+      const { respond } = streamOfBytes(64 * MIB, MIB);
+      h.upstream.route('GET', '/crimes-street/all-crime', respond);
+      const error = await failure(
+        area({ date: '2026-08' }, { tooLargeHint: 'Try a smaller radius.' }),
+      );
+      expect(error.data).toMatchObject({
+        reason: 'area_too_large',
+        recovery: { hint: 'Try a smaller radius.' },
+      });
     });
 
     it('stops reading and cancels the stream once the ceiling is crossed', async () => {
       const { respond, state } = streamOfBytes(200 * MIB, MIB);
       h.upstream.route('GET', '/crimes-street/all-crime', respond);
       const error = await failure(area());
-      expect(error.data).toMatchObject({ reason: 'response_too_large' });
+      expect(error.data).toMatchObject({ reason: 'area_too_large' });
       expect(state.cancelled).toBe(true);
       expect(state.pulledBytes).toBeLessThan(BODY_CEILING + 4 * MIB);
     });
 
-    it('applies the ceiling to every route, not just area queries', async () => {
+    it('refuses an over-ceiling body on a route that is not an area query as response_too_large, not retried', async () => {
       const { respond, state } = streamOfBytes(64 * MIB, MIB);
       h.upstream.route('GET', '/forces', respond);
       const error = await failure(h.service.getForces(h.ctx, h.budget()));
-      expect(error.data).toMatchObject({ reason: 'response_too_large' });
+      expect(error.code).toBe(JsonRpcErrorCode.ServiceUnavailable);
+      expect(error.data).toMatchObject({ reason: 'response_too_large', retryable: false });
+      expect(error.data).not.toHaveProperty('recovery');
       expect(state.cancelled).toBe(true);
       expect(h.upstream.count('/forces')).toBe(1);
     });
@@ -297,7 +310,7 @@ describe('PoliceApiService request boundary', () => {
       const body = `["${'é'.repeat(17 * MIB)}"]`;
       h.upstream.route('GET', '/crimes-street/all-crime', textOk(body));
       const error = await failure(area());
-      expect(error.data).toMatchObject({ reason: 'response_too_large' });
+      expect(error.data).toMatchObject({ reason: 'area_too_large' });
     });
   });
 

@@ -24,6 +24,8 @@ export interface KnownGap {
   readonly aspect: KnownGapAspect;
   /** data.police.uk force id (`btp` for British Transport Police). */
   readonly force: string;
+  /** The force publishes none of this aspect's data, so a zero count there is the gap itself, not a measurement. */
+  readonly nothingPublished?: true;
   /** The data.police.uk page the fact was read from. */
   readonly source: string;
   /** One sentence, no closing period; the helper appends the dated attribution. */
@@ -41,12 +43,14 @@ export const KNOWN_GAPS: readonly KnownGap[] = [
     aspect: 'crime',
     text: 'Greater Manchester Police publishes no crime data to data.police.uk, so crime counts there do not measure crime',
     source: CHANGELOG_KNOWN_ISSUES,
+    nothingPublished: true,
   },
   {
     force: 'greater-manchester',
     aspect: 'outcomes',
     text: 'Greater Manchester Police publishes no outcome data to data.police.uk, so outcome counts there do not measure police outcomes',
     source: CHANGELOG_KNOWN_ISSUES,
+    nothingPublished: true,
   },
   {
     force: 'northern-ireland',
@@ -59,6 +63,7 @@ export const KNOWN_GAPS: readonly KnownGap[] = [
     aspect: 'outcomes',
     text: 'The Police Service of Northern Ireland publishes no outcomes to data.police.uk, so outcome counts there do not measure police outcomes',
     source: OUTCOMES_API_DOCS,
+    nothingPublished: true,
   },
   {
     force: 'devon-and-cornwall',
@@ -77,12 +82,14 @@ export const KNOWN_GAPS: readonly KnownGap[] = [
     aspect: 'asb',
     text: 'British Transport Police supplies no anti-social behaviour data',
     source: CHANGELOG_KNOWN_ISSUES,
+    nothingPublished: true,
   },
   {
     force: 'btp',
     aspect: 'outcomes',
     text: 'British Transport Police publishes no outcome data to data.police.uk',
     source: ABOUT_KNOWN_ISSUES,
+    nothingPublished: true,
   },
 ];
 
@@ -97,6 +104,13 @@ export function coverageNotes(force: string, aspects?: readonly KnownGapAspect[]
   return KNOWN_GAPS.filter(
     (gap) => gap.force === force && (aspects === undefined || aspects.includes(gap.aspect)),
   ).map((gap) => `${gap.text} ${ATTRIBUTION}.`);
+}
+
+/** True when the table says the force publishes none of the aspect's data, so a zero count there needs no other explanation. */
+export function publishesNothing(force: string, aspect: KnownGapAspect): boolean {
+  return KNOWN_GAPS.some(
+    (gap) => gap.force === force && gap.aspect === aspect && gap.nothingPublished === true,
+  );
 }
 
 /** Every table fact for a force as one string (the `gaps` field), or `undefined` when none. */

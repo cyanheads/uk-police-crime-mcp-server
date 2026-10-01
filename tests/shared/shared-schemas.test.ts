@@ -411,6 +411,29 @@ describe('polygonInput', () => {
     const vertices = [...ring, { lat: 'x', lng: 1 }, ...ring];
     expect(rejected(polygonInput, vertices)[0]?.path[0]).toBe(3);
   });
+
+  it('reports [lat, lng] pairs as one issue saying vertices are { lat, lng } objects, with no vertex count', () => {
+    const issues = rejected(polygonInput, [
+      [52.634, -1.136],
+      [52.64, -1.13],
+      [52.63, -1.12],
+    ]);
+    expect(issues).toHaveLength(1);
+    expect(issues[0]).toMatchObject({ code: 'invalid_type', path: [0] });
+    expect(issues[0]?.message).toBe(
+      'Each polygon vertex is a { lat, lng } object such as { "lat": 52.634, "lng": -1.136 }, or lat,lng in the string form; [lat, lng] pairs are not accepted because GeoJSON writes [lng, lat].',
+    );
+  });
+
+  it.each<[string, unknown, (string | number)[]]>([
+    ['an out-of-range first vertex', [{ lat: 95, lng: 0 }], [0, 'lat']],
+    ['a malformed second vertex of three', [ring[0], { lat: 52.6 }, ring[2]], [1, 'lng']],
+    ['a malformed string vertex', '52.63,-1.14:oops', [1]],
+  ])('reports %s alone, without the vertex count', (_name, value, path) => {
+    const issues = rejected(polygonInput, value);
+    expect(issues).toHaveLength(1);
+    expect(issues[0]?.path).toEqual(path);
+  });
 });
 
 describe('limitInput', () => {

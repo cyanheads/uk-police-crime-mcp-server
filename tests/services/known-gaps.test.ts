@@ -14,6 +14,7 @@ import {
   KNOWN_GAPS_VERIFIED,
   type KnownGapAspect,
   knownGapsAgeWarning,
+  publishesNothing,
 } from '@/services/police-api/known-gaps.js';
 
 const DAY_MS = 86_400_000;
@@ -83,6 +84,32 @@ describe('known-gaps table', () => {
   it('has no duplicate force and aspect pair', () => {
     const pairs = KNOWN_GAPS.map((gap) => `${gap.force}:${gap.aspect}`);
     expect(new Set(pairs).size).toBe(pairs.length);
+  });
+
+  it('marks exactly the facts that say a force publishes nothing for an aspect', () => {
+    const marked = KNOWN_GAPS.filter((gap) => gap.nothingPublished).map(
+      (gap) => `${gap.force}:${gap.aspect}`,
+    );
+    expect(marked.sort()).toEqual([
+      'btp:asb',
+      'btp:outcomes',
+      'greater-manchester:crime',
+      'greater-manchester:outcomes',
+      'northern-ireland:outcomes',
+    ]);
+  });
+});
+
+describe('publishesNothing', () => {
+  it.each<[string, KnownGapAspect, boolean]>([
+    ['greater-manchester', 'crime', true],
+    ['northern-ireland', 'outcomes', true],
+    ['northern-ireland', 'crime', false],
+    ['devon-and-cornwall', 'outcomes', false],
+    ['btp', 'crime', false],
+    ['leicestershire', 'crime', false],
+  ])('%s %s → %s', (force, aspect, expected) => {
+    expect(publishesNothing(force, aspect)).toBe(expected);
   });
 });
 

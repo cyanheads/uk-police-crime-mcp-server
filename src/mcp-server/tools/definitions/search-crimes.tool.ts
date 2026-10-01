@@ -46,7 +46,7 @@ import {
   limitInput,
 } from '@/mcp-server/tools/shared-schemas.js';
 import { crimesQuery, parseArea } from '@/services/police-api/area.js';
-import { coverageNotes } from '@/services/police-api/known-gaps.js';
+import { coverageNotes, publishesNothing } from '@/services/police-api/known-gaps.js';
 import { getPoliceApiService } from '@/services/police-api/police-api-service.js';
 import type { CrimeRecord, MapPoint } from '@/services/police-api/types.js';
 
@@ -58,7 +58,7 @@ const DATA_NOTE =
   "Locations are anonymised map points that each cover at least eight addresses, not where crimes happened. Area searches exclude crimes the force could not place; search area 'force_unplaced' for those. Each crime shows its latest police outcome; court results are not published.";
 
 const POINT_TOO_LARGE =
-  "A 1-mile circle here holds more than 10,000 crimes; search area 'polygon' with a smaller ring around the point.";
+  "A 1-mile circle here holds too many crimes for data.police.uk to answer (it can refuse an area holding more than about 10,000); search area 'polygon' with a smaller ring around the point.";
 
 /** Most map points listed in `top_locations`. */
 const TOP_LOCATIONS = 10;
@@ -180,7 +180,7 @@ function topLocations(crimes: readonly CrimeRecord[]): NonNullable<CrimesOutput[
 export const searchCrimesTool = tool('ukcrime_search_crimes', {
   title: 'Search UK Street-Level Crimes',
   description:
-    "Search street-level crimes recorded in one month inside an area — a point with a 1-mile radius, a polygon, a snapped location_id from an earlier result, or a police neighbourhood — or list the crimes a force could not place on the map (area 'force_unplaced'). Returns the total, counts by category and by latest police outcome, the busiest map points, and a page of crimes, each with the persistent_id that ukcrime_get_crime_outcomes takes; for what police resolved in a month, whenever the crime was recorded, use ukcrime_search_outcomes. Locations are anonymised map points, not crime sites. An area holding more than 10,000 crimes is refused upstream whatever the category — search smaller polygons.",
+    "Search street-level crimes recorded in one month inside an area — a point with a 1-mile radius, a polygon, a snapped location_id from an earlier result, or a police neighbourhood — or list the crimes a force could not place on the map (area 'force_unplaced'). Returns the total, counts by category and by latest police outcome, the busiest map points, and a page of crimes, each with the persistent_id that ukcrime_get_crime_outcomes takes; for what police resolved in a month, whenever the crime was recorded, use ukcrime_search_outcomes. Locations are anonymised map points, not crime sites. data.police.uk can refuse an area holding more than about 10,000 crimes, whatever the category — then search smaller polygons.",
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
     area: z
@@ -267,9 +267,9 @@ export const searchCrimesTool = tool('ukcrime_search_crimes', {
     {
       reason: 'area_too_large',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'the area holds more than 10,000 crimes, which data.police.uk refuses to answer',
+      when: 'the area is too large to answer: data.police.uk can refuse one holding more than about 10,000 crimes',
       recovery:
-        "Search a smaller area: split the polygon into smaller polygons, or for a neighbourhood call ukcrime_find_neighbourhood with include ['boundary'] and search parts of that polygon with area 'polygon'. The 10,000-crime cap counts every category, so a narrower category does not help.",
+        "Search a smaller area: split the polygon into smaller polygons, or for a neighbourhood call ukcrime_find_neighbourhood with include ['boundary'] and search parts of that polygon with area 'polygon'. The limit of about 10,000 crimes counts every category, so a narrower category does not help.",
       severity: 'notice',
       thrownBy: 'service',
     },
@@ -358,7 +358,9 @@ export const searchCrimesTool = tool('ukcrime_search_crimes', {
         ),
       );
     }
-    if (total === 0) {
+    // A force that publishes no crime data is explained by its coverage note alone.
+    const silentForce = forceId !== undefined && publishesNothing(forceId, 'crime');
+    if (total === 0 && !(spec.kind === 'force_unplaced' && !narrowed && silentForce)) {
       notes.push(
         outsideCoverageNote(spec, run.located) ??
           (narrowed

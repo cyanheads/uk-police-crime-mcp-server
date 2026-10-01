@@ -311,6 +311,10 @@ describe('PoliceApiService reference methods', () => {
       ['a display name whose slug differs', 'criminal damage and arson', 'criminal-damage-arson'],
       ['a display name with runs of spaces', 'violence   and  sexual offences', 'violent-crime'],
       ['a display name that is also a phrase', 'all crime', 'all-crime'],
+      ['a slug written with underscores', 'vehicle_crime', 'vehicle-crime'],
+      ['a slug written with spaces', 'anti social behaviour', 'anti-social-behaviour'],
+      ['a display name written with hyphens', 'violence-and-sexual-offences', 'violent-crime'],
+      ['mixed runs of spaces, underscores and hyphens', 'vehicle _-crime', 'vehicle-crime'],
     ])('findCategory matches %s', async (_name, input, slug) => {
       const found = await settle(h.service.findCategory(input, h.ctx, h.budget()));
       expect(found?.slug).toBe(slug);
@@ -328,7 +332,21 @@ describe('PoliceApiService reference methods', () => {
       expect(found?.slug).toBe('violent-crime');
     });
 
-    it.each(['arson', 'violent', '', 'all-crimes'])(
+    it('findCategory resolves every slug and display name, in hyphen, underscore and space spellings, to its own category (no two fold to one form)', async () => {
+      const categories = await settle(h.service.getCategories(h.ctx, h.budget()));
+      expect(categories).toHaveLength(15);
+      for (const { slug, name } of categories) {
+        for (const form of [slug, name]) {
+          const words = form.toLowerCase().split(/[\s-]+/);
+          for (const spelling of [words.join('-'), words.join('_'), words.join(' ')]) {
+            const found = await settle(h.service.findCategory(spelling, h.ctx, h.budget()));
+            expect(found?.slug, `${JSON.stringify(spelling)} should resolve to ${slug}`).toBe(slug);
+          }
+        }
+      }
+    });
+
+    it.each(['arson', 'violent', '', 'all-crimes', 'theft'])(
       'findCategory returns undefined for %j, never widening to all crime',
       async (input) => {
         expect(await settle(h.service.findCategory(input, h.ctx, h.budget()))).toBeUndefined();
