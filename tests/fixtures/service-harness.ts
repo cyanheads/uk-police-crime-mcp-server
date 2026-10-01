@@ -10,7 +10,7 @@
 
 import type { Context } from '@cyanheads/mcp-ts-core';
 import { createFetchMock, createMockContext } from '@cyanheads/mcp-ts-core/testing';
-import { afterEach, beforeEach, expect, vi } from 'vitest';
+import { afterEach, beforeEach, expect, type MockInstance, vi } from 'vitest';
 import {
   initPoliceApiService,
   PoliceApiService,
@@ -128,19 +128,47 @@ export function createUpstream(): Upstream {
   return upstream;
 }
 
+/** Records the SHA-256 digests the current test starts (an area query's cache key), so {@link settle} can wait for them. */
+let digests: MockInstance<SubtleCrypto['digest']> | undefined;
+
 /** Installs the virtual clock for one test: Date and the timer functions are virtual, `setImmediate` and microtasks stay real. */
 function installVirtualClock(): void {
   vi.useFakeTimers({
     toFake: ['Date', 'setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'],
   });
   vi.setSystemTime(START_TIME);
+  digests = vi.spyOn(crypto.subtle, 'digest');
+}
+
+/** Removes what {@link installVirtualClock} installed. */
+function uninstallVirtualClock(): void {
+  digests?.mockRestore();
+  digests = undefined;
+  vi.useRealTimers();
 }
 
 /**
- * Drives a pending service call to completion on the virtual clock: yields a few
- * real milliseconds (native crypto and stream work), then advances virtual time
- * in `stepMs` slices until the promise settles. Returns what the promise
- * resolved to, or rejects with what it rejected with.
+ * Waits in real time, with the virtual clock held still, until every digest the
+ * test has started has finished and its caller has run on. The native digest
+ * takes real time that load stretches, so a clock that moves meanwhile expires
+ * timers and cache entries before the request they time has even started.
+ */
+async function untilDigested(): Promise<void> {
+  let seen = 0;
+  while (digests && seen < digests.mock.results.length) {
+    const started = digests.mock.results.slice(seen);
+    seen += started.length;
+    await Promise.all(started.map((result) => result.value));
+    await new Promise<void>((resolve) => realSetImmediate(resolve));
+  }
+}
+
+/**
+ * Drives a pending service call to completion on the virtual clock: first waits
+ * for the digests already started ({@link untilDigested}), yields a few real
+ * milliseconds (native stream work), then advances virtual time in `stepMs`
+ * slices until the promise settles. Returns what the promise resolved to, or
+ * rejects with what it rejected with.
  */
 export async function settle<T>(promise: Promise<T>, stepMs = 50, limitMs = 300_000): Promise<T> {
   let done = false;
@@ -148,10 +176,11 @@ export async function settle<T>(promise: Promise<T>, stepMs = 50, limitMs = 300_
     done = true;
   };
   promise.then(watch, watch);
+  await untilDigested();
   let advanced = 0;
   let rounds = 0;
   while (!done && advanced <= limitMs) {
-    // The first rounds wait real milliseconds for native work (crypto digests, streams); later rounds only yield.
+    // The first rounds wait real milliseconds for native stream work; later rounds only yield.
     await new Promise<void>((resolve) =>
       rounds < 3 ? realSetTimeout(resolve, 2) : realSetImmediate(resolve),
     );
@@ -215,7 +244,7 @@ export function useServiceHarness(options: { reference?: boolean } = {}): Servic
   afterEach(() => {
     const { service, upstream } = live();
     service.dispose();
-    vi.useRealTimers();
+    uninstallVirtualClock();
     current = undefined;
     expect(upstream.unhandled).toEqual([]);
   });
@@ -265,7 +294,7 @@ export function useToolHarness(options: { reference?: boolean } = {}): ToolHarne
   afterEach(() => {
     const { service, upstream } = live();
     service.dispose();
-    vi.useRealTimers();
+    uninstallVirtualClock();
     current = undefined;
     expect(upstream.unhandled).toEqual([]);
   });
