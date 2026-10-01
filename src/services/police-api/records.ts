@@ -47,10 +47,11 @@ const present = (value: string | null | undefined): string | undefined =>
   value?.trim() ? value : undefined;
 
 /** Code-unit order, so the sort never depends on the runtime's locale. */
-const compareText = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
+export const compareText = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
 
 /** Order for digit-string ids: shorter first, then code-unit order. */
-const compareDigits = (a: string, b: string): number => a.length - b.length || compareText(a, b);
+export const compareDigits = (a: string, b: string): number =>
+  a.length - b.length || compareText(a, b);
 
 function normalizeLocation(
   raw: RawLocation,

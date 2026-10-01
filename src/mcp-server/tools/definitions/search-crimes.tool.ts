@@ -48,7 +48,8 @@ import {
 import { crimesQuery, parseArea } from '@/services/police-api/area.js';
 import { coverageNotes, publishesNothing } from '@/services/police-api/known-gaps.js';
 import { getPoliceApiService } from '@/services/police-api/police-api-service.js';
-import type { CrimeRecord, MapPoint } from '@/services/police-api/types.js';
+import { compareDigits } from '@/services/police-api/records.js';
+import type { CrimeRecord } from '@/services/police-api/types.js';
 
 const CRIME_AREAS = ['point', 'polygon', 'location', 'neighbourhood', 'force_unplaced'] as const;
 
@@ -145,36 +146,23 @@ type CrimesOutput = z.infer<typeof OutputSchema>;
 
 /** The map points holding the most crimes, most first, then by location id. */
 function topLocations(crimes: readonly CrimeRecord[]): NonNullable<CrimesOutput['top_locations']> {
-  const counts = new Map<
-    string,
-    { count: number; readonly mapPoint?: MapPoint; readonly streetName: string }
-  >();
+  const counts = new Map<string, NonNullable<CrimesOutput['top_locations']>[number]>();
   for (const { location } of crimes) {
     if (!location) continue;
     const entry = counts.get(location.location_id);
     if (entry) entry.count += 1;
     else {
       counts.set(location.location_id, {
+        location_id: location.location_id,
+        street_name: location.street_name,
         count: 1,
-        streetName: location.street_name,
-        ...(location.map_point ? { mapPoint: location.map_point } : {}),
+        ...(location.map_point ? { map_point: location.map_point } : {}),
       });
     }
   }
-  return Array.from(counts, ([locationId, entry]) => ({ locationId, ...entry }))
-    .sort(
-      (a, b) =>
-        b.count - a.count ||
-        a.locationId.length - b.locationId.length ||
-        (a.locationId < b.locationId ? -1 : a.locationId > b.locationId ? 1 : 0),
-    )
-    .slice(0, TOP_LOCATIONS)
-    .map(({ locationId, streetName, count, mapPoint }) => ({
-      location_id: locationId,
-      street_name: streetName,
-      count,
-      ...(mapPoint ? { map_point: mapPoint } : {}),
-    }));
+  return Array.from(counts.values())
+    .sort((a, b) => b.count - a.count || compareDigits(a.location_id, b.location_id))
+    .slice(0, TOP_LOCATIONS);
 }
 
 export const searchCrimesTool = tool('ukcrime_search_crimes', {

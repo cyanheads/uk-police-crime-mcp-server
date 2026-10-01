@@ -45,6 +45,7 @@ import {
 import { outcomesQuery, parseArea } from '@/services/police-api/area.js';
 import { coverageNotes } from '@/services/police-api/known-gaps.js';
 import { getPoliceApiService } from '@/services/police-api/police-api-service.js';
+import { compareText } from '@/services/police-api/records.js';
 import type { OutcomeRecord } from '@/services/police-api/types.js';
 
 const OUTCOME_AREAS = ['point', 'polygon', 'location', 'neighbourhood'] as const;
@@ -56,8 +57,6 @@ const DATA_NOTE =
 
 const POINT_TOO_LARGE =
   "A 1-mile circle here holds more than 10,000 outcomes; search area 'polygon' with a smaller ring around the point.";
-
-const compareText = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
 
 const OutcomeSchema = z
   .object({
@@ -141,13 +140,13 @@ type OutcomesOutput = z.infer<typeof OutputSchema>;
 
 /** Counts outcomes by code, most first, then by code. */
 function outcomeCounts(outcomes: readonly OutcomeRecord[]): OutcomesOutput['by_outcome'] {
-  const counts = new Map<string, { count: number; readonly name: string }>();
+  const counts = new Map<string, OutcomesOutput['by_outcome'][number]>();
   for (const { code, name } of outcomes) {
     const entry = counts.get(code);
     if (entry) entry.count += 1;
-    else counts.set(code, { name, count: 1 });
+    else counts.set(code, { code, name, count: 1 });
   }
-  return Array.from(counts, ([code, { name, count }]) => ({ code, name, count })).sort(
+  return Array.from(counts.values()).sort(
     (a, b) => b.count - a.count || compareText(a.code, b.code),
   );
 }

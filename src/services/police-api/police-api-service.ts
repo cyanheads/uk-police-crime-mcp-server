@@ -39,6 +39,7 @@ import {
   RawStreetDates,
 } from './raw-schemas.js';
 import {
+  compareText,
   normalizeCrimeHistory,
   normalizeEvents,
   normalizeNeighbourhood,
@@ -208,7 +209,7 @@ async function areaCacheKey(
   params: Readonly<Record<string, string>>,
 ): Promise<string> {
   const canonical = Object.entries(params)
-    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+    .sort(([a], [b]) => compareText(a, b))
     .map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(value)}`)
     .join('&');
   const digest = await crypto.subtle.digest(
@@ -294,7 +295,7 @@ export class PoliceApiService {
     }
     const months = [first, ...rest]
       .map((row) => ({ month: row.date, stopSearchForces: row['stop-and-search'] }))
-      .sort((a, b) => (a.month < b.month ? 1 : a.month > b.month ? -1 : 0));
+      .sort((a, b) => compareText(b.month, a.month));
     const availability: Availability = { latest, earliest, months };
     this.availabilityCache.set(SINGLETON_KEY, availability);
     return availability;
@@ -457,7 +458,7 @@ export class PoliceApiService {
     ctx: Context,
     budget: CallBudget,
   ): Promise<Lookup<readonly MapPoint[]>> {
-    const path = `/${encodeURIComponent(force)}/${encodeURIComponent(neighbourhoodId)}/boundary`;
+    const path = neighbourhoodPath(force, neighbourhoodId, 'boundary');
     const cached = this.boundaryCache.get(path);
     if (cached) return cached;
     const answer = await this.send({ path, notFoundIsMiss: true }, ctx, budget);

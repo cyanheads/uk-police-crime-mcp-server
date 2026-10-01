@@ -15,6 +15,7 @@ import {
   BTP_FORCE,
   type PoliceApiService,
 } from '@/services/police-api/police-api-service.js';
+import { compareText } from '@/services/police-api/records.js';
 import type {
   CallBudget,
   Force,
@@ -239,7 +240,7 @@ export function breakdown<T>(
     counts.set(value, (counts.get(value) ?? 0) + 1);
   }
   return Array.from(counts, ([value, count]) => ({ value, count })).sort(
-    (a, b) => b.count - a.count || (a.value < b.value ? -1 : a.value > b.value ? 1 : 0),
+    (a, b) => b.count - a.count || compareText(a.value, b.value),
   );
 }
 
