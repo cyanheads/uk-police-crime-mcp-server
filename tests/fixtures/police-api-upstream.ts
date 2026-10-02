@@ -76,6 +76,54 @@ export const forcesBody = () => [
   { id: 'northern-ireland', name: 'Police Service of Northern Ireland' },
 ];
 
+/** `GET /forces` in full, all 44 in upstream order, as data.police.uk answered on 2026-10-01. */
+export const allForcesBody = () => [
+  { id: 'avon-and-somerset', name: 'Avon and Somerset Constabulary' },
+  { id: 'bedfordshire', name: 'Bedfordshire Police' },
+  { id: 'cambridgeshire', name: 'Cambridgeshire Constabulary' },
+  { id: 'cheshire', name: 'Cheshire Constabulary' },
+  { id: 'city-of-london', name: 'City of London Police' },
+  { id: 'cleveland', name: 'Cleveland Police' },
+  { id: 'cumbria', name: 'Cumbria Constabulary' },
+  { id: 'derbyshire', name: 'Derbyshire Constabulary' },
+  { id: 'devon-and-cornwall', name: 'Devon & Cornwall Police' },
+  { id: 'dorset', name: 'Dorset Police' },
+  { id: 'durham', name: 'Durham Constabulary' },
+  { id: 'essex', name: 'Essex Police' },
+  { id: 'gloucestershire', name: 'Gloucestershire Constabulary' },
+  { id: 'greater-manchester', name: 'Greater Manchester Police' },
+  { id: 'gwent', name: 'Gwent Police' },
+  { id: 'hampshire', name: 'Hampshire Constabulary' },
+  { id: 'dyfed-powys', name: 'Dyfed-Powys Police' },
+  { id: 'hertfordshire', name: 'Hertfordshire Constabulary' },
+  { id: 'humberside', name: 'Humberside Police' },
+  { id: 'kent', name: 'Kent Police' },
+  { id: 'lancashire', name: 'Lancashire Constabulary' },
+  { id: 'leicestershire', name: 'Leicestershire Police' },
+  { id: 'lincolnshire', name: 'Lincolnshire Police' },
+  { id: 'merseyside', name: 'Merseyside Police' },
+  { id: 'metropolitan', name: 'Metropolitan Police Service' },
+  { id: 'norfolk', name: 'Norfolk Constabulary' },
+  { id: 'north-wales', name: 'North Wales Police' },
+  { id: 'north-yorkshire', name: 'North Yorkshire Police' },
+  { id: 'northamptonshire', name: 'Northamptonshire Police' },
+  { id: 'northumbria', name: 'Northumbria Police' },
+  { id: 'nottinghamshire', name: 'Nottinghamshire Police' },
+  { id: 'northern-ireland', name: 'Police Service of Northern Ireland' },
+  { id: 'south-wales', name: 'South Wales Police' },
+  { id: 'south-yorkshire', name: 'South Yorkshire Police' },
+  { id: 'staffordshire', name: 'Staffordshire Police' },
+  { id: 'suffolk', name: 'Suffolk Constabulary' },
+  { id: 'surrey', name: 'Surrey Police' },
+  { id: 'sussex', name: 'Sussex Police' },
+  { id: 'thames-valley', name: 'Thames Valley Police' },
+  { id: 'warwickshire', name: 'Warwickshire Police' },
+  { id: 'west-mercia', name: 'West Mercia Police' },
+  { id: 'west-midlands', name: 'West Midlands Police' },
+  { id: 'west-yorkshire', name: 'West Yorkshire Police' },
+  { id: 'wiltshire', name: 'Wiltshire Police' },
+];
+
 /** `GET /crime-categories` — all 15, `url` being the slug. */
 export const categoriesBody = () => [
   { url: 'all-crime', name: 'All crime' },
@@ -126,6 +174,45 @@ export const locateBody = (overrides: Record<string, unknown> = {}) => ({
   neighbourhood: 'NX01',
   ...overrides,
 });
+
+/**
+ * `GET /locate-neighbourhood` answered by the `q` it was sent (`lat,lng` at 6 dp):
+ * a force id answers 200 with that force, a responder answers as itself. A `q`
+ * with no entry fails the request, so a test names every point it expects.
+ */
+export const locateBy =
+  (answers: Readonly<Record<string, string | Responder>>): Responder =>
+  (request) => {
+    const q = new URL(request.url).searchParams.get('q') ?? '';
+    const answer = answers[q];
+    if (answer === undefined) throw new Error(`No locate answer for q=${q}`);
+    return typeof answer === 'string'
+      ? jsonOk(locateBody({ force: answer }))(request)
+      : answer(request);
+  };
+
+/**
+ * A ring straddling two forces (Greater Manchester to the north, Cheshire to the
+ * south), as `{ lat, lng }` vertices: NW, NE, SE, SW.
+ */
+export const STRADDLE_RING = [
+  { lat: 53.37, lng: -2.26 },
+  { lat: 53.37, lng: -2.2 },
+  { lat: 53.33, lng: -2.2 },
+  { lat: 53.33, lng: -2.26 },
+] as const;
+
+/**
+ * The points a search locates for {@link STRADDLE_RING}, as `q` values: the
+ * bounding-box centre, then the first northernmost (NW), southernmost (SE) and
+ * easternmost (NE) vertices; the westernmost is NW again.
+ */
+export const STRADDLE_SAMPLES = {
+  centre: '53.350000,-2.230000',
+  north: '53.370000,-2.260000',
+  south: '53.330000,-2.200000',
+  east: '53.370000,-2.200000',
+} as const;
 
 /** `GET /{force}/{id}/boundary` — decimal strings at 10 dp, first vertex repeated last. */
 export const boundaryBody = () => [
@@ -502,14 +589,26 @@ export const rateLimited =
       ...(retryAfter === undefined ? {} : { headers: { 'retry-after': retryAfter } }),
     });
 
+/** 429 whose `Retry-After` is an HTTP-date `ms` after the moment it answers (whole seconds, as the header carries). */
+export const rateLimitedUntil =
+  (ms: number): Responder =>
+  () =>
+    new Response(null, {
+      status: 429,
+      headers: { 'retry-after': new Date(Date.now() + ms).toUTCString() },
+    });
+
 /** 503 with an empty body and no `Retry-After`: an area data.police.uk refuses as too large, or an outage. */
 export const overloaded: Responder = () => new Response(null, { status: 503 });
 
-/** A bare status with an empty body (500, 502, 504 …). */
+/** A bare status with an empty body (500, 502, 504 …), carrying `Retry-After` (delta-seconds) when given. */
 export const status =
-  (code: number): Responder =>
+  (code: number, retryAfter?: string): Responder =>
   () =>
-    new Response(null, { status: code });
+    new Response(null, {
+      status: code,
+      ...(retryAfter === undefined ? {} : { headers: { 'retry-after': retryAfter } }),
+    });
 
 /** A fetch that never answers; rejects with the request's abort reason when its signal fires. */
 export const hang: Responder = (request) =>
@@ -534,6 +633,18 @@ export function sequence(...responders: Responder[]): Responder {
     return responder(request);
   };
 }
+
+/** The month an area request asked for: its `date` query parameter, or the form field of a POST. */
+const monthOf = async (request: Request): Promise<string> =>
+  (request.method === 'POST'
+    ? new URLSearchParams(await request.clone().text()).get('date')
+    : new URL(request.url).searchParams.get('date')) ?? '';
+
+/** Answers each month of an area route with its own responder, any other month with `rest`. */
+export const perMonth =
+  (answers: Readonly<Record<string, Responder>>, rest: Responder = emptyArrayOk): Responder =>
+  async (request) =>
+    (answers[await monthOf(request)] ?? rest)(request);
 
 /** A valid JSON body of exactly `bytes` ASCII bytes: `["xxx…"]`. Generated, never checked in. */
 export function sizedJsonBody(bytes: number): string {

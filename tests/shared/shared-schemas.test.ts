@@ -94,6 +94,9 @@ describe('blankAsUnset', () => {
 });
 
 describe('forceInput', () => {
+  const SHAPE =
+    "Expected a force id or name such as 'leicestershire' or 'Devon & Cornwall Police': letters, with words joined by spaces, hyphens, underscores or '&'.";
+
   it.each([
     ['leicestershire', 'leicestershire'],
     ['  Leicestershire  ', 'leicestershire'],
@@ -104,6 +107,15 @@ describe('forceInput', () => {
     ['Avon and Somerset', 'avon-and-somerset'],
     ['northern-ireland', 'northern-ireland'],
     ['btp', 'btp'],
+    // Display names fold the same way; the handler strips a trailing suffix when it matches.
+    ['Leicestershire Police', 'leicestershire-police'],
+    ['Devon & Cornwall Police', 'devon-and-cornwall-police'],
+    ['Avon&Somerset', 'avon-and-somerset'],
+    ['Dyfed-Powys Police', 'dyfed-powys-police'],
+    ['Police Service of Northern Ireland', 'police-service-of-northern-ireland'],
+    ['greater--manchester', 'greater-manchester'],
+    ['greater - manchester', 'greater-manchester'],
+    ['Greater\tManchester', 'greater-manchester'],
   ])('reads %j as %j', (input, expected) => {
     expect(accepted(forceInput, input)).toBe(expected);
   });
@@ -116,19 +128,55 @@ describe('forceInput', () => {
     ['digits', 'leicestershire1'],
     ['a leading hyphen', '-leicestershire'],
     ['a trailing hyphen', 'leicestershire-'],
-    ['a doubled hyphen', 'greater--manchester'],
+    ['a lone ampersand', '&'],
+    ['a trailing ampersand', 'Avon &'],
     ['a slash', 'leicestershire/neighbourhoods'],
     ['a path climb', '../forces'],
+    ['a dot', 'st. albans'],
     ['a query', 'leicestershire?x=1'],
+    ['an apostrophe', "king's lynn"],
     ['an accented letter', 'dyfed-pówys'],
-    ['a non-string', 5],
-  ])('rejects %s', (_name, input) => {
-    rejected(forceInput, input);
+  ])('rejects %s with one issue naming the expected shape', (_name, input) => {
+    const issues = rejected(forceInput, input);
+    expect(issues.map((issue) => issue.message)).toEqual([SHAPE]);
+  });
+
+  it('rejects a non-string', () => {
+    rejected(forceInput, 5);
   });
 
   it('accepts 100 characters and rejects 101', () => {
     accepted(forceInput, 'a'.repeat(100));
     rejected(forceInput, 'a'.repeat(101));
+  });
+
+  describe('the pattern its JSON Schema advertises', () => {
+    const { properties } = z.toJSONSchema(z.object({ force: forceInput.describe('Force.') }));
+    const advertised = new RegExp(
+      (properties?.force as { pattern?: string } | undefined)?.pattern ?? '(?!)',
+    );
+
+    it.each([
+      'Devon & Cornwall Police',
+      'leicestershire',
+      ' kent ',
+      'West\tYorkshire',
+      'west yorkshire',
+      'west yorkshire',
+      '\tkent',
+      'kent\n',
+    ])('accepts %j, as the schema does', (value) => {
+      expect(advertised.test(value)).toBe(true);
+      accepted(forceInput, value);
+    });
+
+    it.each(['-kent', 'kent-', '&', '&&', 'Avon &', '_', '-', 'kent1', "king's lynn"])(
+      'refuses %j, as the schema does',
+      (value) => {
+        expect(advertised.test(value)).toBe(false);
+        rejected(forceInput, value);
+      },
+    );
   });
 });
 
@@ -521,7 +569,7 @@ describe('a form client submitting every optional field blank', () => {
   it('applies each field normalization when real values arrive', () => {
     expect(
       form.parse({
-        force: ' Greater Manchester ',
+        force: ' Devon & Cornwall ',
         neighbourhood_id: ' NX01 ',
         location_id: ' 123 ',
         month: ' 2026-08 ',
@@ -532,7 +580,7 @@ describe('a form client submitting every optional field blank', () => {
         polygon: [],
       }),
     ).toEqual({
-      force: 'greater-manchester',
+      force: 'devon-and-cornwall',
       neighbourhood_id: 'NX01',
       location_id: '123',
       month: '2026-08',

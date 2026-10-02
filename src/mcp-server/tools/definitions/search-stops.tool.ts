@@ -1,48 +1,58 @@
 /**
- * @fileoverview ukcrime_search_stops — stop and search records for one month
- * inside an area (a point's 1-mile radius, a polygon, a snapped location_id, a
- * police neighbourhood) or across a whole force: counts by type, both ethnicity
- * fields, outcome, object of search, legislation, age range and gender, and a
- * page of stops. Filters narrow the counts and the page together.
+ * @fileoverview ukcrime_search_stops — stop and search records for one month,
+ * or a range of up to 12 months, inside an area (a point's 1-mile radius, a
+ * polygon, a snapped location_id, a police neighbourhood) or across a whole
+ * force: counts by type, both ethnicity fields, outcome, object of search,
+ * legislation, age range, gender, and the find and strip-search flags, each
+ * month's total and publication for a range, and a page of stops. Filters
+ * narrow the counts and the page together.
  * @module mcp-server/tools/definitions/search-stops.tool
  */
 
 import { type Context, tool, z } from '@cyanheads/mcp-ts-core';
-import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { internalError, JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import {
   AREA_INPUT_ALIASES,
   areaEcho,
   breakdown,
   checkNamedForce,
+  type ForceCheck,
   latField,
   lngField,
   locationIdField,
   monthDefaultedNote,
-  monthFailureMessage,
-  monthField,
+  monthFromField,
+  monthSpanLabel,
   NOT_RECORDED,
   neighbourhoodIdField,
   offsetField,
   outsideCoverageNote,
   pageOf,
   pagingNote,
+  partialLocateNote,
   polygonField,
-  runAreaQuery,
-  searchedForceId,
+  rangeEndMonthField,
+  rangeStopMessage,
+  resolveMonthWindow,
+  runAreaWindow,
+  unknownNeighbourhoodMessage,
 } from '@/mcp-server/tools/area-search.js';
 import { inline } from '@/mcp-server/tools/format-helpers.js';
 import {
   AreaEchoSchema,
   breakdownSchema,
+  byMonthSchema,
   LocationSchema,
+  MonthTotalSchema,
   renderArea,
   renderBreakdown,
+  renderByMonth,
   renderLocation,
   SEARCH_ENRICHMENT,
   SEARCH_ENRICHMENT_TRAILER,
 } from '@/mcp-server/tools/search-output.js';
 import { ATTRIBUTION, forceInput, limitInput } from '@/mcp-server/tools/shared-schemas.js';
-import { parseArea, stopsQuery } from '@/services/police-api/area.js';
+import { type AreaTarget, parseArea, stopsQuery } from '@/services/police-api/area.js';
 import {
   getPoliceApiService,
   type PoliceApiService,
@@ -51,7 +61,7 @@ import type { CallBudget, StopRecord } from '@/services/police-api/types.js';
 
 const STOP_AREAS = ['point', 'polygon', 'location', 'neighbourhood', 'force'] as const;
 
-/** The categorical stop fields `filters` match and the breakdowns count, in breakdown order. */
+/** The stop fields `filters` match and the breakdowns count, in breakdown order: eight categorical, then two yes/no flags. */
 const STOP_FIELDS = [
   'type',
   'self_defined_ethnicity',
@@ -61,9 +71,58 @@ const STOP_FIELDS = [
   'legislation',
   'age_range',
   'gender',
+  'outcome_linked_to_object_of_search',
+  'removal_of_more_than_outer_clothing',
 ] as const satisfies readonly (keyof StopRecord)[];
 
 type StopField = (typeof STOP_FIELDS)[number];
+
+/** A stop filter after parsing, its value read as a string. */
+interface StopFilter {
+  readonly field: StopField;
+  readonly value: string;
+}
+
+/**
+ * A stop's value for a filter field or breakdown, as the breakdowns show it: a
+ * flag as `'true'` or `'false'`, an unrecorded value as undefined. Filter
+ * matching, the breakdowns and the zero-hit present values all read it.
+ */
+const stopValue = (stop: StopRecord, field: StopField): string | undefined => {
+  const value = stop[field];
+  return value === undefined ? undefined : String(value);
+};
+
+/** The stops matching every filter, case-insensitively; `(not recorded)` matches an unrecorded value. */
+function matchStops(
+  stops: readonly StopRecord[],
+  filters: readonly StopFilter[],
+): readonly StopRecord[] {
+  if (filters.length === 0) return stops;
+  return stops.filter((stop) =>
+    filters.every(
+      ({ field, value }) =>
+        (stopValue(stop, field) ?? NOT_RECORDED).toLowerCase() === value.toLowerCase(),
+    ),
+  );
+}
+
+/** Every field's breakdown over a stop list. */
+function stopBreakdowns(stops: readonly StopRecord[]) {
+  const count = (field: StopField) => breakdown(stops, (stop) => stopValue(stop, field));
+  return {
+    by_type: count('type'),
+    by_self_defined_ethnicity: count('self_defined_ethnicity'),
+    by_officer_defined_ethnicity: count('officer_defined_ethnicity'),
+    by_outcome: count('outcome'),
+    by_object_of_search: count('object_of_search'),
+    by_legislation: count('legislation'),
+    by_age_range: count('age_range'),
+    by_gender: count('gender'),
+    by_outcome_linked_to_object_of_search: count('outcome_linked_to_object_of_search'),
+    by_removal_of_more_than_outer_clothing: count('removal_of_more_than_outer_clothing'),
+  };
+}
 
 /** Most filters a call takes. */
 const MAX_FILTERS = 8;
@@ -80,13 +139,14 @@ const POINT_TOO_LARGE =
 const StopFilterInput = z
   .object({
     field: z.enum(STOP_FIELDS).describe('Stop field to match.'),
+    // The union, not a preprocess to string, so the advertised schema accepts the boolean too.
     value: z
       .preprocess(
         (value) => (typeof value === 'string' ? value.trim() : value),
-        z.string().min(1).max(200),
+        z.union([z.string().min(1).max(200), z.boolean()]),
       )
       .describe(
-        "Value to match exactly, case-insensitively, as the breakdowns show it; '(not recorded)' matches stops with no value.",
+        "Value to match exactly, case-insensitively, as the breakdowns show it: 'true' or 'false' for outcome_linked_to_object_of_search and removal_of_more_than_outer_clothing (a JSON true or false reads the same), and '(not recorded)' for stops with no value.",
       ),
   })
   .strict()
@@ -121,7 +181,13 @@ const StopSchema = z
   .describe('One stop and search, values as published; a field is absent when not recorded.');
 
 const OutputSchema = z.object({
-  month: z.string().describe('The month searched, YYYY-MM.'),
+  month_from: z
+    .string()
+    .optional()
+    .describe(
+      'First month of the range searched, YYYY-MM; present only when month_from was given.',
+    ),
+  month: z.string().describe('The month searched, or the last month of the range, YYYY-MM.'),
   area: AreaEchoSchema,
   filters: z
     .array(
@@ -133,8 +199,10 @@ const OutputSchema = z.object({
         .describe('One applied filter.'),
     )
     .describe('Filters applied, case-insensitively; empty when none.'),
-  total: z.number().describe('Stops matched after filters.'),
-  unfiltered_total: z.number().describe('Stops in the area and month before filters.'),
+  total: z.number().describe('Stops matched after filters, over the month or range.'),
+  unfiltered_total: z
+    .number()
+    .describe('Stops in the area over the month or range, before filters.'),
   unplaced: z
     .number()
     .describe("Matched stops with no location — the force's unplaced stops, for area 'force'."),
@@ -142,8 +210,19 @@ const OutputSchema = z.object({
     .boolean()
     .optional()
     .describe(
-      "Whether the area's force (named, or located for a point) published stop and search this month. Absent when the force is unknown.",
+      "Whether every force found for the area (the one it names, or each located at a point, a polygon's centre and outermost vertices, or a location's map point) published stop and search this month, or in every month of a range: false when any month was missed. Otherwise absent when no force was found, when a month has no row in the publication list, or when none of those found is missing yet a polygon point could not be looked up.",
     ),
+  by_month: byMonthSchema(
+    MonthTotalSchema.extend({
+      force_published: z
+        .boolean()
+        .optional()
+        .describe(
+          'Whether every force found for the area published stop and search this month; absent on the same terms as the top-level force_published.',
+        ),
+    }),
+    'Stops matched in each month of the range, oldest first; their totals sum to total. Present only when month_from was given.',
+  ),
   by_type: breakdownSchema('Matched stops by search type, most first.'),
   by_self_defined_ethnicity: breakdownSchema(
     'Matched stops by ethnicity as the person defined it, most first.',
@@ -158,6 +237,12 @@ const OutputSchema = z.object({
   by_legislation: breakdownSchema('Matched stops by legislation, most first.'),
   by_age_range: breakdownSchema('Matched stops by age range, most first.'),
   by_gender: breakdownSchema('Matched stops by gender, most first.'),
+  by_outcome_linked_to_object_of_search: breakdownSchema(
+    "Matched stops by whether the outcome was linked to the object of search ('true', 'false' or '(not recorded)'), most first.",
+  ),
+  by_removal_of_more_than_outer_clothing: breakdownSchema(
+    "Matched stops by whether more than outer clothing was removed ('true', 'false' or '(not recorded)' where the force sent no value, as some do for vehicle-only searches), most first.",
+  ),
   stops: z
     .array(StopSchema)
     .describe('This page of matched stops, oldest first, then by location_id.'),
@@ -176,52 +261,76 @@ const BREAKDOWN_TITLES: Readonly<Record<StopField, string>> = {
   legislation: 'By legislation',
   age_range: 'By age range',
   gender: 'By gender',
+  outcome_linked_to_object_of_search: 'By outcome linked to object of search',
+  removal_of_more_than_outer_clothing: 'By more than outer clothing removed',
 };
 
 const yesNo = (flag: boolean): string => (flag ? 'yes' : 'no');
 
 /**
- * A located force's name for the not-published fragment. The search already
- * has its answer, so a failed force-list read leaves the name unknown rather
- * than failing the call; a cancellation still rethrows.
+ * A month's stop-and-search publication for the forces a search knows:
+ * `unpublished` lists those missing from the month's publisher list, and
+ * `published` is true when none is and the forces are `complete`, false when
+ * any is, and absent when no force is known, the month has no row in the list,
+ * or none is missing from forces that may not be complete.
  */
-async function locatedForceName(
-  forceId: string,
+function publication(
+  forces: readonly string[],
+  publishers: readonly string[] | undefined,
+  complete: boolean,
+): { readonly published?: boolean; readonly unpublished: readonly string[] } {
+  if (forces.length === 0 || !publishers) return { unpublished: [] };
+  const unpublished = forces.filter((force) => !publishers.includes(force));
+  if (unpublished.length === 0 && !complete) return { unpublished };
+  return { published: unpublished.length === 0, unpublished };
+}
+
+/**
+ * Names for the not-published fragment, by force id: the named force's, or the
+ * force list's for located forces. The search already has its answer, so a
+ * failed force-list read leaves each name to its id rather than failing the
+ * call; a cancellation still rethrows.
+ */
+async function forceNames(
+  named: ForceCheck,
   service: PoliceApiService,
   ctx: Context,
   budget: CallBudget,
-): Promise<string | undefined> {
+): Promise<ReadonlyMap<string, string>> {
+  if (named.kind === 'ok') return new Map([[named.force.id, named.force.name]]);
   try {
-    return (await service.findForce(forceId, ctx, budget, { allowBtp: true }))?.name;
+    const forces = await service.getForces(ctx, budget);
+    return new Map(forces.map((force) => [force.id, force.name]));
   } catch (error) {
     if (ctx.signal.aborted) throw error;
-    ctx.log.warning('Force list read failed; naming the located force by its id', {
+    ctx.log.warning('Force list read failed; naming each located force by its id', {
       error: error instanceof Error ? error.message : String(error),
     });
-    return;
+    return new Map();
   }
 }
 
 export const searchStopsTool = tool('ukcrime_search_stops', {
   title: 'Search UK Police Stop and Search',
   description:
-    "Search police stop and search records for one month inside an area — a point with a 1-mile radius, a polygon, a location_id from an earlier result, or a police neighbourhood — or across a whole force with area 'force', which includes stops the force could not place. Returns the total and counts by search type, self-defined and officer-defined ethnicity, outcome, object of search, legislation, age range and gender, plus a page of stops. filters narrow the counts and the page together, so filtering one field and reading another's breakdown gives a cross-tab. Forces skip months and some publish none; the result says when the force did not publish for the month.",
+    "Search police stop and search records for one month, or with month_from a range of up to 12 months, inside an area — a point with a 1-mile radius, a polygon, a location_id from an earlier result, or a police neighbourhood — or across a whole force with area 'force', which includes stops the force could not place. Returns the total and counts by search type, self-defined and officer-defined ethnicity, outcome, object of search, legislation, age range, gender, whether the outcome was linked to the object of search, and whether more than outer clothing was removed, each month's total for a range, and a page of stops. filters narrow the counts and the page together, so filtering one field and reading another's breakdown gives a cross-tab. Forces skip months and some publish none; the result names each force it finds for the area that did not publish, with the months it skipped.",
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
     area: z
       .enum(STOP_AREAS)
       .describe(
-        "Area to search: 'point' (lat and lng; a 1-mile radius), 'polygon' (polygon), 'location' (location_id), 'neighbourhood' (force and neighbourhood_id), or 'force' (force alone: every stop the force published for the month, placed or not). An area field the chosen area does not use is rejected.",
+        "Area to search: 'point' (lat and lng; a 1-mile radius), 'polygon' (polygon), 'location' (location_id), 'neighbourhood' (force and neighbourhood_id), or 'force' (force alone: every stop the force published for the month or range, placed or not). An area field the chosen area does not use is rejected.",
       ),
     lat: latField,
     lng: lngField,
     polygon: polygonField,
     location_id: locationIdField,
     force: forceInput.describe(
-      "Force id such as 'leicestershire' (ukcrime_list_reference topic 'forces' lists them); trimmed, lower-cased, spaces and underscores become hyphens. For area 'neighbourhood' (with neighbourhood_id) and 'force' (alone), where 'btp' (British Transport Police) is also accepted.",
+      "Force id such as 'leicestershire', or its name such as 'Leicestershire Police' (ukcrime_list_reference topic 'forces' lists both); case-insensitive, spaces, underscores and hyphens match each other, '&' matches 'and', and a trailing 'Police', 'Police Service' or 'Constabulary' is optional. For area 'neighbourhood' (with neighbourhood_id) and 'force' (alone), where 'btp' (British Transport Police) is also accepted.",
     ),
     neighbourhood_id: neighbourhoodIdField,
-    month: monthField,
+    month: rangeEndMonthField,
+    month_from: monthFromField,
     filters: z
       .preprocess(
         (value) =>
@@ -233,7 +342,7 @@ export const searchStopsTool = tool('ukcrime_search_stops', {
         z.array(StopFilterInput).max(MAX_FILTERS).optional(),
       )
       .describe(
-        'Up to 8 filters, all of which a stop must match; they narrow the counts and the page together. Fields: type, self_defined_ethnicity, officer_defined_ethnicity, outcome, object_of_search, legislation, age_range, gender.',
+        'Up to 8 filters, all of which a stop must match; they narrow the counts and the page together. Fields: type, self_defined_ethnicity, officer_defined_ethnicity, outcome, object_of_search, legislation, age_range, gender, outcome_linked_to_object_of_search, removal_of_more_than_outer_clothing.',
       ),
     limit: limitInput(15).describe('Stops on this page, 1–200. Default 15.'),
     offset: offsetField,
@@ -254,23 +363,31 @@ export const searchStopsTool = tool('ukcrime_search_stops', {
     {
       reason: 'month_not_published',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'month is after the latest published month',
+      when: 'month or month_from is after the latest published month',
       recovery:
-        "Call ukcrime_list_reference with topic 'availability' for the published months, or omit month to search the latest one.",
+        "Call ukcrime_list_reference with topic 'availability' for the published months, or omit month to search the latest one; month_from must be a published month no later than month.",
       severity: 'notice',
     },
     {
       reason: 'month_out_of_range',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'month is before the 36-month window',
+      when: 'month or month_from is before the 36-month window',
       recovery:
         "data.police.uk serves only the last 36 months; call ukcrime_list_reference with topic 'availability' for the earliest month.",
       severity: 'notice',
     },
     {
+      reason: 'invalid_month_range',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'month_from is after month, or the range spans more than 12 months',
+      recovery:
+        'Send a month_from no later than month, making a range of at most 12 months counting both ends; with month omitted, the range ends at the latest published month.',
+      severity: 'notice',
+    },
+    {
       reason: 'unknown_force',
       code: JsonRpcErrorCode.ValidationError,
-      when: "force is not in the force list, or 'btp' on area 'neighbourhood'",
+      when: "force matches no listed force id or name, or more than one, or is 'btp' on area 'neighbourhood'",
       recovery:
         "Call ukcrime_list_reference with topic 'forces' for valid force ids such as 'leicestershire'.",
       severity: 'notice',
@@ -293,10 +410,53 @@ export const searchStopsTool = tool('ukcrime_search_stops', {
       thrownBy: 'service',
     },
     {
+      reason: 'range_too_large',
+      code: JsonRpcErrorCode.ValidationError,
+      when: "the range's months hold more records than one call keeps for a range",
+      recovery:
+        'Shorten the range or search a smaller area; each month alone, or a shorter range, may still fit.',
+      severity: 'notice',
+    },
+    {
+      reason: 'range_incomplete',
+      code: JsonRpcErrorCode.Timeout,
+      when: 'the months of the range could not all be fetched within the time one call allows',
+      recovery:
+        'Call again with the same input — the months already fetched are cached, so the repeat fetches only the rest — or shorten the range or search a smaller area.',
+      retryable: true,
+    },
+    {
       reason: 'upstream_unavailable',
       code: JsonRpcErrorCode.ServiceUnavailable,
       when: 'data.police.uk is not answering',
       recovery: 'data.police.uk is not answering right now; call this tool again in a few minutes.',
+      retryable: true,
+      thrownBy: 'service',
+    },
+    {
+      reason: 'rate_limited',
+      code: JsonRpcErrorCode.RateLimited,
+      when: 'data.police.uk is rate-limiting this server for longer than this call can wait',
+      recovery:
+        'data.police.uk is rate-limiting this server; wait a few seconds, then call this tool again.',
+      retryable: true,
+      thrownBy: 'service',
+    },
+    {
+      reason: 'pacer_shed',
+      code: JsonRpcErrorCode.RateLimited,
+      when: 'too many requests to data.police.uk are already queued in this server',
+      recovery:
+        "This server's queue for data.police.uk is busy; wait a few seconds, then call this tool again.",
+      retryable: true,
+      thrownBy: 'service',
+    },
+    {
+      reason: 'retry_deadline_exceeded',
+      code: JsonRpcErrorCode.Timeout,
+      when: 'data.police.uk did not answer within the time one call allows',
+      recovery:
+        'data.police.uk did not answer within the time one call allows; call this tool again in a minute.',
       retryable: true,
       thrownBy: 'service',
     },
@@ -312,78 +472,88 @@ export const searchStopsTool = tool('ukcrime_search_stops', {
     });
     const parsed = parseArea(input.area, input);
     if (!parsed.ok) throw ctx.fail('invalid_area', parsed.message);
-    const { spec } = parsed;
 
     const service = getPoliceApiService();
     const budget = service.openBudget();
-    const [resolution, named] = await Promise.all([
-      service.resolveMonth(input.month, ctx, budget),
-      checkNamedForce(spec, service, ctx, budget),
+    const [window, named] = await Promise.all([
+      resolveMonthWindow(input.month, input.month_from, service, ctx, budget),
+      checkNamedForce(parsed.spec, service, ctx, budget),
     ]);
-    if (resolution.kind === 'not_published') {
-      throw ctx.fail('month_not_published', monthFailureMessage(resolution));
-    }
-    if (resolution.kind === 'out_of_range') {
-      throw ctx.fail('month_out_of_range', monthFailureMessage(resolution));
-    }
+    if (window.kind !== 'ok') throw ctx.fail(window.kind, window.message);
     if (named.kind === 'unknown') throw ctx.fail('unknown_force', named.message);
-    const { month } = resolution;
+    const { spec } = named;
+    const { month } = window;
+    const ranged = window.from !== undefined;
+    const span = monthSpanLabel(window);
 
-    const run = await runAreaQuery(
-      spec,
-      (target) => ({
-        ...stopsQuery(target, month),
-        ...(spec.kind === 'point' ? { tooLargeHint: POINT_TOO_LARGE } : {}),
-      }),
-      service,
-      ctx,
-      budget,
-    );
-    // /stops-at-location answers [] for an unknown id, so the boundary is the only lookup that misses.
-    if (run.kind !== 'ok') {
-      throw ctx.fail(
-        'unknown_neighbourhood',
-        `Force '${input.force}' has no neighbourhood '${input.neighbourhood_id}'; ids are case-sensitive.`,
-      );
+    const query = (target: AreaTarget, queried: string) => ({
+      ...stopsQuery(target, queried),
+      ...(spec.kind === 'point' ? { tooLargeHint: POINT_TOO_LARGE } : {}),
+    });
+    const mapPointOf = (stop: StopRecord) => stop.location?.map_point;
+    const run = await runAreaWindow(spec, window, query, mapPointOf, service, ctx, budget);
+    if (run.kind === 'range_incomplete' || run.kind === 'range_too_large') {
+      throw ctx.fail(run.kind, rangeStopMessage(run, window));
     }
+    if (run.kind === 'unknown_neighbourhood') {
+      throw ctx.fail('unknown_neighbourhood', unknownNeighbourhoodMessage(run));
+    }
+    // /stops-at-location answers [] for an unknown id, so the boundary is the only lookup that misses.
+    if (run.kind === 'unknown_location')
+      throw internalError('Stop searches have no location lookup that misses.');
 
-    const filters = input.filters ?? [];
-    const matched =
-      filters.length === 0
-        ? run.records
-        : run.records.filter((stop) =>
-            filters.every(
-              ({ field, value }) =>
-                (stop[field] ?? NOT_RECORDED).toLowerCase() === value.toLowerCase(),
-            ),
-          );
+    const filters: StopFilter[] = (input.filters ?? []).map(({ field, value }) => ({
+      field,
+      value: String(value),
+    }));
+    // A range locates once, so one partial located set withholds `true` from every month.
+    const partial = partialLocateNote(run);
+    const byMonth = run.months.map(({ month: searched, records }) => ({
+      month: searched,
+      matched: matchStops(records, filters),
+      ...publication(
+        run.forces,
+        window.availability.months.find((row) => row.month === searched)?.stopSearchForces,
+        partial === undefined,
+      ),
+    }));
+    const records = run.months.flatMap((entry) => entry.records);
+    const matched = byMonth.flatMap((entry) => entry.matched);
     const total = matched.length;
     const page = pageOf(matched, input.offset, input.limit);
     ctx.enrich({ truncated: page.nextOffset !== undefined, shown: page.rows.length });
 
-    const forceId = searchedForceId(named, run.located);
-    const publishers = resolution.availability.months.find(
-      (row) => row.month === month,
-    )?.stopSearchForces;
-    const forcePublished =
-      forceId !== undefined && publishers ? publishers.includes(forceId) : undefined;
+    const flags = byMonth.map((entry) => entry.published);
+    const forcePublished = flags.includes(false)
+      ? false
+      : flags.every((flag) => flag === true)
+        ? true
+        : undefined;
+    const skipped = run.forces
+      .map((forceId) => ({
+        forceId,
+        months: byMonth
+          .filter((entry) => entry.unpublished.includes(forceId))
+          .map((entry) => entry.month),
+      }))
+      .filter((entry) => entry.months.length > 0);
 
     const notes: string[] = [];
-    if (resolution.defaulted) notes.push(monthDefaultedNote(month));
-    if (forceId !== undefined && forcePublished === false) {
-      const forceName =
-        named.kind === 'ok'
-          ? named.force.name
-          : ((await locatedForceName(forceId, service, ctx, budget)) ?? forceId);
-      notes.push(
-        `${inline(forceName)} has not published stop and search data for ${month} to data.police.uk; call ukcrime_list_reference with topic 'availability' and force '${inline(forceId)}' for the months it has.`,
-      );
+    if (window.defaulted) notes.push(monthDefaultedNote(month, window.from));
+    if (skipped.length > 0) {
+      const names = await forceNames(named, service, ctx, budget);
+      for (const { forceId, months: missed } of skipped) {
+        notes.push(
+          `${inline(names.get(forceId) ?? forceId)} has not published stop and search data for ${missed.join(', ')} to data.police.uk; call ukcrime_list_reference with topic 'availability' and force '${inline(forceId)}' for the months it has.`,
+        );
+      }
     }
+    if (partial) notes.push(partial);
     if (total === 0) {
-      if (filters.length > 0 && run.records.length > 0) {
+      if (filters.length > 0 && records.length > 0) {
         const fields = [...new Set(filters.map(({ field }) => field))];
         const present = fields.map((field) => {
-          const values = breakdown(run.records, (stop) => stop[field]);
+          const values = breakdown(records, (stop) => stopValue(stop, field));
           const listed = values
             .slice(0, MAX_PRESENT_VALUES)
             .map(({ value }) => `"${inline(value)}"`)
@@ -397,16 +567,20 @@ export const searchStopsTool = tool('ukcrime_search_stops', {
         notes.push(`No stops matched the filters; ${present.join('; ')}.`);
       } else if (spec.kind === 'location') {
         notes.push(
-          `No stops at location ${spec.locationId} in ${month}; location ids come from earlier results, so check it or search area 'point'.`,
+          `No stops at location ${spec.locationId} in ${span}; location ids come from earlier results, so check it or search area 'point'.`,
         );
       } else {
-        const outside = outsideCoverageNote(spec, run.located);
+        const outside = outsideCoverageNote(spec, run);
+        // The not-published fragments explain a zero only where no force found published in any month searched.
+        const nonePublished =
+          run.forces.length > 0 &&
+          byMonth.every((entry) => entry.unpublished.length === run.forces.length);
         if (outside) notes.push(outside);
-        else if (forcePublished !== false) {
+        else if (partial || !nonePublished) {
           notes.push(
             spec.kind === 'force'
-              ? `No stops recorded for this force in ${month}; try another month.`
-              : `No stops recorded here in ${month}; try another month, a wider area, or area 'force' for the whole force, including stops it could not place.`,
+              ? `No stops recorded for this force in ${span}; try another month.`
+              : `No stops recorded here in ${span}; try another month, a wider area, or area 'force' for the whole force, including stops it could not place.`,
           );
         }
       }
@@ -416,21 +590,24 @@ export const searchStopsTool = tool('ukcrime_search_stops', {
     if (notes.length > 0) ctx.enrich.notice(notes.join(' '));
 
     return {
+      ...(ranged ? { month_from: window.from } : {}),
       month,
-      area: areaEcho(spec, run.target, run.located),
-      filters: filters.map(({ field, value }) => ({ field, value })),
+      area: areaEcho(spec, run),
+      filters,
       total,
-      unfiltered_total: run.records.length,
+      unfiltered_total: records.length,
       unplaced: matched.filter((stop) => !stop.location).length,
       ...(forcePublished !== undefined ? { force_published: forcePublished } : {}),
-      by_type: breakdown(matched, (stop) => stop.type),
-      by_self_defined_ethnicity: breakdown(matched, (stop) => stop.self_defined_ethnicity),
-      by_officer_defined_ethnicity: breakdown(matched, (stop) => stop.officer_defined_ethnicity),
-      by_outcome: breakdown(matched, (stop) => stop.outcome),
-      by_object_of_search: breakdown(matched, (stop) => stop.object_of_search),
-      by_legislation: breakdown(matched, (stop) => stop.legislation),
-      by_age_range: breakdown(matched, (stop) => stop.age_range),
-      by_gender: breakdown(matched, (stop) => stop.gender),
+      ...(ranged
+        ? {
+            by_month: byMonth.map((entry) => ({
+              month: entry.month,
+              total: entry.matched.length,
+              ...(entry.published !== undefined ? { force_published: entry.published } : {}),
+            })),
+          }
+        : {}),
+      ...stopBreakdowns(matched),
       stops: [...page.rows],
       ...(page.nextOffset !== undefined ? { next_offset: page.nextOffset } : {}),
     };
@@ -442,17 +619,19 @@ export const searchStopsTool = tool('ukcrime_search_stops', {
         ? result.filters.map(({ field, value }) => `${field} = "${inline(value)}"`).join('; ')
         : 'none';
     const lines = [
-      `## Stop and search — ${inline(result.month)}`,
+      `## Stop and search — ${inline(monthSpanLabel({ month: result.month, from: result.month_from }))}`,
       '',
       renderArea(result.area),
       `**Filters:** ${filters}`,
       `**Stops matched:** ${result.total} of ${result.unfiltered_total} · **Without a location:** ${result.unplaced}`,
     ];
     if (result.force_published !== undefined) {
+      const when = result.month_from === undefined ? 'this month' : 'in every month of the range';
       lines.push(
-        `**Force published stop and search for this month:** ${yesNo(result.force_published)}`,
+        `**Every force found for the area published stop and search ${when}:** ${yesNo(result.force_published)}`,
       );
     }
+    if (result.by_month) lines.push(...renderByMonth('Stops', result.by_month));
     const breakdowns = {
       type: result.by_type,
       self_defined_ethnicity: result.by_self_defined_ethnicity,
@@ -462,6 +641,8 @@ export const searchStopsTool = tool('ukcrime_search_stops', {
       legislation: result.by_legislation,
       age_range: result.by_age_range,
       gender: result.by_gender,
+      outcome_linked_to_object_of_search: result.by_outcome_linked_to_object_of_search,
+      removal_of_more_than_outer_clothing: result.by_removal_of_more_than_outer_clothing,
     };
     for (const field of STOP_FIELDS) {
       lines.push(...renderBreakdown(BREAKDOWN_TITLES[field], breakdowns[field]));

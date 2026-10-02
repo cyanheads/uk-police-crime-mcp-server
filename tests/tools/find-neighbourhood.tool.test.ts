@@ -4,12 +4,12 @@
  * the three invalid_lookup messages, unknown_force, `found: false` for a locate
  * or profile miss, section loading by `include` (cut to 5, then de-duplicated;
  * `[]` loads none; blank is the default), the single degraded-sections notice,
- * the event cap and `events_total`, the boundary string, known-gap and force-name
- * fallbacks, the proof that a biography and per-person contacts never reach
- * either surface, the enrichment fields on the not-found and found pages and
- * their write order, upstream failure classes, blank form values, caching, and
- * `format()` carrying the same data as `structuredContent` with upstream text
- * kept inert.
+ * every published event (no cap) and `events_total`, the boundary string,
+ * known-gap and force-name fallbacks, the proof that a biography and
+ * per-person contacts never reach either surface, the enrichment fields on the
+ * not-found and found pages and their write order, upstream failure classes,
+ * blank form values, caching, and `format()` carrying the same data as
+ * `structuredContent` with upstream text kept inert.
  * @module tests/tools/find-neighbourhood.tool.test
  */
 
@@ -316,6 +316,48 @@ describe('ukcrime_find_neighbourhood', () => {
 
     it("fails unknown_force for 'btp' with the no-neighbourhoods message", async () => {
       const error = errorOf(await call({ force: 'btp', neighbourhood_id: 'NX01' }));
+      expect(error.data.reason).toBe('unknown_force');
+      expect(error.message).toBe('British Transport Police has no neighbourhoods.');
+      expect(h.upstream.calls.some((c) => c.path.startsWith('/btp'))).toBe(false);
+    });
+
+    it('takes a display name, sending every neighbourhood and force request by the matched id', async () => {
+      neighbourhoodRoutes(h.upstream, { force: 'leicestershire', id: 'NX01' });
+      const result = await call({
+        force: 'Leicestershire Police',
+        neighbourhood_id: 'NX01',
+        include: ['priorities', 'team', 'events', 'boundary'],
+      });
+      const out = data(result);
+      expect(out.force).toMatchObject({ id: 'leicestershire', name: 'Leicestershire Police' });
+      expect(text(result)).toContain('**Force:** Leicestershire Police (leicestershire)');
+      expect(
+        h.upstream.calls
+          .map((c) => c.path)
+          .filter((path) => path !== '/forces')
+          .sort(),
+      ).toEqual([
+        '/forces/leicestershire',
+        '/leicestershire/NX01',
+        '/leicestershire/NX01/boundary',
+        '/leicestershire/NX01/events',
+        '/leicestershire/NX01/people',
+        '/leicestershire/NX01/priorities',
+      ]);
+    });
+
+    it('names the matched id in the guidance when a display name finds no such neighbourhood', async () => {
+      routes();
+      for (const path of [P, ...SECTION_PATHS]) h.upstream.route('GET', path, plainNotFound);
+      const out = data(await call({ force: 'LEICESTERSHIRE POLICE', neighbourhood_id: 'NX01' }));
+      expect(out.found).toBe(false);
+      expect(out.guidance).toContain("No neighbourhood 'NX01' in force 'leicestershire'.");
+    });
+
+    it('fails unknown_force for British Transport Police with the no-neighbourhoods message', async () => {
+      const error = errorOf(
+        await call({ force: 'British Transport Police', neighbourhood_id: 'NX01' }),
+      );
       expect(error.data.reason).toBe('unknown_force');
       expect(error.message).toBe('British Transport Police has no neighbourhoods.');
       expect(h.upstream.calls.some((c) => c.path.startsWith('/btp'))).toBe(false);
@@ -732,54 +774,108 @@ describe('ukcrime_find_neighbourhood', () => {
   });
 
   describe('events', () => {
-    it('lists at most 10 events, the earliest first, with events_total giving the full count', async () => {
+    const titles = (n: number) =>
+      Array.from({ length: n }, (_, i) => `Event ${String(i + 1).padStart(2, '0')}`);
+
+    it('returns all 26 published events in start order, with events_total 26, on both surfaces', async () => {
       routes();
-      h.upstream.route('GET', `${P}/events`, jsonOk(manyEvents(12)));
+      h.upstream.route('GET', `${P}/events`, jsonOk(manyEvents(26)));
       const result = await call({ ...BY_ID });
       const out = data(result);
-      expect(out.events).toHaveLength(10);
-      expect(out.events?.map((e) => e.title)).toEqual(
-        Array.from({ length: 10 }, (_, i) => `Event ${String(i + 1).padStart(2, '0')}`),
+      expect(out.events?.map((e) => e.title)).toEqual(titles(26));
+      expect(out.events?.map((e) => e.start)).toEqual(
+        Array.from({ length: 26 }, (_, i) => `2026-09-${String(i + 1).padStart(2, '0')}T18:00:00`),
       );
-      expect(out.events_total).toBe(12);
-      expect(text(result)).toContain('### Upcoming events (10 of 12)');
+      expect(out.events_total).toBe(26);
+      const rendered = text(result);
+      expect(rendered).toContain('### Upcoming events (26)\n\n');
+      expect(rendered).not.toMatch(/Upcoming events \(\d+ of \d+\)/);
+      const listed = rendered.split('\n').filter((line) => line.startsWith('- **Event '));
+      expect(listed).toEqual(
+        titles(26).map(
+          (title, i) =>
+            `- **${title}** · meeting · starts 2026-09-${String(i + 1).padStart(2, '0')}T18:00:00 · ends 2026-09-${String(i + 1).padStart(2, '0')}T19:00:00 · Example Hall`,
+        ),
+      );
     });
 
-    it.each<[number, number]>([
-      [0, 0],
-      [1, 1],
-      [10, 10],
-      [11, 10],
-    ])('with %i events shows %i and counts them all', async (n, shown) => {
-      routes();
-      h.upstream.route('GET', `${P}/events`, jsonOk(manyEvents(n)));
-      const out = data(await call({ ...BY_ID, include: ['events'] }));
-      expect(out.events).toHaveLength(shown);
-      expect(out.events_total).toBe(n);
-    });
+    it.each([0, 1, 10, 11, 26, 200])(
+      'with %i events returns every one, and events_total equals the count',
+      async (n) => {
+        routes();
+        h.upstream.route('GET', `${P}/events`, jsonOk(manyEvents(n)));
+        const result = await call({ ...BY_ID, include: ['events'] });
+        const out = data(result);
+        expect(out.events).toHaveLength(n);
+        expect(out.events_total).toBe(n);
+        expect(text(result)).toContain(`### Upcoming events (${n})`);
+      },
+    );
 
-    it('sorts undated events after dated ones before the cap, so the cap never drops a dated event for an undated one', async () => {
+    it('sorts undated events after every dated one, keeping their upstream order', async () => {
       routes();
       const undated = Array.from({ length: 5 }, (_, i) => ({
         title: `Undated ${i}`,
         start_date: null,
       }));
-      h.upstream.route('GET', `${P}/events`, jsonOk([...undated, ...manyEvents(7)]));
-      const out = data(await call({ ...BY_ID, include: ['events'] }));
-      expect(out.events?.slice(0, 7).every((e) => e.title.startsWith('Event'))).toBe(true);
-      expect(out.events?.slice(7).map((e) => e.title)).toEqual([
+      h.upstream.route(
+        'GET',
+        `${P}/events`,
+        jsonOk([undated[0], ...manyEvents(7), ...undated.slice(1)]),
+      );
+      const result = await call({ ...BY_ID, include: ['events'] });
+      const out = data(result);
+      expect(out.events?.map((e) => e.title)).toEqual([
+        ...titles(7),
         'Undated 0',
         'Undated 1',
         'Undated 2',
+        'Undated 3',
+        'Undated 4',
       ]);
       expect(out.events_total).toBe(12);
+      const rendered = text(result);
+      expect(rendered).toContain('### Upcoming events (12)');
+      expect(rendered.indexOf('- **Event 07**')).toBeLessThan(rendered.indexOf('- **Undated 0**'));
+      expect(rendered.indexOf('- **Undated 3**')).toBeLessThan(rendered.indexOf('- **Undated 4**'));
     });
 
     it('renders the empty list as none published', async () => {
       routes();
       h.upstream.route('GET', `${P}/events`, jsonOk([]));
       const result = await call({ ...BY_ID, include: ['events'] });
-      expect(text(result)).toContain('### Upcoming events (0 of 0)\n\n_None published._');
+      const out = data(result);
+      expect(out.events).toEqual([]);
+      expect(out.events_total).toBe(0);
+      expect(text(result)).toContain('### Upcoming events (0)\n\n_None published._');
+    });
+
+    it('include: loads only events with ["events"], and neither events nor events_total without it', async () => {
+      routes();
+      h.upstream.route('GET', `${P}/events`, jsonOk(manyEvents(26)));
+      const only = await call({ ...BY_ID, include: ['events'] });
+      const onlyOut = data(only);
+      expect(onlyOut.events).toHaveLength(26);
+      expect(onlyOut.events_total).toBe(26);
+      for (const key of ['priorities', 'team', 'boundary'])
+        expect(onlyOut, key).not.toHaveProperty(key);
+      expect(text(only)).toContain('### Upcoming events (26)');
+      const without = await call({ ...BY_ID, include: ['priorities', 'team', 'boundary'] });
+      const withoutOut = data(without);
+      expect(withoutOut).not.toHaveProperty('events');
+      expect(withoutOut).not.toHaveProperty('events_total');
+      expect(text(without)).not.toContain('### Upcoming events');
+      expect(h.upstream.count(`${P}/events`)).toBe(1);
+    });
+
+    it('describes events as every published event, with no count cap', () => {
+      const advertised =
+        JSON.stringify(findNeighbourhoodTool.output.shape.events.description) +
+        JSON.stringify(findNeighbourhoodTool.output.shape.events_total.description);
+      expect(advertised).not.toMatch(/up to 10|more than shown/i);
+      expect(findNeighbourhoodTool.output.shape.events_total.description).toBe(
+        'Upcoming events published; every one is in events.',
+      );
     });
   });
 
@@ -1027,7 +1123,7 @@ describe('ukcrime_find_neighbourhood', () => {
       for (const member of out.team ?? []) {
         expect(rendered).toContain(`- ${member.rank} — ${member.name}`);
       }
-      expect(rendered).toContain('### Upcoming events (3 of 3)');
+      expect(rendered).toContain('### Upcoming events (3)');
       for (const event of out.events ?? []) {
         expect(rendered).toContain(
           `**${event.title}** · ${event.type} · starts ${event.start} · ends ${event.end} · ${event.address}`,

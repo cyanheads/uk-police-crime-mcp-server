@@ -23,9 +23,10 @@ import {
   outsideCoverageNote,
   pageOf,
   pagingNote,
+  partialLocateNote,
   polygonField,
   runAreaQuery,
-  searchedForceId,
+  unknownNeighbourhoodMessage,
 } from '@/mcp-server/tools/area-search.js';
 import { cell, inline, quote } from '@/mcp-server/tools/format-helpers.js';
 import {
@@ -43,7 +44,7 @@ import {
   limitInput,
 } from '@/mcp-server/tools/shared-schemas.js';
 import { outcomesQuery, parseArea } from '@/services/police-api/area.js';
-import { coverageNotes } from '@/services/police-api/known-gaps.js';
+import { coverageNotes, publishesNothing } from '@/services/police-api/known-gaps.js';
 import { getPoliceApiService } from '@/services/police-api/police-api-service.js';
 import { compareText } from '@/services/police-api/records.js';
 import type { OutcomeRecord } from '@/services/police-api/types.js';
@@ -169,7 +170,7 @@ export const searchOutcomesTool = tool('ukcrime_search_outcomes', {
     polygon: polygonField,
     location_id: locationIdField,
     force: forceInput.describe(
-      "For area 'neighbourhood', with neighbourhood_id: a force id such as 'leicestershire' (ukcrime_list_reference topic 'forces' lists them); trimmed, lower-cased, spaces and underscores become hyphens.",
+      "For area 'neighbourhood', with neighbourhood_id: a force id such as 'leicestershire', or its name such as 'Leicestershire Police' (ukcrime_list_reference topic 'forces' lists both); case-insensitive, spaces, underscores and hyphens match each other, '&' matches 'and', and a trailing 'Police', 'Police Service' or 'Constabulary' is optional.",
     ),
     neighbourhood_id: neighbourhoodIdField,
     month: monthField,
@@ -219,7 +220,7 @@ export const searchOutcomesTool = tool('ukcrime_search_outcomes', {
     {
       reason: 'unknown_force',
       code: JsonRpcErrorCode.ValidationError,
-      when: "force is not in the force list, or is 'btp' (British Transport Police has no neighbourhoods)",
+      when: "force matches no listed force id or name, or more than one, or is 'btp' (British Transport Police has no neighbourhoods)",
       recovery:
         "Call ukcrime_list_reference with topic 'forces' for valid force ids such as 'leicestershire'.",
       severity: 'notice',
@@ -257,6 +258,33 @@ export const searchOutcomesTool = tool('ukcrime_search_outcomes', {
       retryable: true,
       thrownBy: 'service',
     },
+    {
+      reason: 'rate_limited',
+      code: JsonRpcErrorCode.RateLimited,
+      when: 'data.police.uk is rate-limiting this server for longer than this call can wait',
+      recovery:
+        'data.police.uk is rate-limiting this server; wait a few seconds, then call this tool again.',
+      retryable: true,
+      thrownBy: 'service',
+    },
+    {
+      reason: 'pacer_shed',
+      code: JsonRpcErrorCode.RateLimited,
+      when: 'too many requests to data.police.uk are already queued in this server',
+      recovery:
+        "This server's queue for data.police.uk is busy; wait a few seconds, then call this tool again.",
+      retryable: true,
+      thrownBy: 'service',
+    },
+    {
+      reason: 'retry_deadline_exceeded',
+      code: JsonRpcErrorCode.Timeout,
+      when: 'data.police.uk did not answer within the time one call allows',
+      recovery:
+        'data.police.uk did not answer within the time one call allows; call this tool again in a minute.',
+      retryable: true,
+      thrownBy: 'service',
+    },
   ],
 
   async handler(input, ctx) {
@@ -269,14 +297,13 @@ export const searchOutcomesTool = tool('ukcrime_search_outcomes', {
     });
     const parsed = parseArea(input.area, input);
     if (!parsed.ok) throw ctx.fail('invalid_area', parsed.message);
-    const { spec } = parsed;
 
     const service = getPoliceApiService();
     const budget = service.openBudget();
     const [resolution, category, named] = await Promise.all([
       service.resolveMonth(input.month, ctx, budget),
       input.category === undefined ? undefined : service.findCategory(input.category, ctx, budget),
-      checkNamedForce(spec, service, ctx, budget),
+      checkNamedForce(parsed.spec, service, ctx, budget),
     ]);
     if (resolution.kind === 'not_published') {
       throw ctx.fail('month_not_published', monthFailureMessage(resolution));
@@ -288,6 +315,7 @@ export const searchOutcomesTool = tool('ukcrime_search_outcomes', {
       throw ctx.fail('unknown_category', `No crime category matches '${input.category}'.`);
     }
     if (named.kind === 'unknown') throw ctx.fail('unknown_force', named.message);
+    const { spec } = named;
     const { month } = resolution;
 
     const run = await runAreaQuery(
@@ -301,15 +329,13 @@ export const searchOutcomesTool = tool('ukcrime_search_outcomes', {
           ...(spec.kind === 'point' ? { tooLargeHint: POINT_TOO_LARGE } : {}),
         };
       },
+      (outcome) => outcome.crime.location?.map_point,
       service,
       ctx,
       budget,
     );
     if (run.kind === 'unknown_neighbourhood') {
-      throw ctx.fail(
-        'unknown_neighbourhood',
-        `Force '${input.force}' has no neighbourhood '${input.neighbourhood_id}'; ids are case-sensitive.`,
-      );
+      throw ctx.fail('unknown_neighbourhood', unknownNeighbourhoodMessage(run));
     }
     if (run.kind === 'unknown_location') {
       throw ctx.fail(
@@ -329,15 +355,21 @@ export const searchOutcomesTool = tool('ukcrime_search_outcomes', {
 
     const notes: string[] = [];
     if (resolution.defaulted) notes.push(monthDefaultedNote(month));
-    const forceId = searchedForceId(named, run.located);
-    if (forceId) notes.push(...coverageNotes(forceId, ['outcomes']));
+    for (const force of run.forces) notes.push(...coverageNotes(force, ['outcomes']));
+    const partial = partialLocateNote(run);
+    if (partial) notes.push(partial);
+    // Where every force the area falls in publishes no outcomes, its coverage note alone explains a zero.
+    const zeroExplained = !partial && publishesNothing(run.forces, 'outcomes');
     if (total === 0) {
-      notes.push(
-        outsideCoverageNote(spec, run.located) ??
-          (filter && run.records.length > 0
-            ? `Only outcomes for ${inline(filter.name)} crimes were counted; omit category for all.`
-            : `No outcomes recorded here in ${month}; try another month or a wider area.`),
-      );
+      const outside = outsideCoverageNote(spec, run);
+      if (outside) notes.push(outside);
+      else if (filter && run.records.length > 0) {
+        notes.push(
+          `Only outcomes for ${inline(filter.name)} crimes were counted; omit category for all.`,
+        );
+      } else if (!zeroExplained) {
+        notes.push(`No outcomes recorded here in ${month}; try another month or a wider area.`);
+      }
     }
     const paging = pagingNote('outcomes', input.offset, page, total);
     if (paging) notes.push(paging);
@@ -345,7 +377,7 @@ export const searchOutcomesTool = tool('ukcrime_search_outcomes', {
 
     return {
       month,
-      area: areaEcho(spec, run.target, run.located),
+      area: areaEcho(spec, run),
       ...(filter ? { category: { slug: filter.slug, name: filter.name } } : {}),
       total,
       unfiltered_total: run.records.length,

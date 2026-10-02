@@ -1,8 +1,8 @@
 /**
  * @fileoverview The output vocabulary the search tools share: the location,
- * area-echo and breakdown schemas, the enrichment block and its trailer labels,
- * and the markdown renderers — which must keep upstream text inert (CR/LF, pipes,
- * brackets, bidi and line-separator characters).
+ * area-echo, breakdown and by-month schemas, the enrichment block and its
+ * trailer labels, and the markdown renderers — which must keep upstream text
+ * inert (CR/LF, pipes, brackets, bidi and line-separator characters).
  * @module tests/tools/search-output.test
  */
 
@@ -11,9 +11,12 @@ import { describe, expect, it } from 'vitest';
 import {
   AreaEchoSchema,
   breakdownSchema,
+  byMonthSchema,
   LocationSchema,
+  MonthTotalSchema,
   renderArea,
   renderBreakdown,
+  renderByMonth,
   renderLocation,
   SEARCH_ENRICHMENT,
   SEARCH_ENRICHMENT_TRAILER,
@@ -79,6 +82,7 @@ describe('AreaEchoSchema', () => {
       neighbourhood_id: 'NX01',
       located_force: 'leicestershire',
       located_neighbourhood: 'NX01',
+      located_forces: ['cheshire', 'greater-manchester'],
     };
     expect(AreaEchoSchema.parse(echo)).toEqual(echo);
   });
@@ -166,6 +170,29 @@ describe('renderArea', () => {
       '**Area:** force_unplaced · force btp',
     );
     expect(renderArea({ type: 'force', force: 'btp' })).toBe('**Area:** force · force btp');
+  });
+
+  it('lists a polygon’s located forces in the order given, each kept inert, and a location’s located force and neighbourhood', () => {
+    expect(
+      renderArea({
+        type: 'polygon',
+        vertex_count: 4,
+        located_forces: ['cheshire', 'greater-manchester'],
+      }),
+    ).toBe('**Area:** polygon · 4 polygon vertices · located forces cheshire, greater-manchester');
+    expect(
+      renderArea({ type: 'polygon', vertex_count: 3, located_forces: ['a\r\nb [x](y)'] }),
+    ).toBe('**Area:** polygon · 3 polygon vertices · located forces a b \\[x\\](y)');
+    expect(
+      renderArea({
+        type: 'location',
+        location_id: '1000001',
+        located_force: 'leicestershire',
+        located_neighbourhood: 'NX01',
+      }),
+    ).toBe(
+      '**Area:** location · location_id 1000001 · located force leicestershire · located neighbourhood NX01',
+    );
   });
 
   it('renders 0 coordinates (a defined value), not as absent', () => {
@@ -266,5 +293,53 @@ describe('renderBreakdown', () => {
   it('does not let a trailing backslash cancel the pipe escape', () => {
     const [row] = renderBreakdown('t', [{ value: 'a\\', count: 1 }]).slice(-1);
     expect(row).toBe('| a\\\\ | 1 |');
+  });
+});
+
+describe('byMonthSchema and renderByMonth', () => {
+  it('is an optional array of month totals that a tool can extend', () => {
+    const plain = byMonthSchema(MonthTotalSchema, 'Per month.');
+    expect(plain.parse(undefined)).toBeUndefined();
+    expect(plain.parse([{ month: '2026-07', total: 3 }])).toEqual([{ month: '2026-07', total: 3 }]);
+    const flagged = byMonthSchema(
+      MonthTotalSchema.extend({ force_published: z.boolean().optional().describe('Published.') }),
+      'Per month.',
+    );
+    expect(flagged.parse([{ month: '2026-07', total: 0, force_published: false }])).toEqual([
+      { month: '2026-07', total: 0, force_published: false },
+    ]);
+  });
+
+  it('renders a two-column table oldest first, with no published column when no row carries the flag', () => {
+    expect(
+      renderByMonth('Crimes', [
+        { month: '2026-06', total: 2 },
+        { month: '2026-07', total: 0 },
+      ]),
+    ).toEqual([
+      '',
+      '### By month',
+      '',
+      '| Month | Crimes |',
+      '|:--|--:|',
+      '| 2026-06 | 2 |',
+      '| 2026-07 | 0 |',
+    ]);
+  });
+
+  it('adds a published column when any row carries the flag, with unknown where one does not', () => {
+    expect(
+      renderByMonth('Stops', [
+        { month: '2026-06', total: 4, force_published: true },
+        { month: '2026-07', total: 0, force_published: false },
+        { month: '2026-08', total: 1 },
+      ]).slice(3),
+    ).toEqual([
+      '| Month | Stops | Every force found for the area published |',
+      '|:--|--:|:--|',
+      '| 2026-06 | 4 | yes |',
+      '| 2026-07 | 0 | no |',
+      '| 2026-08 | 1 | unknown |',
+    ]);
   });
 });

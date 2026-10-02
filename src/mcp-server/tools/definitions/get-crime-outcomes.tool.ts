@@ -11,7 +11,7 @@ import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { inline, quote } from '@/mcp-server/tools/format-helpers.js';
 import { LocationSchema, renderLocation } from '@/mcp-server/tools/search-output.js';
 import { ATTRIBUTION } from '@/mcp-server/tools/shared-schemas.js';
-import { getPoliceApiService } from '@/services/police-api/police-api-service.js';
+import { callAgainAfter, getPoliceApiService } from '@/services/police-api/police-api-service.js';
 import type { CrimeHistory, Lookup } from '@/services/police-api/types.js';
 
 const MAX_IDS = 25;
@@ -62,20 +62,24 @@ const UNAVAILABLE_BY_REASON: ReadonlyMap<string, string> = new Map([
 
 /**
  * Why one lookup failed, written from the error's code, `reason`, HTTP status
- * and `retryAfter` alone, so no upstream status text or internal message
- * reaches `failed[].error`.
+ * and `retryAfter` alone (the wait in the service's wording, either header
+ * form), so no upstream status text or internal message reaches
+ * `failed[].error`. `at` is when the lookup failed: the wait is named as of
+ * then, the instant the service's own hint names it from.
  */
-function lookupFailure(error: unknown): string {
+function lookupFailure(error: unknown, at: number): string {
   if (!(error instanceof McpError)) return 'The lookup failed unexpectedly.';
   const { reason, retryAfter, status } = error.data ?? {};
   const http = typeof status === 'number' ? ` (HTTP ${status})` : '';
-  const wait = Number(retryAfter);
-  const retry = /^\d+$/.test(String(retryAfter)) && wait > 0 ? ` Retry after ${wait} s.` : '';
   switch (error.code) {
-    case JsonRpcErrorCode.RateLimited:
-      return reason === 'pacer_shed'
-        ? `Too many requests to data.police.uk were queued.${retry}`
-        : `data.police.uk rate-limited the lookup.${retry}`;
+    case JsonRpcErrorCode.RateLimited: {
+      const what =
+        reason === 'pacer_shed'
+          ? 'Too many requests to data.police.uk were queued'
+          : 'data.police.uk rate-limited the lookup';
+      const wait = callAgainAfter(retryAfter, at);
+      return wait ? `${what}; ${wait}.` : `${what}.`;
+    }
     case JsonRpcErrorCode.Timeout:
       return reason === 'call_budget_exhausted'
         ? 'The call ran out of time before this lookup was sent.'
@@ -92,16 +96,16 @@ function lookupFailure(error: unknown): string {
 
 /**
  * The call's failure when every lookup failed: the first failure's code,
- * `reason`, `retryable` and `retryAfter`, with {@link lookupFailure}'s text as
- * the message. The original rides as `cause`, which only the server's own log
- * reads.
+ * `reason`, `retryable`, `retryAfter` and server-written recovery hint, with
+ * {@link lookupFailure}'s text as the message. The original rides as `cause`,
+ * which only the server's own log reads.
  */
-function allFailed(error: unknown): McpError {
-  const message = lookupFailure(error);
+function allFailed(error: unknown, at: number): McpError {
+  const message = lookupFailure(error, at);
   if (!(error instanceof McpError)) {
     return new McpError(JsonRpcErrorCode.InternalError, message, undefined, { cause: error });
   }
-  const { reason, retryable, retryAfter } = error.data ?? {};
+  const { reason, retryable, retryAfter, recovery } = error.data ?? {};
   return new McpError(
     error.code,
     message,
@@ -109,6 +113,7 @@ function allFailed(error: unknown): McpError {
       ...(reason === undefined ? {} : { reason }),
       ...(retryable === undefined ? {} : { retryable }),
       ...(retryAfter === undefined ? {} : { retryAfter }),
+      ...(recovery === undefined ? {} : { recovery }),
     },
     { cause: error },
   );
@@ -168,10 +173,10 @@ const OutputSchema = z.object({
 
 type CrimeOutcomesOutput = z.infer<typeof OutputSchema>;
 
-/** One id's lookup: its answer, or why it failed. */
+/** One id's lookup: its answer, or why it failed and when, the instant every text about it names its wait from. */
 type LookupResult =
   | { readonly id: string; readonly lookup: Lookup<CrimeHistory> }
-  | { readonly id: string; readonly error: unknown };
+  | { readonly at: number; readonly error: unknown; readonly id: string };
 
 export const getCrimeOutcomesTool = tool('ukcrime_get_crime_outcomes', {
   title: 'Get UK Crime Outcome Histories',
@@ -209,6 +214,43 @@ export const getCrimeOutcomesTool = tool('ukcrime_get_crime_outcomes', {
     attribution: { label: 'Attribution' },
     data_note: { label: 'Data note' },
   },
+  errors: [
+    {
+      reason: 'rate_limited',
+      code: JsonRpcErrorCode.RateLimited,
+      when: 'data.police.uk is rate-limiting this server for longer than this call can wait',
+      recovery:
+        'data.police.uk is rate-limiting this server; wait a few seconds, then call this tool again.',
+      retryable: true,
+      thrownBy: 'service',
+    },
+    {
+      reason: 'pacer_shed',
+      code: JsonRpcErrorCode.RateLimited,
+      when: 'too many requests to data.police.uk are already queued in this server',
+      recovery:
+        "This server's queue for data.police.uk is busy; wait a few seconds, then call this tool again.",
+      retryable: true,
+      thrownBy: 'service',
+    },
+    {
+      reason: 'upstream_unavailable',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      when: 'data.police.uk is not answering',
+      recovery: 'data.police.uk is not answering right now; call this tool again in a few minutes.',
+      retryable: true,
+      thrownBy: 'service',
+    },
+    {
+      reason: 'retry_deadline_exceeded',
+      code: JsonRpcErrorCode.Timeout,
+      when: 'data.police.uk did not answer within the time one call allows',
+      recovery:
+        'data.police.uk did not answer within the time one call allows; call this tool again in a minute.',
+      retryable: true,
+      thrownBy: 'service',
+    },
+  ],
 
   async handler(input, ctx) {
     ctx.enrich({ attribution: ATTRIBUTION, data_note: DATA_NOTE });
@@ -222,7 +264,7 @@ export const getCrimeOutcomesTool = tool('ukcrime_get_crime_outcomes', {
       for (const [index, id] of pending) {
         results[index] = await service.getCrimeHistory(id, ctx, budget).then(
           (lookup) => ({ id, lookup }),
-          (error: unknown) => ({ id, error }),
+          (error: unknown) => ({ id, error, at: Date.now() }),
         );
       }
     };
@@ -232,11 +274,11 @@ export const getCrimeOutcomesTool = tool('ukcrime_get_crime_outcomes', {
     const crimes: CrimeOutcomesOutput['crimes'] = [];
     const notFound: string[] = [];
     const failed: CrimeOutcomesOutput['failed'] = [];
-    const failures: unknown[] = [];
+    const failures: { readonly at: number; readonly error: unknown }[] = [];
     for (const result of results) {
       if ('error' in result) {
-        failures.push(result.error);
-        failed.push({ persistent_id: result.id, error: lookupFailure(result.error) });
+        failures.push(result);
+        failed.push({ persistent_id: result.id, error: lookupFailure(result.error, result.at) });
       } else if (result.lookup.kind === 'miss') {
         notFound.push(result.id);
       } else {
@@ -254,7 +296,8 @@ export const getCrimeOutcomesTool = tool('ukcrime_get_crime_outcomes', {
       }
     }
     // Every lookup failing reads as an outage, not as an empty success.
-    if (failures.length === results.length) throw allFailed(failures[0]);
+    const [first] = failures;
+    if (first && failures.length === results.length) throw allFailed(first.error, first.at);
     if (failures.length > 0) {
       ctx.log.warning('Some crime outcome lookups failed upstream', {
         failed: failures.length,

@@ -296,19 +296,20 @@ describe('resolveTarget', () => {
     ]);
   });
 
-  it('returns a miss for an unknown or wrongly cased id (404), and caches the miss', async () => {
+  it('names the force and id of an unknown or wrongly cased neighbourhood (404), and caches the miss', async () => {
     h.upstream.route('GET', '/leicestershire/nx01/boundary', plainNotFound);
     const spec = {
       kind: 'neighbourhood',
       force: 'leicestershire',
       neighbourhoodId: 'nx01',
     } as const;
-    expect(await settle(resolveTarget(spec, h.service, h.ctx, h.budget()))).toEqual({
-      kind: 'miss',
-    });
-    expect(await settle(resolveTarget(spec, h.service, h.ctx, h.budget()))).toEqual({
-      kind: 'miss',
-    });
+    const miss = {
+      kind: 'unknown_neighbourhood',
+      force: 'leicestershire',
+      neighbourhoodId: 'nx01',
+    };
+    expect(await settle(resolveTarget(spec, h.service, h.ctx, h.budget()))).toEqual(miss);
+    expect(await settle(resolveTarget(spec, h.service, h.ctx, h.budget()))).toEqual(miss);
     expect(h.upstream.count('/leicestershire/nx01/boundary')).toBe(1);
   });
 

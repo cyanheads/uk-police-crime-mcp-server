@@ -33,6 +33,7 @@ import {
   plainNotFound,
   type Responder,
   rateLimited,
+  rateLimitedUntil,
   sparseCrimeRecord,
   status,
   wireLocation,
@@ -454,7 +455,12 @@ describe('ukcrime_get_crime_outcomes', () => {
       [
         'a 429 with Retry-After',
         rateLimited('2'),
-        'data.police.uk rate-limited the lookup. Retry after 2 s.',
+        'data.police.uk rate-limited the lookup; call again in 2 s.',
+      ],
+      [
+        'a 429 with an HTTP-date Retry-After',
+        rateLimitedUntil(60_000),
+        'data.police.uk rate-limited the lookup; call again in 60 s.',
       ],
       ['a 429 without Retry-After', rateLimited(), 'data.police.uk rate-limited the lookup.'],
       ['an HTML 200 body', htmlOk, 'data.police.uk answered with a body that is not JSON.'],
@@ -480,6 +486,18 @@ describe('ukcrime_get_crime_outcomes', () => {
       },
     );
 
+    it('names an HTTP-date wait in failed[] as of its failure, though another id answered later', async () => {
+      h.upstream.route('GET', pathOf(A), rateLimitedUntil(60_000));
+      h.upstream.route('GET', pathOf(B), delayed(20_000, jsonOk(crimeHistoryBody(B))));
+      const result = await settle(
+        runToolContract(getCrimeOutcomesTool, { persistent_ids: [A, B] }),
+        200,
+      );
+      const message = 'data.police.uk rate-limited the lookup; call again in 60 s.';
+      expect(data(result).failed).toEqual([{ persistent_id: A, error: message }]);
+      expect(text(result)).toContain(message);
+    });
+
     it('does not put the upstream response body in the failed error of a wrong-shape body', async () => {
       found(A);
       h.upstream.route('GET', pathOf(B), jsonOk({ secret: 'upstream-only-text' }));
@@ -501,7 +519,7 @@ describe('ukcrime_get_crime_outcomes', () => {
     it('logs one warning, not an error, for a partial failure', async () => {
       found(A);
       h.upstream.route('GET', pathOf(B), status(500));
-      const ctx = createMockContext();
+      const ctx = createMockContext({ errors: getCrimeOutcomesTool.errors });
       const input = getCrimeOutcomesTool.input.parse({ persistent_ids: [A, B] });
       await settle(Promise.resolve(getCrimeOutcomesTool.handler(input, ctx)));
       const log = ctx.log as MockContextLogger;
@@ -527,8 +545,13 @@ describe('ukcrime_get_crime_outcomes', () => {
         'a 429 with Retry-After',
         rateLimited('60'),
         JsonRpcErrorCode.RateLimited,
-        { retryAfter: '60' },
-        'data.police.uk rate-limited the lookup. Retry after 60 s.',
+        {
+          reason: 'rate_limited',
+          retryable: true,
+          retryAfter: '60',
+          recovery: { hint: 'data.police.uk is rate-limiting this server; call again in 60 s.' },
+        },
+        'data.police.uk rate-limited the lookup; call again in 60 s.',
       ],
       [
         'a body of the wrong shape',
@@ -568,6 +591,29 @@ describe('ukcrime_get_crime_outcomes', () => {
         expect(error.code).toBe(code);
       },
     );
+
+    it('names an HTTP-date wait as of its failure in both the message and the hint, though another id ran to the deadline', async () => {
+      h.upstream.route('GET', pathOf(A), rateLimitedUntil(60_000));
+      h.upstream.route('GET', pathOf(B), hang);
+      const result = await settle(
+        runToolContract(getCrimeOutcomesTool, { persistent_ids: [A, B] }),
+        200,
+      );
+      const error = errorOf(result);
+      expect(error.code).toBe(JsonRpcErrorCode.RateLimited);
+      expect(error.message).toBe('data.police.uk rate-limited the lookup; call again in 60 s.');
+      expect(error.data).toMatchObject({
+        reason: 'rate_limited',
+        retryable: true,
+        recovery: { hint: 'data.police.uk is rate-limiting this server; call again in 60 s.' },
+      });
+      expect(text(result)).toContain(
+        'Error: data.police.uk rate-limited the lookup; call again in 60 s.',
+      );
+      expect(text(result)).toContain(
+        'Recovery: data.police.uk is rate-limiting this server; call again in 60 s.',
+      );
+    });
 
     it('fails with the error of the first id in input order, not the first to fail', async () => {
       h.upstream.route('GET', pathOf(A), delayed(3000, rateLimited('60')));

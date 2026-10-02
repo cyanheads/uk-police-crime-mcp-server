@@ -14,7 +14,6 @@ import { normalizeCrimes, normalizeOutcomes, normalizeStops } from './records.js
 import type {
   CallBudget,
   CrimeRecord,
-  Lookup,
   MapPoint,
   OutcomeRecord,
   Place,
@@ -64,7 +63,7 @@ const AREA_FIELDS: readonly AreaField[] = [
   'neighbourhood_id',
 ];
 
-/** A checked area input. Force ids are not yet checked against the force list. */
+/** A checked area input. Its force is the input as given until the force check puts the matched id in its place. */
 export type AreaSpec =
   | { readonly kind: 'point'; readonly lat: number; readonly lng: number }
   | { readonly kind: 'polygon'; readonly vertices: readonly MapPoint[] }
@@ -74,6 +73,13 @@ export type AreaSpec =
 
 /** What an area query is sent for: a place, or a whole force (unplaced crimes, force stops). */
 export type AreaTarget = Place | { readonly kind: 'force'; readonly force: string };
+
+/** A neighbourhood id the force does not have: its boundary answered 404 (an unknown or wrongly cased id). */
+export interface UnknownNeighbourhood {
+  readonly force: string;
+  readonly kind: 'unknown_neighbourhood';
+  readonly neighbourhoodId: string;
+}
 
 const listFields = (fields: readonly string[]): string =>
   fields.length <= 1 ? (fields[0] ?? '') : `${fields.slice(0, -1).join(', ')} and ${fields.at(-1)}`;
@@ -139,20 +145,24 @@ export function parseArea(
 
 /**
  * The target an area query is sent for. A neighbourhood becomes its boundary
- * polygon (404 → miss: an unknown or wrongly cased id); a force arm becomes the
- * force; every other arm maps directly.
+ * polygon (404 → {@link UnknownNeighbourhood}); a force arm becomes the force;
+ * every other arm maps directly.
  */
 export async function resolveTarget(
   spec: AreaSpec,
   service: PoliceApiService,
   ctx: Context,
   budget: CallBudget,
-): Promise<Lookup<AreaTarget>> {
+): Promise<{ readonly kind: 'found'; readonly value: AreaTarget } | UnknownNeighbourhood> {
   switch (spec.kind) {
     case 'neighbourhood': {
       const boundary = await service.getBoundary(spec.force, spec.neighbourhoodId, ctx, budget);
       return boundary.kind === 'miss'
-        ? boundary
+        ? {
+            kind: 'unknown_neighbourhood',
+            force: spec.force,
+            neighbourhoodId: spec.neighbourhoodId,
+          }
         : { kind: 'found', value: { kind: 'polygon', vertices: boundary.value } };
     }
     case 'force_unplaced':
@@ -232,11 +242,22 @@ export function crimesQuery(
   };
 }
 
-/** Police outcomes recorded in one month at a place (`/outcomes-at-location`, every arm). */
+const OUTCOMES_DEADLINE_HINT =
+  "data.police.uk is still preparing this month's outcomes, which can take longer than one call allows when the month has not been asked for recently; run the same search again shortly and it usually succeeds.";
+
+/**
+ * Police outcomes recorded in one month at a place (`/outcomes-at-location`,
+ * every arm). The route answered months it had not served recently in 30–53 s
+ * (2026-10-01) and keeps preparing one after a client gives up, so each attempt
+ * runs to the retry deadline rather than being cut at 30 s and resent, and a
+ * failure at the deadline says a repeat search shortly usually succeeds.
+ */
 export function outcomesQuery(place: Place, month: string): AreaQuery<OutcomeRecord> {
   const path = '/outcomes-at-location';
   return {
     ...placeRequest(place, { area: path, location: path }, month, true),
+    attemptToDeadline: true,
+    deadlineHint: OUTCOMES_DEADLINE_HINT,
     normalize: (json) => normalizeOutcomes(parseUpstream(RawOutcomes, json, path)),
   };
 }

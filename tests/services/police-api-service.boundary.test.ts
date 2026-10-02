@@ -5,14 +5,21 @@
  * 503 area value and its separately paced health probe, the 429 cooldown, the
  * per-call budget, attempt timeouts, cancellation, and the pacer with its three
  * area slots. Upstream is a route-table fake; retry backoff, pacer waits and
- * timeouts run on a virtual clock.
+ * timeouts run on a virtual clock. The last block checks that harness: the
+ * clock holds while a digest runs, and a hanging request survives a garbage
+ * collection.
  * @module tests/services/police-api-service.boundary.test
  */
 
+import { setFlagsFromString } from 'node:v8';
+import { runInNewContext } from 'node:vm';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import type { MockContextLogger } from '@cyanheads/mcp-ts-core/testing';
 import { describe, expect, it, vi } from 'vitest';
+import { outcomesQuery } from '@/services/police-api/area.js';
+import type { Place } from '@/services/police-api/types.js';
 import {
+  API_BASE,
   boundaryBody,
   categoriesBody,
   chunkedOk,
@@ -28,19 +35,37 @@ import {
   locateBody,
   networkError,
   overloaded,
+  perMonth,
   plainNotFound,
   type Responder,
   rateLimited,
+  rateLimitedUntil,
   sequence,
   sizedJsonBody,
   status,
   streamOfBytes,
   textOk,
 } from '../fixtures/police-api-upstream.js';
-import { settle, useServiceHarness } from '../fixtures/service-harness.js';
+import { settle, untilReal, useServiceHarness } from '../fixtures/service-harness.js';
 
 const MIB = 1024 * 1024;
 const BODY_CEILING = 32 * MIB;
+
+const RATE_LIMITED_HINT = (seconds: number) =>
+  `data.police.uk is rate-limiting this server; call again in ${seconds} s.`;
+const UNAVAILABLE_HINT = (seconds: number) =>
+  `data.police.uk is not answering right now; call again in ${seconds} s.`;
+const SHED_HINT = (seconds: number) =>
+  `This server's queue for data.police.uk is busy; call again in ${seconds} s.`;
+const OUTCOMES_DEADLINE_HINT =
+  "data.police.uk is still preparing this month's outcomes, which can take longer than one call allows when the month has not been asked for recently; run the same search again shortly and it usually succeeds.";
+
+/**
+ * Real time allowed a test whose virtual wait runs past 30 s: `settle` covers it
+ * in hundreds of 50 ms steps, which a loaded machine can stretch past Vitest's
+ * 5 s default. The virtual-time assertions are what such a test proves.
+ */
+const LONG_VIRTUAL_WAIT_TIMEOUT_MS = 60_000;
 
 /** Resolves with the error a call rejects with; fails the test when it resolves. */
 async function failure(promise: Promise<unknown>): Promise<McpError> {
@@ -142,8 +167,8 @@ describe('PoliceApiService request boundary', () => {
       h.upstream.route('GET', '/crimes-street/all-crime', emptyArrayOk);
       const first = await settle(area());
       const second = await settle(area());
-      expect(first).toEqual({ kind: 'found', value: [] });
-      expect(second).toEqual({ kind: 'found', value: [] });
+      expect(first).toEqual({ kind: 'found', value: [], weight: 2.5 });
+      expect(second).toEqual({ kind: 'found', value: [], weight: 2.5 });
       expect(h.upstream.count('/crimes-street/all-crime')).toBe(1);
     });
 
@@ -417,6 +442,14 @@ describe('PoliceApiService request boundary', () => {
       expect(h.upstream.count('/crime-last-updated')).toBe(0);
     });
 
+    it('names the month refused in the over-ceiling message', async () => {
+      h.upstream.route('GET', '/crimes-street/all-crime', textOk(sizedJsonBody(BODY_CEILING + 1)));
+      const error = await failure(area({ date: '2026-05' }));
+      expect(error.message).toBe(
+        'data.police.uk answered this area for 2026-05 with more than the 32 MiB this server reads for one area, so the area is too large to answer.',
+      );
+    });
+
     it('carries tooLargeHint as the recovery hint on an over-ceiling area body', async () => {
       const { respond } = streamOfBytes(64 * MIB, MIB);
       h.upstream.route('GET', '/crimes-street/all-crime', respond);
@@ -477,6 +510,14 @@ describe('PoliceApiService request boundary', () => {
       expect(error.data).not.toHaveProperty('recovery');
       expect(h.upstream.count('/crimes-street/all-crime')).toBe(1);
       expect(h.upstream.count('/crime-last-updated')).toBe(1);
+    });
+
+    it('names the month refused when the probe answers 200', async () => {
+      h.upstream.route('GET', '/crimes-street/all-crime', overloaded);
+      const error = await failure(area({ date: '2026-05' }));
+      expect(error.message).toBe(
+        'data.police.uk refused this area for 2026-05 as too large to answer, though the service itself is up.',
+      );
     });
 
     it('carries tooLargeHint as the recovery hint when given', async () => {
@@ -580,7 +621,7 @@ describe('PoliceApiService request boundary', () => {
       h.upstream.route('GET', '/crimes-street/all-crime', sequence(overloaded, jsonOk([1, 2])));
       await failure(area());
       const second = await settle(area());
-      expect(second).toEqual({ kind: 'found', value: [1, 2] });
+      expect(second).toEqual({ kind: 'found', value: [1, 2], weight: 6.25 });
       expect(h.upstream.count('/crimes-street/all-crime')).toBe(2);
     });
 
@@ -649,21 +690,211 @@ describe('PoliceApiService request boundary', () => {
       expect((c?.at ?? 0) - (b?.at ?? 0)).toBeLessThanOrEqual(2500);
     });
 
-    it('fails fast, untouched, when Retry-After is longer than the 10 s retry cap', async () => {
+    it('fails at once after one request as rate_limited when Retry-After outlasts the 45 s service-call deadline, naming the wait', async () => {
       h.upstream.route('GET', '/forces', rateLimited('60'));
       const start = Date.now();
       const error = await failure(h.service.getForces(h.ctx, h.budget()));
       expect(error.code).toBe(JsonRpcErrorCode.RateLimited);
-      expect(error.data).toMatchObject({ retryAfter: '60', status: 429 });
+      expect(error.message).toBe('data.police.uk returned HTTP 429.');
+      expect(error.data).toMatchObject({
+        reason: 'rate_limited',
+        retryable: true,
+        retryAfter: '60',
+        status: 429,
+        recovery: { hint: RATE_LIMITED_HINT(60) },
+      });
       expect(h.upstream.count('/forces')).toBe(1);
       expect(Date.now() - start).toBeLessThan(1000);
     });
 
-    it('waits a Retry-After of exactly 10 s rather than failing fast', async () => {
-      h.upstream.route('GET', '/forces', sequence(rateLimited('10'), jsonOk(forcesBody())));
-      await settle(h.service.getForces(h.ctx, h.budget()));
+    it('waits out a Retry-After of 30 s that fits the deadline, outside the pacer, and succeeds', async () => {
+      h.upstream.route('GET', '/forces', sequence(rateLimited('30'), jsonOk(forcesBody())));
+      const forces = await settle(h.service.getForces(h.ctx, h.budget()));
+      expect(forces).toEqual(forcesBody());
       const [first, second] = h.upstream.callsTo('/forces');
-      expect((second?.at ?? 0) - (first?.at ?? 0)).toBeGreaterThanOrEqual(10_000);
+      expect((second?.at ?? 0) - (first?.at ?? 0)).toBeGreaterThanOrEqual(30_000);
+      expect((second?.at ?? 0) - (first?.at ?? 0)).toBeLessThan(30_500);
+    });
+
+    it('waits a Retry-After of 34 s, which leaves the next attempt 11 s of the 45 s deadline', async () => {
+      h.upstream.route('GET', '/forces', sequence(rateLimited('34'), jsonOk(forcesBody())));
+      const forces = await settle(h.service.getForces(h.ctx, h.budget()), 200);
+      expect(forces).toEqual(forcesBody());
+      const [first, second] = h.upstream.callsTo('/forces');
+      expect((second?.at ?? 0) - (first?.at ?? 0)).toBeGreaterThanOrEqual(34_000);
+      expect((second?.at ?? 0) - (first?.at ?? 0)).toBeLessThan(34_500);
+    });
+
+    it.each(['36', '44'])(
+      'fails a Retry-After of %s s at once, after one request, as rate_limited naming it: the next attempt would have under 10 s',
+      async (seconds) => {
+        h.upstream.route('GET', '/forces', sequence(rateLimited(seconds), jsonOk(forcesBody())));
+        const start = Date.now();
+        const error = await failure(h.service.getForces(h.ctx, h.budget()));
+        expect(error.code).toBe(JsonRpcErrorCode.RateLimited);
+        expect(error.data).toMatchObject({
+          reason: 'rate_limited',
+          retryable: true,
+          retryAfter: seconds,
+          recovery: { hint: RATE_LIMITED_HINT(Number(seconds)) },
+        });
+        expect(h.upstream.count('/forces')).toBe(1);
+        expect(Date.now() - start).toBeLessThan(1000);
+      },
+    );
+
+    it('fails a 44 s Retry-After at once rather than waiting into a 5 s answer the deadline would cut off', async () => {
+      h.upstream.route(
+        'GET',
+        '/forces',
+        sequence(rateLimited('44'), delayed(5_000, jsonOk(forcesBody()))),
+      );
+      const start = Date.now();
+      const error = await failure(h.service.getForces(h.ctx, h.budget()));
+      expect(error.code).toBe(JsonRpcErrorCode.RateLimited);
+      expect(error.data).toMatchObject({
+        reason: 'rate_limited',
+        retryable: true,
+        recovery: { hint: RATE_LIMITED_HINT(44) },
+      });
+      expect(h.upstream.count('/forces')).toBe(1);
+      expect(Date.now() - start).toBeLessThan(1000);
+    });
+
+    it('fails the callers the closed cooldown gate held to 15 s at once, while the first waits out its 30 s and succeeds', async () => {
+      const path = '/crimes-street/all-crime';
+      let served = 0;
+      h.upstream.route('GET', path, (request) => {
+        served += 1;
+        return served <= 3 ? rateLimited('30')(request) : emptyArrayOk(request);
+      });
+      const point = (i: number) =>
+        h.service
+          .queryArea(
+            {
+              path,
+              params: { date: '2026-08', lat: String(52.6 + i / 100), lng: '-1.13' },
+              normalize: (json) => json as readonly number[],
+            },
+            h.ctx,
+            h.budget(),
+          )
+          .then(
+            (value) => ({ at: Date.now(), value }),
+            (error: unknown) => ({ at: Date.now(), error }),
+          );
+      const start = Date.now();
+      const first = point(0);
+      // The first 429 closes the cooldown gate before the other two callers queue.
+      await untilReal(() => h.upstream.count(path) === 1);
+      const [a, b, c] = await settle(Promise.all([first, point(1), point(2)]), 200);
+      expect(a).toMatchObject({ value: { kind: 'found', value: [] } });
+      expect(a.at - start).toBeGreaterThanOrEqual(30_000);
+      for (const held of [b, c]) {
+        expect(held).toHaveProperty('error');
+        const error = (held as { error: McpError }).error;
+        expect(error.code).toBe(JsonRpcErrorCode.RateLimited);
+        expect(error.data).toMatchObject({
+          reason: 'rate_limited',
+          retryable: true,
+          recovery: { hint: RATE_LIMITED_HINT(30) },
+        });
+        expect(held.at - start).toBeGreaterThanOrEqual(15_000);
+        expect(held.at - start).toBeLessThan(16_000);
+      }
+      // One request each from the held callers; the first sent two.
+      const sent = h.upstream.callsTo(path).map((call) => call.at - start);
+      expect(sent).toHaveLength(4);
+      expect(sent.filter((at) => at >= 15_000 && at < 16_000)).toHaveLength(2);
+    });
+
+    it('measures the wait against what remains of the call budget, not the full 45 s', async () => {
+      h.upstream.route('GET', '/forces', rateLimited('25'));
+      const error = await failure(h.service.getForces(h.ctx, { deadlineAt: Date.now() + 20_000 }));
+      expect(error.data).toMatchObject({
+        reason: 'rate_limited',
+        recovery: { hint: RATE_LIMITED_HINT(25) },
+      });
+      expect(h.upstream.count('/forces')).toBe(1);
+    });
+
+    it('fails after the second attempt as rate_limited, naming the wait, when every attempt asks for 30 s', async () => {
+      h.upstream.route('GET', '/forces', rateLimited('30'));
+      const error = await failure(h.service.getForces(h.ctx, h.budget()));
+      expect(error.code).toBe(JsonRpcErrorCode.RateLimited);
+      expect(error.data).toMatchObject({
+        reason: 'rate_limited',
+        retryable: true,
+        retryAfter: '30',
+        status: 429,
+        recovery: { hint: RATE_LIMITED_HINT(30) },
+      });
+      const [first, second] = h.upstream.callsTo('/forces');
+      expect(h.upstream.count('/forces')).toBe(2);
+      expect((second?.at ?? 0) - (first?.at ?? 0)).toBeGreaterThanOrEqual(30_000);
+    });
+
+    it('waits out an HTTP-date Retry-After the same way', async () => {
+      h.upstream.route('GET', '/forces', sequence(rateLimitedUntil(30_000), jsonOk(forcesBody())));
+      const forces = await settle(h.service.getForces(h.ctx, h.budget()));
+      expect(forces).toEqual(forcesBody());
+      const [first, second] = h.upstream.callsTo('/forces');
+      // An HTTP-date has whole-second resolution.
+      expect((second?.at ?? 0) - (first?.at ?? 0)).toBeGreaterThanOrEqual(29_000);
+      expect((second?.at ?? 0) - (first?.at ?? 0)).toBeLessThan(30_500);
+    });
+
+    it('names an HTTP-date Retry-After in seconds when it does not fit, keeping the raw header', async () => {
+      h.upstream.route('GET', '/forces', rateLimitedUntil(30_000));
+      const error = await failure(h.service.getForces(h.ctx, h.budget()));
+      expect(error.data).toMatchObject({
+        reason: 'rate_limited',
+        retryable: true,
+        retryAfter: expect.stringMatching(/ GMT$/),
+        recovery: { hint: RATE_LIMITED_HINT(30) },
+      });
+      expect(h.upstream.count('/forces')).toBe(2);
+    });
+
+    it('rounds a wait up to whole seconds: an HTTP-date 59.7 s ahead is named as 60 s, not 59', async () => {
+      // The 429 arrives 300 ms into a second; the header's date has whole-second resolution.
+      vi.setSystemTime(Date.now() + 300);
+      h.upstream.route('GET', '/forces', rateLimitedUntil(60_000));
+      const error = await failure(h.service.getForces(h.ctx, h.budget()));
+      expect(error.data).toMatchObject({
+        reason: 'rate_limited',
+        recovery: { hint: RATE_LIMITED_HINT(60) },
+      });
+      expect(h.upstream.count('/forces')).toBe(1);
+    });
+
+    it('fails rate_limited with no hint of its own once attempts run out on a 429 with no Retry-After', async () => {
+      h.upstream.route('GET', '/forces', rateLimited());
+      const error = await failure(h.service.getForces(h.ctx, h.budget()));
+      expect(error.data).toMatchObject({
+        reason: 'rate_limited',
+        retryable: true,
+        retryAttempts: 3,
+      });
+      expect(error.data).not.toHaveProperty('retryAfter');
+      expect(error.data).not.toHaveProperty('recovery');
+      expect(h.upstream.count('/forces')).toBe(3);
+    });
+
+    it('ends at once with the abort reason, sending nothing more, when the call is cancelled during the wait', async () => {
+      const controller = new AbortController();
+      const reason = new Error('client went away');
+      h.upstream.route('GET', '/forces', sequence(rateLimited('30'), jsonOk(forcesBody())));
+      const start = Date.now();
+      const outcome = h.service.getForces(h.ctxWith(controller.signal), h.budget()).then(
+        () => 'resolved',
+        (error: unknown) => error,
+      );
+      await vi.advanceTimersByTimeAsync(10_000);
+      controller.abort(reason);
+      expect(await settle(outcome)).toBe(reason);
+      expect(Date.now() - start).toBeLessThan(10_500);
+      expect(h.upstream.count('/forces')).toBe(1);
     });
 
     it('holds every queued request behind the shared cooldown gate, not just the retry', async () => {
@@ -677,10 +908,234 @@ describe('PoliceApiService request boundary', () => {
       expect((other?.at ?? 0) - (first?.at ?? 0)).toBeGreaterThanOrEqual(5000);
     });
 
-    it('shows the 429 header on the error when attempts run out within the cap', async () => {
+    it('shows the 429 header on the error when attempts run out on short waits', async () => {
       h.upstream.route('GET', '/forces', rateLimited('2'));
       const error = await failure(h.service.getForces(h.ctx, h.budget()));
-      expect(error.data).toMatchObject({ retryAfter: '2', retryAttempts: 3 });
+      expect(error.data).toMatchObject({
+        retryAfter: '2',
+        retryAttempts: 3,
+        reason: 'rate_limited',
+        recovery: { hint: RATE_LIMITED_HINT(2) },
+      });
+    });
+  });
+
+  describe('failures that outlast the retries', () => {
+    it.each([500, 502, 503, 504])(
+      'fails a persistent %i as upstream_unavailable, retryable, after three attempts, keeping the status',
+      async (code) => {
+        h.upstream.route('GET', '/forces', status(code));
+        const error = await failure(h.service.getForces(h.ctx, h.budget()));
+        expect(error.code).toBe(JsonRpcErrorCode.ServiceUnavailable);
+        expect(error.message).toBe(
+          `data.police.uk returned HTTP ${code}. (failed after 3 attempts)`,
+        );
+        expect(error.data).toMatchObject({
+          reason: 'upstream_unavailable',
+          retryable: true,
+          status: code,
+          retryAttempts: 3,
+        });
+        // The calling tool's declared recovery fills the hint.
+        expect(error.data).not.toHaveProperty('recovery');
+        expect(h.upstream.count('/forces')).toBe(3);
+      },
+    );
+
+    it(
+      'names the wait of a 503 whose Retry-After it waited out once and could not again: upstream_unavailable after two requests',
+      async () => {
+        h.upstream.route('GET', '/forces', status(503, '30'));
+        const error = await failure(h.service.getForces(h.ctx, h.budget()));
+        expect(error.code).toBe(JsonRpcErrorCode.ServiceUnavailable);
+        expect(error.data).toMatchObject({
+          reason: 'upstream_unavailable',
+          retryable: true,
+          status: 503,
+          retryAfter: '30',
+          recovery: { hint: UNAVAILABLE_HINT(30) },
+        });
+        const [first, second] = h.upstream.callsTo('/forces');
+        expect(h.upstream.count('/forces')).toBe(2);
+        expect((second?.at ?? 0) - (first?.at ?? 0)).toBeGreaterThanOrEqual(30_000);
+      },
+      LONG_VIRTUAL_WAIT_TIMEOUT_MS,
+    );
+
+    it.each([502, 504])(
+      'names the short Retry-After of a %i still failing after three attempts',
+      async (code) => {
+        h.upstream.route('GET', '/forces', status(code, '2'));
+        const error = await failure(h.service.getForces(h.ctx, h.budget()));
+        expect(error.code).toBe(JsonRpcErrorCode.ServiceUnavailable);
+        expect(error.data).toMatchObject({
+          reason: 'upstream_unavailable',
+          retryable: true,
+          retryAttempts: 3,
+          retryAfter: '2',
+          recovery: { hint: UNAVAILABLE_HINT(2) },
+        });
+        expect(h.upstream.count('/forces')).toBe(3);
+      },
+    );
+
+    it('fails a network failure that outlasts the retries as upstream_unavailable, keeping its cause', async () => {
+      h.upstream.route('GET', '/forces', networkError);
+      const error = await failure(h.service.getForces(h.ctx, h.budget()));
+      expect(error.code).toBe(JsonRpcErrorCode.ServiceUnavailable);
+      expect(error.message).toBe('Could not reach data.police.uk. (failed after 3 attempts)');
+      expect(error.data).toMatchObject({ reason: 'upstream_unavailable', retryable: true });
+      expect((error.cause as McpError).cause).toBeInstanceOf(TypeError);
+      expect(h.upstream.count('/forces')).toBe(3);
+    });
+
+    it(
+      'fails a request that never answers at the 45 s deadline as retry_deadline_exceeded, retryable',
+      async () => {
+        h.upstream.route('GET', '/forces', hang);
+        const start = Date.now();
+        const error = await failure(h.service.getForces(h.ctx, h.budget()));
+        expect(error.code).toBe(JsonRpcErrorCode.Timeout);
+        expect(error.data).toMatchObject({
+          reason: 'retry_deadline_exceeded',
+          retryable: true,
+          retryAttempts: 2,
+        });
+        expect(error.data).not.toHaveProperty('recovery');
+        expect(Date.now() - start).toBeLessThanOrEqual(45_500);
+        expect(h.upstream.count('/forces')).toBe(2);
+      },
+      LONG_VIRTUAL_WAIT_TIMEOUT_MS,
+    );
+
+    it.each<[string, Responder]>([
+      ['a 502', status(502)],
+      ['a network failure', networkError],
+    ])(
+      'fails retries ending in an attempt timeout before the deadline as retry_deadline_exceeded, retryable: two of %s, then a hang',
+      async (_name, fast) => {
+        h.upstream.route('GET', '/forces', sequence(fast, fast, hang));
+        const start = Date.now();
+        const error = await failure(h.service.getForces(h.ctx, h.budget()));
+        // The third attempt times out at 30 s, about 33 s in: the loop is out of retries, not deadline.
+        expect(Date.now() - start).toBeGreaterThanOrEqual(30_000);
+        expect(Date.now() - start).toBeLessThan(45_000);
+        expect(error.code).toBe(JsonRpcErrorCode.Timeout);
+        expect(error.message).toBe(
+          'data.police.uk did not answer within 30 s. (failed after 3 attempts)',
+        );
+        expect(error.data).toMatchObject({
+          reason: 'retry_deadline_exceeded',
+          retryable: true,
+          retryAttempts: 3,
+        });
+        // The calling tool's declared recovery fills the hint.
+        expect(error.data).not.toHaveProperty('recovery');
+        expect(h.upstream.count('/forces')).toBe(3);
+      },
+      LONG_VIRTUAL_WAIT_TIMEOUT_MS,
+    );
+
+    it('leaves a 501 untyped and unretried: the route is not implemented, not down', async () => {
+      h.upstream.route('GET', '/forces', status(501));
+      const error = await failure(h.service.getForces(h.ctx, h.budget()));
+      expect(error.code).toBe(JsonRpcErrorCode.ServiceUnavailable);
+      expect(error.data).toMatchObject({ retryable: false, status: 501 });
+      expect(error.data).not.toHaveProperty('reason');
+      expect(h.upstream.count('/forces')).toBe(1);
+    });
+
+    it('keeps the reason of a failure that already has one: unreadable_response stays itself', async () => {
+      h.upstream.route('GET', '/forces', htmlOk);
+      const error = await failure(h.service.getForces(h.ctx, h.budget()));
+      expect(error.data).toMatchObject({ reason: 'unreadable_response' });
+      expect(error.data).not.toHaveProperty('retryable');
+    });
+  });
+
+  describe('the outcomes route', () => {
+    const POLYGON: Place = {
+      kind: 'polygon',
+      vertices: [
+        { latitude: 52.63, longitude: -1.14 },
+        { latitude: 52.63, longitude: -1.12 },
+        { latitude: 52.64, longitude: -1.12 },
+      ],
+    };
+    const POINT_PLACE: Place = { kind: 'point', lat: 52.63, lng: -1.13 };
+    const outcomes = (place: Place = POINT_PLACE, budget = h.budget(), ctx = h.ctx) =>
+      h.service.queryArea(outcomesQuery(place, '2026-08'), ctx, budget);
+
+    it.each<[string, 'GET' | 'POST', Place]>([
+      ['a point', 'GET', POINT_PLACE],
+      ['a polygon', 'POST', POLYGON],
+      ['a location', 'GET', { kind: 'location', locationId: '1000001' }],
+    ])(
+      'lets one request for %s run past 30 s: an answer at 35 s succeeds with one request',
+      async (_name, method, place) => {
+        h.upstream.route(method, '/outcomes-at-location', delayed(35_000, emptyArrayOk));
+        const result = await settle(outcomes(place));
+        expect(result).toEqual({ kind: 'found', value: [], weight: 2.5 });
+        expect(h.upstream.count('/outcomes-at-location')).toBe(1);
+      },
+    );
+
+    it('fails one request that never answers at the 45 s deadline, retryable, with the outcomes hint', async () => {
+      h.upstream.route('GET', '/outcomes-at-location', hang);
+      const start = Date.now();
+      const error = await failure(outcomes());
+      expect(error.code).toBe(JsonRpcErrorCode.Timeout);
+      expect(error.data).toMatchObject({
+        reason: 'retry_deadline_exceeded',
+        retryable: true,
+        retryAttempts: 1,
+        recovery: { hint: OUTCOMES_DEADLINE_HINT },
+      });
+      expect(Date.now() - start).toBeGreaterThanOrEqual(45_000);
+      expect(Date.now() - start).toBeLessThanOrEqual(45_500);
+      expect(h.upstream.count('/outcomes-at-location')).toBe(1);
+    });
+
+    it('bounds the one request by what remains of the call budget', async () => {
+      h.upstream.route('GET', '/outcomes-at-location', hang);
+      const start = Date.now();
+      const error = await failure(outcomes(POINT_PLACE, { deadlineAt: Date.now() + 10_000 }));
+      expect(error.data).toMatchObject({
+        reason: 'retry_deadline_exceeded',
+        recovery: { hint: OUTCOMES_DEADLINE_HINT },
+      });
+      expect(Date.now() - start).toBeLessThanOrEqual(10_100);
+      expect(h.upstream.count('/outcomes-at-location')).toBe(1);
+    });
+
+    it('still retries a fast failure inside the same deadline', async () => {
+      h.upstream.route('GET', '/outcomes-at-location', sequence(status(502), emptyArrayOk));
+      const result = await settle(outcomes());
+      expect(result).toEqual({ kind: 'found', value: [], weight: 2.5 });
+      expect(h.upstream.count('/outcomes-at-location')).toBe(2);
+    });
+
+    it('ends at once with the abort reason when the call is cancelled during the long request', async () => {
+      const controller = new AbortController();
+      const reason = new Error('client went away');
+      h.upstream.route('GET', '/outcomes-at-location', hang);
+      const outcome = outcomes(POINT_PLACE, h.budget(), h.ctxWith(controller.signal)).then(
+        () => 'resolved',
+        (error: unknown) => error,
+      );
+      await settle(new Promise<void>((resolve) => setTimeout(resolve, 32_000)));
+      controller.abort(reason);
+      expect(await settle(outcome)).toBe(reason);
+      expect(h.upstream.count('/outcomes-at-location')).toBe(1);
+    });
+
+    it('keeps the 30 s attempt timeout and its retry on the other area routes', async () => {
+      h.upstream.route('GET', '/crimes-street/all-crime', sequence(hang, emptyArrayOk));
+      const result = await settle(area());
+      expect(result).toEqual({ kind: 'found', value: [], weight: 2.5 });
+      const [first, second] = h.upstream.callsTo('/crimes-street/all-crime');
+      expect((second?.at ?? 0) - (first?.at ?? 0)).toBeGreaterThanOrEqual(30_000);
+      expect((second?.at ?? 0) - (first?.at ?? 0)).toBeLessThan(31_500);
     });
   });
 
@@ -703,6 +1158,23 @@ describe('PoliceApiService request boundary', () => {
 
     it('opens a 50 s budget on the service clock', () => {
       expect(h.service.openBudget()).toEqual({ deadlineAt: Date.now() + 50_000 });
+    });
+
+    it('narrows a budget to end within the given time, never past the budget it narrows', async () => {
+      const budget = h.budget();
+      expect(h.service.narrowBudget(budget, 10_000)).toEqual({ deadlineAt: Date.now() + 10_000 });
+      await vi.advanceTimersByTimeAsync(45_000);
+      expect(h.service.narrowBudget(budget, 10_000)).toEqual(budget);
+    });
+
+    it('ends a request that never answers at a narrowed budget, not the 45 s service deadline', async () => {
+      h.upstream.route('GET', '/forces', hang);
+      const start = Date.now();
+      const error = await failure(
+        h.service.getForces(h.ctx, h.service.narrowBudget(h.budget(), 10_000)),
+      );
+      expect(error.code).toBe(JsonRpcErrorCode.Timeout);
+      expect(Date.now() - start).toBeLessThanOrEqual(10_500);
     });
 
     it('refuses a call whose budget is already spent, without sending anything', async () => {
@@ -753,6 +1225,19 @@ describe('PoliceApiService request boundary', () => {
       await vi.advanceTimersByTimeAsync(1000);
       controller.abort(reason);
       expect(await settle(outcome)).toBe(reason);
+      expect(h.upstream.count('/forces')).toBe(1);
+    });
+
+    it('leaves a failure untyped, never retryable, when the call was cancelled as the upstream answered', async () => {
+      const controller = new AbortController();
+      h.upstream.route('GET', '/forces', () => {
+        controller.abort(new Error('client went away'));
+        return new Response(null, { status: 502 });
+      });
+      const error = await failure(h.service.getForces(h.ctxWith(controller.signal), h.budget()));
+      expect(error.message).toBe('data.police.uk returned HTTP 502.');
+      expect(error.data).not.toHaveProperty('reason');
+      expect(error.data).not.toHaveProperty('retryable');
       expect(h.upstream.count('/forces')).toBe(1);
     });
 
@@ -857,6 +1342,60 @@ describe('PoliceApiService request boundary', () => {
       expect(shed[0]?.at).toBeLessThan(21_000);
     });
 
+    it('gives a shed retryable, a hint naming its wait, and a message that names no internal pacer', async () => {
+      heldAreaRoute(25_000);
+      const outcomes = await settle(Promise.all(fourAreas(Date.now())));
+      const error = outcomes.find((outcome) => 'error' in outcome)?.error as McpError;
+      expect(error.code).toBe(JsonRpcErrorCode.RateLimited);
+      expect(error.message).toBe(
+        'Too many requests to data.police.uk are queued in this server, so this one was not sent.',
+      );
+      const retryAfter = (error.data as { retryAfter: number }).retryAfter;
+      expect(retryAfter).toBeGreaterThan(0);
+      expect(error.data).toMatchObject({
+        reason: 'pacer_shed',
+        retryable: true,
+        recovery: { hint: SHED_HINT(retryAfter) },
+      });
+      expect(JSON.stringify({ message: error.message, data: error.data })).not.toContain(
+        'data-police-uk',
+      );
+    });
+
+    it('holds no area slot while it waits out a Retry-After: other area queries go out when the cooldown gate opens', async () => {
+      const first = sequence(rateLimited('30'), emptyArrayOk);
+      const held = { now: 0, peak: 0 };
+      const others = delayed(5000, emptyArrayOk);
+      h.upstream.route('GET', '/crimes-street/all-crime', async (request) => {
+        if (new URL(request.url).searchParams.get('n') === 'A') return first(request);
+        held.now += 1;
+        held.peak = Math.max(held.peak, held.now);
+        try {
+          return await others(request);
+        } finally {
+          held.now -= 1;
+        }
+      });
+      const start = Date.now();
+      const limited = area({ date: '2026-08', n: 'A' });
+      await until(() => h.upstream.count('/crimes-street/all-crime') >= 1);
+      const rest = ['B', 'C', 'D'].map((n) => area({ date: '2026-08', n }));
+      const [result] = await settle(Promise.all([limited, Promise.all(rest)]));
+      expect(result).toEqual({ kind: 'found', value: [], weight: 2.5 });
+      const sent = h.upstream.callsTo('/crimes-street/all-crime').map((call) => call.at - start);
+      const [aFirst, ...later] = sent;
+      expect(aFirst).toBeLessThan(1000);
+      // B, C and D wait only for the cooldown gate (15 s cap), all three in flight at once.
+      const others3 = later.slice(0, 3);
+      for (const at of others3) {
+        expect(at).toBeGreaterThanOrEqual(15_000);
+        expect(at).toBeLessThan(16_000);
+      }
+      expect(held.peak).toBe(3);
+      // A's own retry goes out after the full 30 s it was asked to wait.
+      expect(later[3]).toBeGreaterThanOrEqual(30_000);
+    });
+
     it('counts the wait for an area slot against the same 20 s as the wait for a pacer slot', async () => {
       const held = heldAreaRoute(15_000);
       const ids = ['A', 'B', 'C', 'D'];
@@ -879,6 +1418,124 @@ describe('PoliceApiService request boundary', () => {
       expect(shed[0]?.error).toMatchObject({ data: { reason: 'pacer_shed' } });
       expect(shed[0]?.at).toBeGreaterThanOrEqual(20_000);
       expect(shed[0]?.at).toBeLessThan(21_000);
+    });
+  });
+
+  describe('a range month: one full attempt, checked when it is sent', () => {
+    const ROUTE = '/crimes-street/all-crime';
+    const july = {
+      path: ROUTE,
+      params: { date: '2026-07' },
+      normalize: (json: unknown) => json as readonly number[],
+    };
+    /** The July requests sent, as ms after `start`. */
+    const julySent = (start: number) =>
+      h.upstream
+        .callsTo(ROUTE)
+        .filter((call) => call.query.get('date') === '2026-07')
+        .map((call) => call.at - start);
+    /** Runs `run` once `ms` of virtual time has passed. */
+    const inMs = <T>(ms: number, run: () => Promise<T>) =>
+      new Promise<void>((resolve) => setTimeout(resolve, ms)).then(run);
+    /** Three August queries holding every area slot for 25 s; July answers at once. */
+    const holdAreaSlots = () => {
+      h.upstream.route(
+        'GET',
+        ROUTE,
+        perMonth({ '2026-07': emptyArrayOk }, delayed(25_000, emptyArrayOk)),
+      );
+      return Promise.all(['A', 'B', 'C'].map((n) => area({ date: '2026-08', n })));
+    };
+
+    it('answers late, never sent, a month that waited for an area slot until less than one full attempt was left', async () => {
+      const start = Date.now();
+      const budget = h.budget();
+      const [answer] = await settle(
+        Promise.all([
+          inMs(6000, () => h.service.queryRangeMonth(july, h.ctx, budget)),
+          holdAreaSlots(),
+        ]),
+      );
+      expect(answer).toEqual({ kind: 'late' });
+      expect(julySent(start)).toEqual([]);
+    });
+
+    it('sends a single-month query after the same wait, whatever is left', async () => {
+      const start = Date.now();
+      const budget = h.budget();
+      const [answer] = await settle(
+        Promise.all([inMs(6000, () => h.service.queryArea(july, h.ctx, budget)), holdAreaSlots()]),
+      );
+      expect(answer).toEqual({ kind: 'found', value: [], weight: 2.5 });
+      expect(julySent(start)).toEqual([25_000]);
+    });
+
+    it('checks only the first attempt: a retry goes out with less than one full attempt left', async () => {
+      h.upstream.route('GET', ROUTE, sequence(delayed(8000, rateLimited('1')), emptyArrayOk));
+      const start = Date.now();
+      const budget = h.budget();
+      const answer = await settle(
+        inMs(15_000, () => h.service.queryRangeMonth(july, h.ctx, budget)),
+      );
+      expect(answer).toEqual({ kind: 'found', value: [], weight: 2.5 });
+      const [first, retry] = julySent(start);
+      expect(first).toBe(15_000);
+      expect(retry).toBeGreaterThan(20_000);
+    });
+
+    it('serves a cached month whatever is left', async () => {
+      h.upstream.route('GET', ROUTE, emptyArrayOk);
+      await settle(h.service.queryRangeMonth(july, h.ctx, h.budget()));
+      const short = h.service.narrowBudget(h.budget(), 10_000);
+      expect(await settle(h.service.queryRangeMonth(july, h.ctx, short))).toEqual({
+        kind: 'found',
+        value: [],
+        weight: 2.5,
+      });
+      expect(julySent(0)).toHaveLength(1);
+    });
+  });
+
+  describe('the test harness', () => {
+    it('holds the virtual clock while a digest started during a settle runs', async () => {
+      const start = Date.now();
+      let doneAt: number | undefined;
+      const work = (async () => {
+        // Starts after settle has checked for digests once, as a handler reaching its cache key does.
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        await crypto.subtle.digest('SHA-256', new Uint8Array(16 * MIB));
+        doneAt = Date.now();
+      })();
+      await settle(work);
+      expect(doneAt).toBe(start);
+    });
+
+    /** V8's collector, reached without `--expose-gc` on the command line. */
+    const collectGarbage = (() => {
+      setFlagsFromString('--expose-gc');
+      return runInNewContext('gc') as () => void;
+    })();
+
+    it('still ends a hanging request when its caller aborts after a garbage collection, as a real fetch in flight does', async () => {
+      h.upstream.route('GET', '/forces', hang);
+      const controller = new AbortController();
+      let outcome: unknown = 'pending';
+      void h.upstream.fetch(`${API_BASE}/forces`, { signal: controller.signal }).then(
+        () => {
+          outcome = 'answered';
+        },
+        (error: unknown) => {
+          outcome = error;
+        },
+      );
+      for (let round = 0; round < 3; round++) {
+        collectGarbage();
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      }
+      const reason = new Error('attempt timed out');
+      controller.abort(reason);
+      await untilReal(() => outcome !== 'pending', 1000);
+      expect(outcome).toBe(reason);
     });
   });
 });

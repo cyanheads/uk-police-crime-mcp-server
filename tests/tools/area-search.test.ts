@@ -1,16 +1,21 @@
 /**
  * @fileoverview The plumbing the area search tools share: the named-force check
- * (`btp` only on the force arms), month-failure wording, `runAreaQuery`'s miss
- * values and its point-arm locate that degrades quietly unless the call was
- * cancelled, breakdowns, paging, the area echo, and the notice fragments.
+ * (by id or display name, handing on the matched id; `btp` only on the force
+ * arms), month-failure wording, `runAreaQuery`'s miss values and the forces it
+ * finds — a point and a polygon's sample points located beside the query (at
+ * most two sample lookups outstanding, so the query keeps a pacer slot), a
+ * location's map point after it, every lookup given up after 10 s and each
+ * degrading quietly unless the call was cancelled — breakdowns, paging, the
+ * area echo, and the notice fragments (the partial-locate one included).
  * @module tests/tools/area-search.test
  */
 
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import type { MockContextLogger } from '@cyanheads/mcp-ts-core/testing';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   AREA_INPUT_ALIASES,
+  type AreaForces,
   areaEcho,
   breakdown,
   checkNamedForce,
@@ -20,8 +25,9 @@ import {
   outsideCoverageNote,
   pageOf,
   pagingNote,
+  partialLocateNote,
   runAreaQuery,
-  searchedForceId,
+  samplePoints,
 } from '@/mcp-server/tools/area-search.js';
 import {
   type AreaSpec,
@@ -29,17 +35,29 @@ import {
   outcomesQuery,
   stopsQuery,
 } from '@/services/police-api/area.js';
-import type { LocatedNeighbourhood, Lookup, Place } from '@/services/police-api/types.js';
+import type {
+  CrimeRecord,
+  LocatedNeighbourhood,
+  Lookup,
+  MapPoint,
+  OutcomeRecord,
+  Place,
+  StopRecord,
+} from '@/services/police-api/types.js';
 import {
   boundaryBody,
+  crimeRecord,
   crimesBody,
   hang,
   jsonOk,
   locateBody,
+  locateBy,
   outcomesBody,
   overloaded,
   plainNotFound,
   type Responder,
+  STRADDLE_RING,
+  STRADDLE_SAMPLES,
   status,
   stopsBody,
 } from '../fixtures/police-api-upstream.js';
@@ -59,6 +77,22 @@ const FOUND: Lookup<LocatedNeighbourhood> = {
   value: { force: 'leicestershire', neighbourhood: 'NX01' },
 };
 const MISS: Lookup<LocatedNeighbourhood> = { kind: 'miss' };
+
+/** Each search's map-point reader, as the tools pass it. */
+const crimePoint = (crime: CrimeRecord): MapPoint | undefined => crime.location?.map_point;
+const outcomePoint = (outcome: OutcomeRecord): MapPoint | undefined =>
+  outcome.crime.location?.map_point;
+const stopPoint = (stop: StopRecord): MapPoint | undefined => stop.location?.map_point;
+
+/** A polygon spec from `[lat, lng]` pairs. */
+const polygonOf = (...points: Array<readonly [number, number]>): AreaSpec => ({
+  kind: 'polygon',
+  vertices: points.map(([latitude, longitude]) => ({ latitude, longitude })),
+});
+const STRADDLE: AreaSpec = polygonOf(...STRADDLE_RING.map(({ lat, lng }) => [lat, lng] as const));
+
+/** What a run that located nothing carries, for the echo and note helpers. */
+const NONE: AreaForces = { forces: [] };
 
 describe('AREA_INPUT_ALIASES', () => {
   it('maps the upstream and common coordinate spellings one to one', () => {
@@ -81,24 +115,54 @@ describe('checkNamedForce', () => {
     ['point', POINT],
     ['polygon', RING],
     ['location', { kind: 'location', locationId: '1000001' }],
-  ])('says none for %s, with no request', async (_name, spec) => {
-    expect(await check(spec)).toEqual({ kind: 'none' });
+  ])('says none for %s, with no request, and keeps the area as it is', async (_name, spec) => {
+    expect(await check(spec)).toEqual({ kind: 'none', spec });
     expect(h.upstream.calls).toHaveLength(0);
   });
+
+  const named = (kind: 'neighbourhood' | 'force_unplaced' | 'force', force: string): AreaSpec =>
+    kind === 'neighbourhood' ? { kind, force, neighbourhoodId: 'NX01' } : { kind, force };
 
   it.each(['neighbourhood', 'force_unplaced', 'force'] as const)(
     '%s resolves a listed force to the force object',
     async (kind) => {
-      const spec: AreaSpec =
-        kind === 'neighbourhood'
-          ? { kind, force: 'leicestershire', neighbourhoodId: 'NX01' }
-          : { kind, force: 'leicestershire' };
-      expect(await check(spec)).toEqual({
+      expect(await check(named(kind, 'leicestershire'))).toEqual({
         kind: 'ok',
         force: { id: 'leicestershire', name: 'Leicestershire Police' },
+        spec: named(kind, 'leicestershire'),
       });
     },
   );
+
+  it.each(['neighbourhood', 'force_unplaced', 'force'] as const)(
+    '%s matches a display name and puts the matched id in the area it hands on',
+    async (kind) => {
+      // The schema folds 'Devon & Cornwall Police' to this before the check.
+      expect(await check(named(kind, 'devon-and-cornwall-police'))).toEqual({
+        kind: 'ok',
+        force: { id: 'devon-and-cornwall', name: 'Devon & Cornwall Police' },
+        spec: named(kind, 'devon-and-cornwall'),
+      });
+    },
+  );
+
+  it.each(['force_unplaced', 'force'] as const)(
+    '%s matches British Transport Police to btp',
+    async (kind) => {
+      expect(await check({ kind, force: 'british-transport-police' })).toEqual({
+        kind: 'ok',
+        force: { id: 'btp', name: 'British Transport Police' },
+        spec: { kind, force: 'btp' },
+      });
+    },
+  );
+
+  it('refuses British Transport Police on the neighbourhood arm with the btp message', async () => {
+    expect(await check(named('neighbourhood', 'british-transport-police'))).toEqual({
+      kind: 'unknown',
+      message: 'British Transport Police has no neighbourhoods.',
+    });
+  });
 
   it.each(['neighbourhood', 'force_unplaced', 'force'] as const)(
     '%s rejects an unknown force by name',
@@ -120,6 +184,7 @@ describe('checkNamedForce', () => {
       expect(await check({ kind, force: 'btp' })).toEqual({
         kind: 'ok',
         force: { id: 'btp', name: 'British Transport Police' },
+        spec: { kind, force: 'btp' },
       });
       expect(h.upstream.count('/forces')).toBe(0);
     },
@@ -132,8 +197,11 @@ describe('checkNamedForce', () => {
     });
   });
 
-  it('is case-sensitive about the force id (the schema lower-cases before it gets here)', async () => {
-    expect((await check({ kind: 'force', force: 'Leicestershire' })).kind).toBe('unknown');
+  it('matches case-insensitively, whether or not the schema folded the value first', async () => {
+    expect(await check({ kind: 'force', force: 'Leicestershire Police' })).toMatchObject({
+      kind: 'ok',
+      spec: { kind: 'force', force: 'leicestershire' },
+    });
   });
 
   it('propagates a force-list failure', async () => {
@@ -172,6 +240,7 @@ describe('runAreaQuery', () => {
     runAreaQuery(
       spec,
       (target) => crimesQuery(target, category, '2026-08'),
+      crimePoint,
       h.service,
       ctx,
       h.budget(),
@@ -202,6 +271,8 @@ describe('runAreaQuery', () => {
       expect(run.records).toHaveLength(7);
       expect(run.target).toBe(POINT);
       expect(run.located).toEqual(FOUND);
+      expect(run.forces).toEqual(['leicestershire']);
+      expect(run).not.toHaveProperty('samples');
       expect(h.upstream.callsTo('/locate-neighbourhood')[0]?.query.get('q')).toBe(
         '52.630000,-1.130000',
       );
@@ -230,6 +301,7 @@ describe('runAreaQuery', () => {
       const run = await crimes(POINT);
       if (run.kind !== 'ok') throw new Error(`got ${run.kind}`);
       expect(run.located).toEqual(MISS);
+      expect(run.forces).toEqual([]);
       expect(run.records).toEqual([]);
     });
 
@@ -239,6 +311,7 @@ describe('runAreaQuery', () => {
       const run = await crimes(POINT);
       if (run.kind !== 'ok') throw new Error(`got ${run.kind}`);
       expect(run).not.toHaveProperty('located');
+      expect(run.forces).toEqual([]);
       expect(run.records).toHaveLength(7);
       const warnings = (h.ctx.log as MockContextLogger).calls.filter(
         (call) => call.level === 'warning',
@@ -270,6 +343,27 @@ describe('runAreaQuery', () => {
       if (run.kind !== 'ok') throw new Error(`got ${run.kind}`);
       expect(run).not.toHaveProperty('located');
       expect(run.records).toHaveLength(7);
+    });
+
+    it('gives up on a hung locate at 10 s, so an answered point search waits no longer', async () => {
+      h.upstream.route('GET', '/crimes-street/all-crime', jsonOk(crimesBody()));
+      h.upstream.route('GET', '/locate-neighbourhood', hang);
+      const start = Date.now();
+      const run = await crimes(POINT);
+      if (run.kind !== 'ok') throw new Error(`got ${run.kind}`);
+      expect(run).not.toHaveProperty('located');
+      expect(run.records).toHaveLength(7);
+      expect(Date.now() - start).toBeLessThanOrEqual(10_500);
+    });
+
+    it('waits out no Retry-After for a locate: a 429 asking for 5 s degrades after one request', async () => {
+      h.upstream.route('GET', '/crimes-street/all-crime', jsonOk(crimesBody()));
+      h.upstream.route('GET', '/locate-neighbourhood', status(429, '5'));
+      const run = await crimes(POINT);
+      if (run.kind !== 'ok') throw new Error(`got ${run.kind}`);
+      expect(run).not.toHaveProperty('located');
+      expect(run.records).toHaveLength(7);
+      expect(h.upstream.count('/locate-neighbourhood')).toBe(1);
     });
 
     it('rethrows a locate failure when the call was cancelled while the locate was in flight', async () => {
@@ -310,6 +404,7 @@ describe('runAreaQuery', () => {
             ...crimesQuery(target, 'all-crime', '2026-08'),
             tooLargeHint: 'Use a ring.',
           }),
+          crimePoint,
           h.service,
           h.ctx,
           h.budget(),
@@ -323,20 +418,310 @@ describe('runAreaQuery', () => {
     });
   });
 
-  describe('arms without a locate', () => {
-    it('never calls /locate-neighbourhood for a polygon', async () => {
+  describe('polygon arm', () => {
+    /** The straddle ring's sample answers: Greater Manchester to the north, Cheshire to the south. */
+    const straddleAnswers = (overrides: Record<string, string | Responder> = {}) =>
+      locateBy({
+        [STRADDLE_SAMPLES.centre]: 'cheshire',
+        [STRADDLE_SAMPLES.north]: 'greater-manchester',
+        [STRADDLE_SAMPLES.south]: 'cheshire',
+        [STRADDLE_SAMPLES.east]: 'greater-manchester',
+        ...overrides,
+      });
+
+    it('locates the sample points beside the area query and returns their distinct forces, sorted', async () => {
       h.upstream.route('POST', '/crimes-street/all-crime', jsonOk(crimesBody()));
-      const run = await crimes(RING);
+      h.upstream.route('GET', '/locate-neighbourhood', straddleAnswers());
+      const run = await crimes(STRADDLE);
       if (run.kind !== 'ok') throw new Error(`got ${run.kind}`);
+      expect(run.forces).toEqual(['cheshire', 'greater-manchester']);
+      expect(run.samples?.map((lookup) => lookup?.kind === 'found' && lookup.value.force)).toEqual([
+        'cheshire',
+        'greater-manchester',
+        'cheshire',
+        'greater-manchester',
+      ]);
       expect(run).not.toHaveProperty('located');
+      const locates = h.upstream.callsTo('/locate-neighbourhood');
+      expect(locates.map((call) => call.query.get('q'))).toEqual([
+        STRADDLE_SAMPLES.centre,
+        STRADDLE_SAMPLES.north,
+        STRADDLE_SAMPLES.south,
+        STRADDLE_SAMPLES.east,
+      ]);
+      const [area] = h.upstream.callsTo('/crimes-street/all-crime');
+      expect(locates.every((call) => call.at === area?.at)).toBe(true);
+    });
+
+    it('keeps at most two sample lookups queued or in flight, leaving the area query a pacer slot', async () => {
+      // A pentagon whose centre and four extreme vertices are five distinct points.
+      const pentagon = polygonOf(
+        [53.4, -2.3],
+        [53.38, -2.24],
+        [53.34, -2.26],
+        [53.34, -2.34],
+        [53.38, -2.36],
+      );
+      expect(samplePoints(pentagon.kind === 'polygon' ? pentagon.vertices : [])).toHaveLength(5);
+      h.upstream.route('POST', '/crimes-street/all-crime', jsonOk([]));
+      h.upstream.route('GET', '/locate-neighbourhood', async (request) => {
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+        return jsonOk(locateBody())(request);
+      });
+      let outstanding = 0;
+      let most = 0;
+      const locate = h.service.locate.bind(h.service);
+      vi.spyOn(h.service, 'locate').mockImplementation(async (...args) => {
+        outstanding += 1;
+        most = Math.max(most, outstanding);
+        try {
+          return await locate(...args);
+        } finally {
+          outstanding -= 1;
+        }
+      });
+      const run = await crimes(pentagon);
+      if (run.kind !== 'ok') throw new Error(`got ${run.kind}`);
+      expect(run.samples).toHaveLength(5);
+      expect(h.upstream.count('/locate-neighbourhood')).toBe(5);
+      expect(most).toBe(2);
+    });
+
+    it('logs the samples left unsent when the 10 s for lookups ran out as skipped, not as a spent call budget', async () => {
+      const pentagon = polygonOf(
+        [53.4, -2.3],
+        [53.38, -2.24],
+        [53.34, -2.26],
+        [53.34, -2.34],
+        [53.38, -2.36],
+      );
+      h.upstream.route('POST', '/crimes-street/all-crime', jsonOk([]));
+      h.upstream.route('GET', '/locate-neighbourhood', hang);
+      const run = await crimes(pentagon);
+      if (run.kind !== 'ok') throw new Error(`got ${run.kind}`);
+      expect(run.samples).toEqual([undefined, undefined, undefined, undefined, undefined]);
+      expect(h.upstream.count('/locate-neighbourhood')).toBe(2);
+      const warnings = (h.ctx.log as MockContextLogger).calls.filter((c) => c.level === 'warning');
+      expect(warnings.map((c) => c.msg).sort()).toEqual([
+        'Point lookup failed; searching without the located force',
+        'Point lookup failed; searching without the located force',
+        'Point lookup skipped: the time allowed for lookups ran out before it was sent; searching without the located force',
+        'Point lookup skipped: the time allowed for lookups ran out before it was sent; searching without the located force',
+        'Point lookup skipped: the time allowed for lookups ran out before it was sent; searching without the located force',
+      ]);
+      expect(JSON.stringify(warnings)).not.toContain('50-second budget');
+    });
+
+    it('sends the area query and answers when every sample lookup hangs, never shedding it behind its own lookups', async () => {
+      h.upstream.route('POST', '/crimes-street/all-crime', jsonOk(crimesBody()));
+      h.upstream.route('GET', '/locate-neighbourhood', hang);
+      const run = await crimes(STRADDLE);
+      if (run.kind !== 'ok') throw new Error(`got ${run.kind}`);
+      expect(run.records).toHaveLength(7);
+      expect(run.forces).toEqual([]);
+      expect(run.samples).toEqual([undefined, undefined, undefined, undefined]);
+      expect(h.upstream.count('/crimes-street/all-crime')).toBe(1);
+    });
+
+    it('gives up on hung sample lookups at 10 s, so an answered polygon search waits no longer', async () => {
+      h.upstream.route('POST', '/crimes-street/all-crime', jsonOk([]));
+      h.upstream.route(
+        'GET',
+        '/locate-neighbourhood',
+        straddleAnswers({ [STRADDLE_SAMPLES.north]: hang, [STRADDLE_SAMPLES.east]: hang }),
+      );
+      const start = Date.now();
+      const run = await crimes(STRADDLE);
+      if (run.kind !== 'ok') throw new Error(`got ${run.kind}`);
+      expect(run.forces).toEqual(['cheshire']);
+      expect(Date.now() - start).toBeLessThanOrEqual(10_500);
+    });
+
+    it('gives the area query a slot when every sample hangs and the area answers late: the lookups end at 10 s, the search when the area answers', async () => {
+      h.upstream.route('POST', '/crimes-street/all-crime', async (request) => {
+        await new Promise((resolve) => setTimeout(resolve, 15_000));
+        return jsonOk(crimesBody())(request);
+      });
+      h.upstream.route('GET', '/locate-neighbourhood', hang);
+      const start = Date.now();
+      const run = await crimes(STRADDLE);
+      if (run.kind !== 'ok') throw new Error(`got ${run.kind}`);
+      expect(run.records).toHaveLength(7);
+      expect(Date.now() - start).toBeGreaterThanOrEqual(15_000);
+      expect(Date.now() - start).toBeLessThanOrEqual(15_500);
+    });
+
+    it('fails an area query answering 500 as upstream_unavailable while every sample lookup hangs, never as pacer_shed', async () => {
+      h.upstream.route('POST', '/crimes-street/all-crime', status(500));
+      h.upstream.route('GET', '/locate-neighbourhood', hang);
+      const start = Date.now();
+      const error = await crimes(STRADDLE).catch((e: unknown) => e);
+      expect(error).toBeInstanceOf(McpError);
+      expect((error as McpError).code).toBe(JsonRpcErrorCode.ServiceUnavailable);
+      expect((error as McpError).data).toMatchObject({
+        reason: 'upstream_unavailable',
+        retryable: true,
+      });
+      // Every attempt and retry went out while the two hung lookups still held their slots.
+      const attempts = h.upstream.callsTo('/crimes-street/all-crime');
+      expect(attempts).toHaveLength(3);
+      expect(attempts.every((attempt) => attempt.at - start < 10_000)).toBe(true);
+      expect(h.upstream.count('/locate-neighbourhood')).toBe(2);
+    });
+
+    it('sends no lookup for a polygon with no vertex in the coverage box', async () => {
+      h.upstream.route('POST', '/crimes-street/all-crime', jsonOk([]));
+      const run = await crimes(polygonOf([48.85, 2.35], [48.86, 2.36], [48.84, 2.34]));
+      if (run.kind !== 'ok') throw new Error(`got ${run.kind}`);
+      expect(run.samples).toEqual([]);
+      expect(run.forces).toEqual([]);
       expect(h.upstream.count('/locate-neighbourhood')).toBe(0);
     });
 
-    it('never calls /locate-neighbourhood for a location or a force arm', async () => {
-      h.upstream.route('GET', '/crimes-at-location', jsonOk(crimesBody()));
+    it('carries every 404 as a miss and locates no force', async () => {
+      h.upstream.route('POST', '/crimes-street/all-crime', jsonOk([]));
+      h.upstream.route('GET', '/locate-neighbourhood', plainNotFound);
+      const run = await crimes(STRADDLE);
+      if (run.kind !== 'ok') throw new Error(`got ${run.kind}`);
+      expect(run.samples).toEqual([MISS, MISS, MISS, MISS]);
+      expect(run.forces).toEqual([]);
+    });
+
+    it('skips a sample whose lookup failed, keeping the others, with one warning', async () => {
+      h.upstream.route('POST', '/crimes-street/all-crime', jsonOk([]));
+      h.upstream.route(
+        'GET',
+        '/locate-neighbourhood',
+        straddleAnswers({
+          [STRADDLE_SAMPLES.north]: status(500),
+          [STRADDLE_SAMPLES.east]: status(500),
+        }),
+      );
+      const run = await crimes(STRADDLE);
+      if (run.kind !== 'ok') throw new Error(`got ${run.kind}`);
+      expect(run.samples?.map((lookup) => lookup?.kind)).toEqual([
+        'found',
+        undefined,
+        'found',
+        undefined,
+      ]);
+      expect(run.forces).toEqual(['cheshire']);
+      const warnings = (h.ctx.log as MockContextLogger).calls.filter((c) => c.level === 'warning');
+      expect(warnings).toHaveLength(2);
+    });
+
+    it('rethrows when the call is cancelled while a sample lookup is in flight', async () => {
+      const controller = new AbortController();
+      const ctx = h.ctxWith(controller.signal);
+      h.upstream.route('POST', '/crimes-street/all-crime', jsonOk([]));
+      h.upstream.route(
+        'GET',
+        '/locate-neighbourhood',
+        straddleAnswers({ [STRADDLE_SAMPLES.south]: hang }),
+      );
+      const pending = startCrimes(STRADDLE, 'all-crime', ctx);
+      await untilReal(() => h.upstream.count('/locate-neighbourhood') === 4);
+      setTimeout(() => controller.abort(), 1000);
+      const error = await settle(pending).catch((e: unknown) => e);
+      expect(error).toBeInstanceOf(Error);
+      expect(error).not.toHaveProperty('kind');
+      const degraded = (ctx.log as MockContextLogger).calls.some(
+        (call) => call.msg === 'Point lookup failed; searching without the located force',
+      );
+      expect(degraded).toBe(false);
+    });
+
+    it('sends no further lookup or query for a repeated polygon (both cached)', async () => {
+      h.upstream.route('POST', '/crimes-street/all-crime', jsonOk(crimesBody()));
+      h.upstream.route('GET', '/locate-neighbourhood', straddleAnswers());
+      const first = await crimes(STRADDLE);
+      const second = await crimes(STRADDLE);
+      expect(second).toEqual(first);
+      expect(h.upstream.count('/locate-neighbourhood')).toBe(4);
+      expect(h.upstream.count('/crimes-street/all-crime')).toBe(1);
+    });
+  });
+
+  describe('location arm', () => {
+    const LOCATION: AreaSpec = { kind: 'location', locationId: '1000001' };
+
+    it('locates the first record carrying a map point, after the area answer', async () => {
+      h.upstream.route('GET', '/crimes-at-location', async (request) => {
+        await new Promise((resolve) => setTimeout(resolve, 5000));
+        return jsonOk([
+          crimeRecord({ id: 1, location: null }),
+          crimeRecord({ id: 2, location: { ...crimeRecord().location, latitude: '52.640000' } }),
+          crimeRecord({ id: 3 }),
+        ])(request);
+      });
+      h.upstream.route(
+        'GET',
+        '/locate-neighbourhood',
+        locateBy({ '52.640000,-1.130000': 'leicestershire' }),
+      );
+      const run = await crimes(LOCATION);
+      if (run.kind !== 'ok') throw new Error(`got ${run.kind}`);
+      expect(run.located).toEqual(FOUND);
+      expect(run.forces).toEqual(['leicestershire']);
+      expect(run).not.toHaveProperty('samples');
+      const [area] = h.upstream.callsTo('/crimes-at-location');
+      const locates = h.upstream.callsTo('/locate-neighbourhood');
+      expect(locates).toHaveLength(1);
+      expect(locates[0]?.at).toBeGreaterThanOrEqual((area?.at ?? 0) + 5000);
+    });
+
+    it.each<[string, unknown[]]>([
+      ['no records', []],
+      ['records with no map point', [crimeRecord({ location: null })]],
+    ])('sends no lookup for %s', async (_name, body) => {
+      h.upstream.route('GET', '/crimes-at-location', jsonOk(body));
+      const run = await crimes(LOCATION);
+      if (run.kind !== 'ok') throw new Error(`got ${run.kind}`);
+      expect(run).not.toHaveProperty('located');
+      expect(run.forces).toEqual([]);
+      expect(h.upstream.count('/locate-neighbourhood')).toBe(0);
+    });
+
+    it('degrades quietly when the lookup fails', async () => {
+      h.upstream.route('GET', '/crimes-at-location', jsonOk([crimeRecord()]));
+      h.upstream.route('GET', '/locate-neighbourhood', status(500));
+      const run = await crimes(LOCATION);
+      if (run.kind !== 'ok') throw new Error(`got ${run.kind}`);
+      expect(run).not.toHaveProperty('located');
+      expect(run.forces).toEqual([]);
+    });
+
+    it('gives up on a hung lookup 10 s after the area answered, so the answered search waits no longer', async () => {
+      h.upstream.route('GET', '/crimes-at-location', async (request) => {
+        await new Promise((resolve) => setTimeout(resolve, 20_000));
+        return jsonOk([crimeRecord()])(request);
+      });
+      h.upstream.route('GET', '/locate-neighbourhood', hang);
+      const start = Date.now();
+      const run = await crimes(LOCATION);
+      if (run.kind !== 'ok') throw new Error(`got ${run.kind}`);
+      expect(run).not.toHaveProperty('located');
+      expect(run.records).toHaveLength(1);
+      expect(Date.now() - start).toBeGreaterThanOrEqual(30_000);
+      expect(Date.now() - start).toBeLessThanOrEqual(30_500);
+    });
+  });
+
+  describe('named arms', () => {
+    it('carry the named force and send no lookup', async () => {
       h.upstream.route('GET', '/crimes-no-location', jsonOk([]));
-      await crimes({ kind: 'location', locationId: '1000001' });
-      await crimes({ kind: 'force_unplaced', force: 'leicestershire' });
+      h.upstream.route('GET', '/leicestershire/NX01/boundary', jsonOk(boundaryBody()));
+      h.upstream.route('POST', '/crimes-street/all-crime', jsonOk([]));
+      const unplaced = await crimes({ kind: 'force_unplaced', force: 'btp' });
+      const hood = await crimes({
+        kind: 'neighbourhood',
+        force: 'leicestershire',
+        neighbourhoodId: 'NX01',
+      });
+      expect(unplaced).toMatchObject({ kind: 'ok', forces: ['btp'] });
+      expect(hood).toMatchObject({ kind: 'ok', forces: ['leicestershire'] });
+      expect(unplaced).not.toHaveProperty('located');
+      expect(hood).not.toHaveProperty('samples');
       expect(h.upstream.count('/locate-neighbourhood')).toBe(0);
     });
   });
@@ -366,7 +751,11 @@ describe('runAreaQuery', () => {
 
     it('returns unknown_neighbourhood on a boundary 404, without sending the area query', async () => {
       h.upstream.route('GET', '/leicestershire/NX01/boundary', plainNotFound);
-      expect(await crimes(NEIGHBOURHOOD)).toEqual({ kind: 'unknown_neighbourhood' });
+      expect(await crimes(NEIGHBOURHOOD)).toEqual({
+        kind: 'unknown_neighbourhood',
+        force: 'leicestershire',
+        neighbourhoodId: 'NX01',
+      });
       expect(h.upstream.calls.map((c) => c.path)).toEqual(['/leicestershire/NX01/boundary']);
     });
 
@@ -391,6 +780,7 @@ describe('runAreaQuery', () => {
         runAreaQuery(
           { kind: 'location', locationId: '999' },
           (target) => outcomesQuery(target as Place, '2026-08'),
+          outcomePoint,
           h.service,
           h.ctx,
           h.budget(),
@@ -405,6 +795,7 @@ describe('runAreaQuery', () => {
         runAreaQuery(
           { kind: 'location', locationId: '999' },
           (target) => stopsQuery(target, '2026-08'),
+          stopPoint,
           h.service,
           h.ctx,
           h.budget(),
@@ -420,6 +811,7 @@ describe('runAreaQuery', () => {
         runAreaQuery(
           { kind: 'location', locationId: '999' },
           (target) => stopsQuery(target, '2026-08'),
+          stopPoint,
           h.service,
           h.ctx,
           h.budget(),
@@ -432,12 +824,14 @@ describe('runAreaQuery', () => {
   describe('records', () => {
     it('shares the cached array between runs (read-only, never re-fetched)', async () => {
       h.upstream.route('GET', '/crimes-at-location', jsonOk(crimesBody()));
+      h.upstream.route('GET', '/locate-neighbourhood', jsonOk(locateBody()));
       const spec: AreaSpec = { kind: 'location', locationId: '1000001' };
       const first = await crimes(spec);
       const second = await crimes(spec);
       if (first.kind !== 'ok' || second.kind !== 'ok') throw new Error('expected ok');
       expect(second.records).toBe(first.records);
       expect(h.upstream.count('/crimes-at-location')).toBe(1);
+      expect(h.upstream.count('/locate-neighbourhood')).toBe(1);
     });
 
     it('returns the target for a force arm', async () => {
@@ -446,6 +840,7 @@ describe('runAreaQuery', () => {
         runAreaQuery(
           { kind: 'force', force: 'leicestershire' },
           (target) => stopsQuery(target, '2026-08'),
+          stopPoint,
           h.service,
           h.ctx,
           h.budget(),
@@ -461,6 +856,7 @@ describe('runAreaQuery', () => {
         runAreaQuery(
           POINT,
           (target) => outcomesQuery(target as Place, '2026-08'),
+          outcomePoint,
           h.service,
           h.ctx,
           h.budget(),
@@ -473,35 +869,57 @@ describe('runAreaQuery', () => {
   });
 });
 
-describe('searchedForceId', () => {
-  it('prefers the force the arm named', () => {
-    expect(
-      searchedForceId(
-        { kind: 'ok', force: { id: 'btp', name: 'British Transport Police' } },
-        FOUND,
-      ),
-    ).toBe('btp');
+describe('samplePoints', () => {
+  const at = (points: readonly MapPoint[]) =>
+    points.map(({ latitude, longitude }) => `${latitude.toFixed(6)},${longitude.toFixed(6)}`);
+
+  it('takes the bounding-box centre, then the first northernmost, southernmost and easternmost vertices of a rectangle (westernmost repeats)', () => {
+    expect(at(samplePoints(STRADDLE.kind === 'polygon' ? STRADDLE.vertices : []))).toEqual([
+      STRADDLE_SAMPLES.centre,
+      STRADDLE_SAMPLES.north,
+      STRADDLE_SAMPLES.south,
+      STRADDLE_SAMPLES.east,
+    ]);
   });
 
-  it('falls back to the located force', () => {
-    expect(searchedForceId({ kind: 'none' }, FOUND)).toBe('leicestershire');
+  it('keeps five distinct points at most, and one for a degenerate ring', () => {
+    const pentagon = polygonOf(
+      [53.4, -2.3],
+      [53.38, -2.24],
+      [53.34, -2.26],
+      [53.34, -2.34],
+      [53.38, -2.36],
+    );
+    expect(samplePoints(pentagon.kind === 'polygon' ? pentagon.vertices : [])).toHaveLength(5);
+    const dot = polygonOf([52.63, -1.13], [52.63, -1.13], [52.63, -1.13]);
+    expect(at(samplePoints(dot.kind === 'polygon' ? dot.vertices : []))).toEqual([
+      '52.630000,-1.130000',
+    ]);
   });
 
-  it.each<[string, Lookup<LocatedNeighbourhood> | undefined]>([
-    ['a locate miss', MISS],
-    ['no locate', undefined],
-  ])('is undefined for none and %s', (_name, located) => {
-    expect(searchedForceId({ kind: 'none' }, located)).toBeUndefined();
+  it('drops repeats only at the 6 dp a lookup is sent at: vertices 0.00001° apart stay distinct', () => {
+    // N is 0.00001° north of SW, E 0.00001° east of it; W and S repeat SW.
+    const sliver = polygonOf([52.63, -1.13], [52.63001, -1.13], [52.63, -1.12999]);
+    const points = at(samplePoints(sliver.kind === 'polygon' ? sliver.vertices : []));
+    expect(points).toHaveLength(4);
+    expect(points.slice(1)).toEqual([
+      '52.630010,-1.130000',
+      '52.630000,-1.130000',
+      '52.630000,-1.129990',
+    ]);
   });
 
-  it('is undefined for an unknown named force', () => {
-    expect(searchedForceId({ kind: 'unknown', message: 'x' }, undefined)).toBeUndefined();
+  it('is empty when no vertex lies in the coverage box', () => {
+    const paris = polygonOf([48.85, 2.35], [48.86, 2.36], [48.84, 2.34]);
+    expect(samplePoints(paris.kind === 'polygon' ? paris.vertices : [])).toEqual([]);
   });
 });
 
 describe('areaEcho', () => {
   it('echoes a point with the located force and neighbourhood when found', () => {
-    expect(areaEcho(POINT, POINT as Place, FOUND)).toEqual({
+    expect(
+      areaEcho(POINT, { target: POINT as Place, forces: ['leicestershire'], located: FOUND }),
+    ).toEqual({
       type: 'point',
       lat: 52.63,
       lng: -1.13,
@@ -514,7 +932,9 @@ describe('areaEcho', () => {
     ['a locate miss', MISS],
     ['no locate', undefined],
   ])('echoes a point without located fields for %s', (_name, located) => {
-    expect(areaEcho(POINT, POINT as Place, located)).toEqual({
+    expect(
+      areaEcho(POINT, { target: POINT as Place, forces: [], ...(located ? { located } : {}) }),
+    ).toEqual({
       type: 'point',
       lat: 52.63,
       lng: -1.13,
@@ -522,12 +942,41 @@ describe('areaEcho', () => {
   });
 
   it('echoes a polygon by vertex count (as given, the ring not closed)', () => {
-    expect(areaEcho(RING, RING as Place, undefined)).toEqual({ type: 'polygon', vertex_count: 3 });
+    expect(areaEcho(RING, { ...NONE, target: RING as Place })).toEqual({
+      type: 'polygon',
+      vertex_count: 3,
+    });
+  });
+
+  it('echoes a polygon’s located forces as given (the run sorts them)', () => {
+    expect(
+      areaEcho(RING, {
+        target: RING as Place,
+        forces: ['cheshire', 'greater-manchester'],
+        samples: [MISS],
+      }),
+    ).toEqual({
+      type: 'polygon',
+      vertex_count: 3,
+      located_forces: ['cheshire', 'greater-manchester'],
+    });
+  });
+
+  it('echoes a location with its map point’s located force and neighbourhood', () => {
+    const spec: AreaSpec = { kind: 'location', locationId: '1000001' };
+    expect(
+      areaEcho(spec, { target: spec as Place, forces: ['leicestershire'], located: FOUND }),
+    ).toEqual({
+      type: 'location',
+      location_id: '1000001',
+      located_force: 'leicestershire',
+      located_neighbourhood: 'NX01',
+    });
   });
 
   it('echoes a location by id', () => {
     const spec: AreaSpec = { kind: 'location', locationId: '1000001' };
-    expect(areaEcho(spec, spec as Place, undefined)).toEqual({
+    expect(areaEcho(spec, { ...NONE, target: spec as Place })).toEqual({
       type: 'location',
       location_id: '1000001',
     });
@@ -543,7 +992,7 @@ describe('areaEcho', () => {
       kind: 'polygon',
       vertices: boundaryBody().map(() => ({ latitude: 1, longitude: 2 })),
     } as const;
-    expect(areaEcho(spec, target, undefined)).toEqual({
+    expect(areaEcho(spec, { forces: ['leicestershire'], target })).toEqual({
       type: 'neighbourhood',
       force: 'leicestershire',
       neighbourhood_id: 'NX01',
@@ -552,7 +1001,12 @@ describe('areaEcho', () => {
   });
 
   it.each(['force_unplaced', 'force'] as const)('echoes %s by force alone', (kind) => {
-    expect(areaEcho({ kind, force: 'btp' }, { kind: 'force', force: 'btp' }, undefined)).toEqual({
+    expect(
+      areaEcho(
+        { kind, force: 'btp' },
+        { forces: ['btp'], target: { kind: 'force', force: 'btp' } },
+      ),
+    ).toEqual({
       type: kind,
       force: 'btp',
     });
@@ -677,31 +1131,31 @@ describe('notice fragments', () => {
     });
 
     it('flags a point whose locate answered 404', () => {
-      expect(outsideCoverageNote(POINT, MISS)).toBe(OUTSIDE_POINT);
+      expect(outsideCoverageNote(POINT, { located: MISS })).toBe(OUTSIDE_POINT);
     });
 
     it.each<[string, Lookup<LocatedNeighbourhood> | undefined]>([
       ['found', FOUND],
       ['unknown (the locate failed)', undefined],
     ])('does not flag a point whose locate is %s', (_name, located) => {
-      expect(outsideCoverageNote(POINT, located)).toBeUndefined();
+      expect(outsideCoverageNote(POINT, located ? { located } : {})).toBeUndefined();
     });
 
     it('flags a polygon with every vertex outside the coverage box', () => {
-      expect(
-        outsideCoverageNote(ring([48.85, 2.35], [48.86, 2.36], [48.84, 2.34]), undefined),
-      ).toBe(OUTSIDE_POLYGON);
+      expect(outsideCoverageNote(ring([48.85, 2.35], [48.86, 2.36], [48.84, 2.34]), NONE)).toBe(
+        OUTSIDE_POLYGON,
+      );
     });
 
     it('flags a polygon with swapped coordinates (lat in the longitude slot)', () => {
-      expect(
-        outsideCoverageNote(ring([-1.14, 52.63], [-1.12, 52.64], [-1.13, 52.6]), undefined),
-      ).toBe(OUTSIDE_POLYGON);
+      expect(outsideCoverageNote(ring([-1.14, 52.63], [-1.12, 52.64], [-1.13, 52.6]), NONE)).toBe(
+        OUTSIDE_POLYGON,
+      );
     });
 
     it('does not flag a polygon with one vertex inside the box', () => {
       expect(
-        outsideCoverageNote(ring([48.85, 2.35], [52.63, -1.13], [48.84, 2.34]), undefined),
+        outsideCoverageNote(ring([48.85, 2.35], [52.63, -1.13], [48.84, 2.34]), NONE),
       ).toBeUndefined();
     });
 
@@ -711,7 +1165,7 @@ describe('notice fragments', () => {
       ['south-east corner', [49.8, 2.0]],
       ['north-west corner', [61.0, -8.7]],
     ])('treats the %s of the box as inside', (_name, point) => {
-      expect(outsideCoverageNote(ring(point, point, point), undefined)).toBeUndefined();
+      expect(outsideCoverageNote(ring(point, point, point), NONE)).toBeUndefined();
     });
 
     it.each<[string, [number, number]]>([
@@ -720,12 +1174,20 @@ describe('notice fragments', () => {
       ['just west', [52, -8.71]],
       ['just east', [52, 2.01]],
     ])('treats a point %s of the box as outside', (_name, point) => {
-      expect(outsideCoverageNote(ring(point, point, point), undefined)).toBe(OUTSIDE_POLYGON);
+      expect(outsideCoverageNote(ring(point, point, point), NONE)).toBe(OUTSIDE_POLYGON);
+    });
+
+    it('flags an in-box polygon whose every sample answered 404, and only then', () => {
+      const highlands = ring([57.5, -4.3], [57.5, -4.1], [57.4, -4.1]);
+      expect(outsideCoverageNote(highlands, { samples: [MISS, MISS] })).toBe(OUTSIDE_POLYGON);
+      expect(outsideCoverageNote(highlands, { samples: [MISS, undefined] })).toBeUndefined();
+      expect(outsideCoverageNote(highlands, { samples: [MISS, FOUND] })).toBeUndefined();
+      expect(outsideCoverageNote(highlands, { samples: [] })).toBeUndefined();
     });
 
     it('ignores the locate result for a polygon and the polygon for a point', () => {
-      expect(outsideCoverageNote(ring([48.85, 2.35]), FOUND)).toBe(OUTSIDE_POLYGON);
-      expect(outsideCoverageNote(POINT, MISS)).toBe(OUTSIDE_POINT);
+      expect(outsideCoverageNote(ring([48.85, 2.35]), { located: FOUND })).toBe(OUTSIDE_POLYGON);
+      expect(outsideCoverageNote(POINT, { located: MISS })).toBe(OUTSIDE_POINT);
     });
 
     it.each<[string, AreaSpec]>([
@@ -737,7 +1199,39 @@ describe('notice fragments', () => {
       ['force_unplaced', { kind: 'force_unplaced', force: 'leicestershire' }],
       ['force', { kind: 'force', force: 'leicestershire' }],
     ])('has nothing to say about a %s', (_name, spec) => {
-      expect(outsideCoverageNote(spec, MISS)).toBeUndefined();
+      expect(outsideCoverageNote(spec, { located: MISS, samples: [MISS] })).toBeUndefined();
+    });
+  });
+
+  describe('partialLocateNote', () => {
+    const CHESHIRE: Lookup<LocatedNeighbourhood> = {
+      kind: 'found',
+      value: { force: 'cheshire', neighbourhood: 'CX01' },
+    };
+
+    it('names how many of the sample lookups failed when others found a force', () => {
+      expect(
+        partialLocateNote({
+          forces: ['cheshire'],
+          samples: [CHESHIRE, undefined, CHESHIRE, undefined],
+        }),
+      ).toBe(
+        "The force at 2 of this polygon's 4 sample points could not be looked up, so the forces named here may not be all it falls in; search again to retry the lookup.",
+      );
+      expect(
+        partialLocateNote({ forces: ['cheshire'], samples: [CHESHIRE, MISS, undefined] }),
+      ).toContain("The force at 1 of this polygon's 3 sample points");
+    });
+
+    it.each<[string, AreaForces]>([
+      ['every lookup answered', { forces: ['cheshire'], samples: [CHESHIRE, MISS] }],
+      ['every lookup failed', { forces: [], samples: [undefined, undefined] }],
+      ['the rest answered 404', { forces: [], samples: [MISS, undefined] }],
+      ['no sample was sent', { forces: [], samples: [] }],
+      ['a point whose locate failed', { forces: [] }],
+      ['a named arm', { forces: ['leicestershire'] }],
+    ])('says nothing when %s', (_name, run) => {
+      expect(partialLocateNote(run)).toBeUndefined();
     });
   });
 

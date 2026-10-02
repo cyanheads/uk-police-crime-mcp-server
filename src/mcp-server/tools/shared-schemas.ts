@@ -8,6 +8,7 @@
  */
 
 import { z } from '@cyanheads/mcp-ts-core';
+import { foldForce } from '@/services/police-api/police-api-service.js';
 
 /** OGL v3.0 attribution — the `attribution` enrichment field, written first by every tool. */
 export const ATTRIBUTION =
@@ -34,17 +35,24 @@ export function blankAsUnset<T extends z.ZodType>(
   }, schema);
 }
 
-/** Force id: lower-cased, runs of spaces/underscores to `-`, then `^[a-z]+(-[a-z]+)*$`. */
+const FORCE_SHAPE =
+  "Expected a force id or name such as 'leicestershire' or 'Devon & Cornwall Police': letters, with words joined by spaces, hyphens, underscores or '&'.";
+
+/**
+ * Force id or display name, folded by `foldForce` (lower-cased, `&` as `and`,
+ * each run of whitespace, `_` and `-` as one `-`). One pattern serves both
+ * sides: advertised, it is the raw grammar (letters first and last, joined by
+ * whitespace, `&`, `_` or `-`); checked against the folded value, it admits
+ * exactly `^[a-z]+(-[a-z]+)*$`. The handler matches the value by id or name
+ * against the force list.
+ */
 export const forceInput = blankAsUnset(
   z
     .string()
     .max(100)
-    .regex(
-      /^[a-z]+(-[a-z]+)*$/,
-      "Expected a force id: lower-case words joined by hyphens, such as 'leicestershire' or 'devon-and-cornwall'.",
-    )
+    .regex(/^\s*[A-Za-z](?:[A-Za-z\s&_-]*[A-Za-z])?\s*$/, FORCE_SHAPE)
     .optional(),
-  (value) => value.toLowerCase().replace(/[\s_]+/g, '-'),
+  foldForce,
 );
 
 /**

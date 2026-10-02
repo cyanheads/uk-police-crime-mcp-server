@@ -1,8 +1,9 @@
 /**
  * @fileoverview PoliceApiService in-process caches: every cache's TTL, the
  * entry caps (45, 45, 64, 10,000), and the area-response cache's key, weight
- * (decoded bytes x 1.25), 15-minute TTL from insert, eviction order and the
- * half-cap uncached rule. Time is virtual; large bodies are generated here.
+ * (decoded bytes x 1.25) against its 128 MiB budget, 15-minute TTL from insert,
+ * clearing on a new release, eviction order and the 32 MiB uncached rule. Time
+ * is virtual; large bodies are generated here.
  * @module tests/services/police-api-service.cache.test
  */
 
@@ -16,6 +17,7 @@ import {
   neighbourhoodsBody,
   plainNotFound,
   sizedJsonBody,
+  streetDatesBody,
   textOk,
 } from '../fixtures/police-api-upstream.js';
 import { DAY, HOUR, MINUTE, settle, useServiceHarness } from '../fixtures/service-harness.js';
@@ -332,57 +334,93 @@ describe('PoliceApiService caches', () => {
     });
   });
 
-  describe('area cache: weight, eviction and the half-cap rule', () => {
-    const body20 = sizedJsonBody(20_000_000);
-    const entry = (n: number) => area({ date: '2026-08', n: String(n) });
+  describe('area cache: a new release', () => {
+    const availability = () => settle(h.service.getAvailability(h.ctx, h.budget()));
     const fetched = () => h.upstream.count('/crimes-street/all-crime');
 
-    it('weighs entries by decoded bytes x 1.25 against a 64 MiB budget: two 20 MB bodies fit, a third evicts the oldest', async () => {
-      h.upstream.route('GET', '/crimes-street/all-crime', textOk(body20));
-      await settle(entry(1));
-      await settle(entry(2));
-      await settle(entry(1));
-      await settle(entry(2));
+    it('keeps the area cache over the first availability read and an hourly re-read with the same latest month', async () => {
+      h.upstream.route('GET', '/crimes-street/all-crime', jsonOk([1]));
+      await settle(area());
+      await availability();
+      await settle(area());
+      expect(fetched()).toBe(1);
+      await vi.advanceTimersByTimeAsync(50 * MINUTE);
+      await settle(area());
       expect(fetched()).toBe(2);
-      await settle(entry(3));
-      await settle(entry(1));
-      expect(fetched()).toBe(4);
+      await vi.advanceTimersByTimeAsync(10 * MINUTE + 1);
+      expect((await availability()).latest).toBe('2026-08');
+      expect(h.upstream.count('/crimes-street-dates')).toBe(2);
+      await settle(area());
+      expect(fetched()).toBe(2);
+    });
+
+    it('clears the area cache when an hourly re-read finds a new latest month', async () => {
+      h.upstream.route('GET', '/crimes-street/all-crime', jsonOk([1]));
+      await availability();
+      await vi.advanceTimersByTimeAsync(50 * MINUTE);
+      await settle(area());
+      await settle(area());
+      expect(fetched()).toBe(1);
+      h.upstream.route('GET', '/crimes-street-dates', jsonOk(streetDatesBody({ to: '2026-09' })));
+      await vi.advanceTimersByTimeAsync(10 * MINUTE + 1);
+      expect((await availability()).latest).toBe('2026-09');
+      await settle(area());
+      expect(fetched()).toBe(2);
+    });
+  });
+
+  describe('area cache: weight, eviction and the 32 MiB entry cap', () => {
+    const body20 = sizedJsonBody(20_000_000);
+    const entry = (n: number) => area({ date: '2026-08', n: String(n) });
+    const entries = async (...ns: number[]) => {
+      for (const n of ns) await settle(entry(n));
+    };
+    const fetched = () => h.upstream.count('/crimes-street/all-crime');
+
+    it('weighs entries by decoded bytes x 1.25 against a 128 MiB budget: five 20 MB bodies fit, a sixth evicts the oldest', async () => {
+      h.upstream.route('GET', '/crimes-street/all-crime', textOk(body20));
+      await entries(1, 2, 3, 4, 5);
+      await entries(1, 2, 3, 4, 5);
+      expect(fetched()).toBe(5);
+      await entries(6);
+      await entries(2, 3, 4, 5, 6);
+      expect(fetched()).toBe(6);
+      await entries(1);
+      expect(fetched()).toBe(7);
     });
 
     it('evicts the least recently used entry, not the oldest inserted', async () => {
       h.upstream.route('GET', '/crimes-street/all-crime', textOk(body20));
-      await settle(entry(1));
-      await settle(entry(2));
-      await settle(entry(1)); // 1 is now the most recently used
-      await settle(entry(3)); // evicts 2
-      expect(fetched()).toBe(3);
-      await settle(entry(1));
-      await settle(entry(3));
-      expect(fetched()).toBe(3);
-      await settle(entry(2));
-      expect(fetched()).toBe(4);
+      await entries(1, 2, 3, 4, 5);
+      await entries(1); // 1 is now the most recently used, 2 the least
+      await entries(6); // evicts 2
+      expect(fetched()).toBe(6);
+      await entries(1, 3, 4, 5, 6);
+      expect(fetched()).toBe(6);
+      await entries(2);
+      expect(fetched()).toBe(7);
     });
 
     it('drops expired entries before evicting live ones', async () => {
       h.upstream.route('GET', '/crimes-street/all-crime', textOk(body20));
-      await settle(entry(1));
+      await entries(1);
       await vi.advanceTimersByTimeAsync(MINUTE);
-      await settle(entry(2));
-      await settle(entry(1)); // 1 becomes the most recently used; 2 is now the least
-      await vi.advanceTimersByTimeAsync(14 * MINUTE + 1001); // 1 expired, 2 still live
-      await settle(entry(3));
-      await settle(entry(2));
-      expect(fetched()).toBe(3);
+      await entries(2, 3, 4, 5);
+      await entries(1); // 1 becomes the most recently used; 2 is now the least
+      await vi.advanceTimersByTimeAsync(14 * MINUTE + 1001); // 1 expired, 2–5 still live
+      await entries(6);
+      await entries(2, 3, 4, 5);
+      expect(fetched()).toBe(6);
     });
 
-    it('caches a body at the half-cap boundary (26,843,545 bytes weighs 33,554,431.25)', async () => {
+    it('caches a body at the 32 MiB entry cap (26,843,545 bytes weighs 33,554,431.25)', async () => {
       h.upstream.route('GET', '/crimes-street/all-crime', textOk(sizedJsonBody(26_843_545)));
       await settle(entry(1));
       await settle(entry(1));
       expect(fetched()).toBe(1);
     });
 
-    it('serves a body one byte over the half-cap uncached, and says so in the log', async () => {
+    it('serves a body one byte over the 32 MiB entry cap uncached, and says so in the log', async () => {
       h.upstream.route('GET', '/crimes-street/all-crime', textOk(sizedJsonBody(26_843_546)));
       const first = await settle(entry(1));
       expect(first.kind).toBe('found');
@@ -420,6 +458,16 @@ describe('PoliceApiService caches', () => {
       await settle(entry(1));
       await settle(entry(1));
       expect(fetched()).toBe(1);
+    });
+
+    it('reports the weight of a month fetched, served from the cache, and served uncached alike', async () => {
+      h.upstream.route('GET', '/crimes-street/all-crime', textOk(sizedJsonBody(1000)));
+      h.upstream.route('GET', '/outcomes-at-location', textOk(sizedJsonBody(26_843_546)));
+      expect(await settle(entry(1))).toMatchObject({ kind: 'found', weight: 1250 });
+      expect(await settle(entry(1))).toMatchObject({ kind: 'found', weight: 1250 });
+      expect(fetched()).toBe(1);
+      const big = await settle(area({ date: '2026-08' }, { path: '/outcomes-at-location' }));
+      expect(big).toMatchObject({ kind: 'found', weight: 26_843_546 * 1.25 });
     });
   });
 });

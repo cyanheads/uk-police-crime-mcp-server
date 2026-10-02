@@ -1,6 +1,7 @@
 /**
  * @fileoverview PoliceApiService reference and lookup methods: availability,
- * month resolution (with its throttled re-check), forces and BTP handling,
+ * month resolution (with its throttled re-check), forces, matching one by id or
+ * display name, and BTP handling,
  * categories, force detail, neighbourhood lists, locate and boundary, plus
  * `parseUpstream` and the request each generic area query builds. Each method
  * is exercised against fixture bodies shaped like the API Reference, including
@@ -251,34 +252,103 @@ describe('PoliceApiService reference methods', () => {
       expect(error.data).toMatchObject({ reason: 'unexpected_response' });
     });
 
-    it('findForce returns a listed force and undefined for an unknown id', async () => {
+    const BTP_REFUSED = {
+      kind: 'unknown',
+      message: 'British Transport Police has no neighbourhoods.',
+    } as const;
+
+    it('findForce finds a listed force by id, and names an unknown one', async () => {
       const options = { allowBtp: false };
       expect(
         await settle(h.service.findForce('leicestershire', h.ctx, h.budget(), options)),
-      ).toEqual({
-        id: 'leicestershire',
-        name: 'Leicestershire Police',
+      ).toEqual({ kind: 'found', force: { id: 'leicestershire', name: 'Leicestershire Police' } });
+      expect(await settle(h.service.findForce('atlantis', h.ctx, h.budget(), options))).toEqual({
+        kind: 'unknown',
+        message: "No police force 'atlantis'.",
       });
-      expect(
-        await settle(h.service.findForce('atlantis', h.ctx, h.budget(), options)),
-      ).toBeUndefined();
+    });
+
+    it.each([
+      ['leicestershire-police', 'leicestershire'],
+      ['metropolitan-police', 'metropolitan'],
+      ['metropolitan-police-service', 'metropolitan'],
+      ['devon-and-cornwall-police', 'devon-and-cornwall'],
+      ['avon-and-somerset-constabulary', 'avon-and-somerset'],
+      ['police-service-of-northern-ireland', 'northern-ireland'],
+      ['Dyfed-Powys Police', 'dyfed-powys'],
+    ])('findForce matches the display-name form %j to %s', async (input, id) => {
+      const match = await settle(
+        h.service.findForce(input, h.ctx, h.budget(), { allowBtp: false }),
+      );
+      expect(match).toMatchObject({ kind: 'found', force: { id } });
     });
 
     it('findForce answers btp only where the caller allows it, without asking upstream', async () => {
-      expect(await settle(h.service.findForce('btp', h.ctx, h.budget(), { allowBtp: true }))).toBe(
-        BTP_FORCE,
-      );
+      expect(
+        await settle(h.service.findForce('btp', h.ctx, h.budget(), { allowBtp: true })),
+      ).toEqual({ kind: 'found', force: BTP_FORCE });
       expect(
         await settle(h.service.findForce('btp', h.ctx, h.budget(), { allowBtp: false })),
-      ).toBeUndefined();
+      ).toEqual(BTP_REFUSED);
       expect(h.upstream.count('/forces')).toBe(0);
+    });
+
+    it('findForce matches British Transport Police to btp, refused by the same gate', async () => {
+      expect(
+        await settle(
+          h.service.findForce('british-transport-police', h.ctx, h.budget(), { allowBtp: true }),
+        ),
+      ).toEqual({ kind: 'found', force: BTP_FORCE });
+      expect(
+        await settle(
+          h.service.findForce('british-transport-police', h.ctx, h.budget(), { allowBtp: false }),
+        ),
+      ).toEqual(BTP_REFUSED);
     });
 
     it('does not let a listed force named btp through allowBtp: false', async () => {
       h.upstream.route('GET', '/forces', jsonOk([{ id: 'btp', name: 'Listed BTP' }]));
       expect(
         await settle(h.service.findForce('btp', h.ctx, h.budget(), { allowBtp: false })),
-      ).toBeUndefined();
+      ).toEqual(BTP_REFUSED);
+    });
+
+    it('findForce picks neither force when a name key is shared, naming both ids', async () => {
+      h.upstream.route(
+        'GET',
+        '/forces',
+        jsonOk([
+          { id: 'northshire', name: 'Southshire Police' },
+          { id: 'southshire', name: 'Southshire Constabulary' },
+        ]),
+      );
+      expect(
+        await settle(
+          h.service.findForce('southshire-police', h.ctx, h.budget(), { allowBtp: true }),
+        ),
+      ).toEqual({
+        kind: 'unknown',
+        message:
+          "'southshire-police' matches more than one police force: 'northshire', 'southshire'; send one of their ids.",
+      });
+      // An exact id is matched first, so the id itself is never ambiguous.
+      expect(
+        await settle(h.service.findForce('southshire', h.ctx, h.budget(), { allowBtp: true })),
+      ).toMatchObject({ kind: 'found', force: { id: 'southshire' } });
+    });
+
+    it('findForce matches an exact id before any name', async () => {
+      h.upstream.route(
+        'GET',
+        '/forces',
+        jsonOk([
+          { id: 'kent', name: 'Medway Police' },
+          { id: 'medway', name: 'Kent Police' },
+        ]),
+      );
+      expect(
+        await settle(h.service.findForce('kent', h.ctx, h.budget(), { allowBtp: true })),
+      ).toMatchObject({ kind: 'found', force: { id: 'kent' } });
     });
 
     it('exports btp as British Transport Police', () => {
@@ -720,7 +790,8 @@ describe('PoliceApiService reference methods', () => {
           h.budget(),
         ),
       );
-      expect(lookup).toEqual({ kind: 'found', value: [10, 20] });
+      // The body `[{"n":1},{"n":2}]` is 17 bytes, weighing 17 × 1.25.
+      expect(lookup).toEqual({ kind: 'found', value: [10, 20], weight: 21.25 });
     });
 
     it('does not cache a response whose normalizer threw, and does not retry it', async () => {
@@ -740,7 +811,7 @@ describe('PoliceApiService reference methods', () => {
         );
       await expect(settle(query(true))).rejects.toThrow('bad record');
       expect(h.upstream.count('/crimes-street/all-crime')).toBe(1);
-      expect(await settle(query(false))).toEqual({ kind: 'found', value: [1] });
+      expect(await settle(query(false))).toEqual({ kind: 'found', value: [1], weight: 3.75 });
       expect(h.upstream.count('/crimes-street/all-crime')).toBe(2);
     });
   });

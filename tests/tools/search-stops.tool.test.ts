@@ -1,11 +1,13 @@
 /**
  * @fileoverview ukcrime_search_stops through `runToolContract` (the production
  * parse of output extended with enrichment): every area arm, every filter field
- * and its semantics, paging and `next_offset`, the stop-and-search publication
- * check, every zero-hit notice, every declared error reason, the enrichment
- * fields on the zero-result page and the under-cap page and their write order,
- * upstream failure classes, blank form values, and `format()` carrying the same
- * data as `structuredContent` with upstream text kept inert.
+ * and its semantics (the find and strip-search flags included, with the
+ * advertised input schema checked against the handler by ajv), paging and
+ * `next_offset`, the stop-and-search publication check, every zero-hit notice,
+ * every declared error reason, the enrichment fields on the zero-result page
+ * and the under-cap page and their write order, upstream failure classes, blank
+ * form values, and `format()` carrying the same data as `structuredContent`
+ * with upstream text kept inert.
  * @module tests/tools/search-stops.tool.test
  */
 
@@ -16,6 +18,7 @@ import {
   type MockContextLogger,
   runToolContract,
 } from '@cyanheads/mcp-ts-core/testing';
+import { Ajv2020 } from 'ajv/dist/2020.js';
 import { describe, expect, it } from 'vitest';
 import type { z } from 'zod';
 import { searchStopsTool } from '@/mcp-server/tools/definitions/search-stops.tool.js';
@@ -27,10 +30,14 @@ import {
   htmlOk,
   jsonOk,
   locateBody,
+  locateBy,
   manyStops,
   overloaded,
   plainNotFound,
+  type Responder,
   rateLimited,
+  STRADDLE_RING,
+  STRADDLE_SAMPLES,
   sparseStopRecord,
   status,
   stopRecord,
@@ -229,12 +236,17 @@ describe('ukcrime_search_stops', () => {
   });
 
   describe('area polygon', () => {
-    it('POSTs the ring as a form and has no force, so no publication check and no locate', async () => {
+    it('POSTs the ring as a form, locates its sample points, and checks the located force’s publication', async () => {
       h.upstream.route('POST', '/stops-street', jsonOk(stopsBody()));
+      h.upstream.route('GET', '/locate-neighbourhood', jsonOk(locateBody()));
       const out = data(await call({ area: 'polygon', polygon: RING, month: '2026-07' }));
-      expect(out.area).toEqual({ type: 'polygon', vertex_count: 4 });
+      expect(out.area).toEqual({
+        type: 'polygon',
+        vertex_count: 4,
+        located_forces: ['leicestershire'],
+      });
       expect(out.total).toBe(6);
-      expect(out).not.toHaveProperty('force_published');
+      expect(out.force_published).toBe(true);
       expect(out.notice).toBeUndefined();
       const [request] = h.upstream.callsTo('/stops-street');
       expect(request?.method).toBe('POST');
@@ -244,11 +256,25 @@ describe('ukcrime_search_stops', () => {
         '52.630000,-1.140000:52.630000,-1.120000:52.640000,-1.120000:52.640000,-1.140000',
       );
       expect(form.get('date')).toBe('2026-07');
-      expect(h.upstream.count('/locate-neighbourhood')).toBe(0);
+      // The bounding-box centre, then the N, S and E vertices; the W vertex repeats S.
+      expect(
+        h.upstream
+          .callsTo('/locate-neighbourhood')
+          .map((c) => c.query.get('q'))
+          .sort(),
+      ).toEqual(
+        [
+          '52.635000,-1.130000',
+          '52.640000,-1.120000',
+          '52.630000,-1.140000',
+          '52.630000,-1.120000',
+        ].sort(),
+      );
     });
 
     it('reads poly as polygon and accepts the string form', async () => {
       h.upstream.route('POST', '/stops-street', jsonOk([]));
+      h.upstream.route('GET', '/locate-neighbourhood', jsonOk(locateBody()));
       const out = data(
         await callRaw({
           area: 'polygon',
@@ -261,12 +287,19 @@ describe('ukcrime_search_stops', () => {
   });
 
   describe('area location', () => {
-    it('reads /stops-at-location and has no force to check publication for', async () => {
+    it('reads /stops-at-location and checks publication for the force its map point locates in', async () => {
       h.upstream.route('GET', '/stops-at-location', jsonOk(stopsBody()));
+      h.upstream.route('GET', '/locate-neighbourhood', jsonOk(locateBody()));
       const out = data(await call({ area: 'location', location_id: '1000001', month: '2026-07' }));
-      expect(out.area).toEqual({ type: 'location', location_id: '1000001' });
+      expect(out.area).toEqual({
+        type: 'location',
+        location_id: '1000001',
+        located_force: 'leicestershire',
+        located_neighbourhood: 'NX01',
+      });
       expect(out.total).toBe(6);
-      expect(out).not.toHaveProperty('force_published');
+      expect(out.force_published).toBe(true);
+      expect(h.upstream.count('/locate-neighbourhood')).toBe(1);
       expect(Object.fromEntries(h.upstream.callsTo('/stops-at-location')[0]?.query ?? [])).toEqual({
         location_id: '1000001',
         date: '2026-07',
@@ -338,6 +371,41 @@ describe('ukcrime_search_stops', () => {
       expect(error.message).toBe("No police force 'atlantis'.");
       expect(h.upstream.count('/atlantis/NX01/boundary')).toBe(0);
     });
+
+    it('takes a display name, reading the boundary and checking publication by the matched id', async () => {
+      h.upstream.route('GET', '/leicestershire/NX01/boundary', jsonOk(boundaryBody()));
+      h.upstream.route('POST', '/stops-street', jsonOk(stopsBody()));
+      const result = await call({ ...NEIGHBOURHOOD, force: 'Leicestershire Constabulary' });
+      const out = data(result);
+      expect(out.area).toEqual({
+        type: 'neighbourhood',
+        force: 'leicestershire',
+        neighbourhood_id: 'NX01',
+        vertex_count: 5,
+      });
+      expect(out.force_published).toBe(true);
+      expect(text(result)).toContain('force leicestershire · neighbourhood_id NX01');
+      expect(
+        h.upstream.calls.filter((c) => c.path.endsWith('/boundary')).map((c) => c.path),
+      ).toEqual(['/leicestershire/NX01/boundary']);
+    });
+
+    it('names the matched id when a display name finds no such neighbourhood', async () => {
+      h.upstream.route('GET', '/leicestershire/zz99/boundary', plainNotFound);
+      const error = errorOf(
+        await call({ ...NEIGHBOURHOOD, force: 'Leicestershire Police', neighbourhood_id: 'zz99' }),
+      );
+      expect(error.data.reason).toBe('unknown_neighbourhood');
+      expect(error.message).toBe(
+        "Force 'leicestershire' has no neighbourhood 'zz99'; ids are case-sensitive.",
+      );
+    });
+
+    it('refuses British Transport Police with the no-neighbourhoods message', async () => {
+      const error = errorOf(await call({ ...NEIGHBOURHOOD, force: 'British Transport Police' }));
+      expect(error.data.reason).toBe('unknown_force');
+      expect(error.message).toBe('British Transport Police has no neighbourhoods.');
+    });
   });
 
   describe('area force', () => {
@@ -369,6 +437,31 @@ describe('ukcrime_search_stops', () => {
       expect(error.code).toBe(JsonRpcErrorCode.ValidationError);
       expect(error.data.reason).toBe('unknown_force');
       expect(h.upstream.count('/stops-force')).toBe(0);
+    });
+
+    it.each([
+      ['British Transport Police', 'btp'],
+      ['Metropolitan Police', 'metropolitan'],
+      ['Dyfed-Powys Police', 'dyfed-powys'],
+    ])(
+      'takes the display name %j, sending force=%s and echoing it on both surfaces',
+      async (name, id) => {
+        forceRoute();
+        const result = await call({ area: 'force', force: name, month: '2026-07' });
+        expect(data(result).area).toEqual({ type: 'force', force: id });
+        expect(text(result)).toContain(`**Area:** force · force ${id}`);
+        expect(Object.fromEntries(h.upstream.callsTo('/stops-force')[0]?.query ?? [])).toEqual({
+          force: id,
+          date: '2026-07',
+        });
+      },
+    );
+
+    it('names a display-named force that did not publish by its matched id and listed name', async () => {
+      forceRoute([]);
+      const out = data(await call({ area: 'force', force: 'Devon & Cornwall Police' }));
+      expect(out.force_published).toBe(false);
+      expect(out.notice).toContain(notPublished('Devon & Cornwall Police', 'devon-and-cornwall'));
     });
 
     it('does not offer the unplaced-crimes arm', async () => {
@@ -565,7 +658,445 @@ describe('ukcrime_search_stops', () => {
     });
   });
 
+  describe('the find and strip-search flags', () => {
+    const LINKED = 'outcome_linked_to_object_of_search';
+    const REMOVAL = 'removal_of_more_than_outer_clothing';
+    /**
+     * Six stops covering each flag's three states, shaped like live rows: a
+     * vehicle-only search with a null removal flag (as some forces send), a
+     * null find flag, two searches that removed more than outer clothing, one
+     * of them unplaced. Found: true 3, false 2, null 1. Removal: false 3,
+     * true 2, null 1.
+     */
+    const flagStops = () => [
+      stopRecord({
+        datetime: '2026-08-01T10:00:00+00:00',
+        officer_defined_ethnicity: 'White',
+        age_range: '10-17',
+        outcome_linked_to_object_of_search: true,
+        removal_of_more_than_outer_clothing: false,
+      }),
+      stopRecord({
+        datetime: '2026-08-02T10:00:00+00:00',
+        officer_defined_ethnicity: 'Black',
+        outcome_linked_to_object_of_search: false,
+        removal_of_more_than_outer_clothing: true,
+      }),
+      stopRecord({
+        datetime: '2026-08-03T10:00:00+00:00',
+        officer_defined_ethnicity: 'Black',
+        age_range: '10-17',
+        outcome_linked_to_object_of_search: true,
+        removal_of_more_than_outer_clothing: true,
+        location: null,
+      }),
+      stopRecord({
+        datetime: '2026-08-04T10:00:00+00:00',
+        type: 'Vehicle search',
+        involved_person: false,
+        officer_defined_ethnicity: 'White',
+        outcome_linked_to_object_of_search: false,
+        removal_of_more_than_outer_clothing: null,
+      }),
+      stopRecord({
+        datetime: '2026-08-05T10:00:00+00:00',
+        type: 'Person and Vehicle search',
+        officer_defined_ethnicity: 'White',
+        outcome_linked_to_object_of_search: null,
+        removal_of_more_than_outer_clothing: false,
+      }),
+      stopRecord({
+        datetime: '2026-08-06T10:00:00+00:00',
+        officer_defined_ethnicity: 'Asian',
+        outcome_linked_to_object_of_search: true,
+        removal_of_more_than_outer_clothing: false,
+      }),
+    ];
+    const flagged = (filters: unknown, extra: Record<string, unknown> = {}) =>
+      callRaw({ ...FORCE, month: '2026-07', filters, ...extra });
+
+    it('breaks both flags down over every stop, a null flag under (not recorded)', async () => {
+      forceRoute(flagStops());
+      const out = data(await flagged([]));
+      expect(out.by_outcome_linked_to_object_of_search).toEqual([
+        { value: 'true', count: 3 },
+        { value: 'false', count: 2 },
+        { value: '(not recorded)', count: 1 },
+      ]);
+      expect(out.by_removal_of_more_than_outer_clothing).toEqual([
+        { value: 'false', count: 3 },
+        { value: 'true', count: 2 },
+        { value: '(not recorded)', count: 1 },
+      ]);
+      // The stop itself keeps the flag absent, as before.
+      expect(out.stops[3]).not.toHaveProperty(REMOVAL);
+      expect(out.stops[4]).not.toHaveProperty(LINKED);
+    });
+
+    it('describes (not recorded) in the removal breakdown as no value sent, not a value forces send', () => {
+      expect(searchStopsTool.output.shape.by_removal_of_more_than_outer_clothing.description).toBe(
+        "Matched stops by whether more than outer clothing was removed ('true', 'false' or '(not recorded)' where the force sent no value, as some do for vehicle-only searches), most first.",
+      );
+    });
+
+    it.each<[string, string | boolean, number, string]>([
+      [LINKED, 'true', 3, 'true'],
+      [LINKED, 'TRUE', 3, 'TRUE'],
+      [LINKED, '  true  ', 3, 'true'],
+      [LINKED, true, 3, 'true'],
+      [LINKED, 'false', 2, 'false'],
+      [LINKED, false, 2, 'false'],
+      [LINKED, '(not recorded)', 1, '(not recorded)'],
+      [LINKED, '(NOT RECORDED)', 1, '(NOT RECORDED)'],
+      [REMOVAL, 'true', 2, 'true'],
+      [REMOVAL, 'True', 2, 'True'],
+      [REMOVAL, true, 2, 'true'],
+      [REMOVAL, 'false', 3, 'false'],
+      [REMOVAL, 'FALSE', 3, 'FALSE'],
+      [REMOVAL, false, 3, 'false'],
+      [REMOVAL, '(not recorded)', 1, '(not recorded)'],
+    ])('filters %s = %j → %i stops, echoing %j', async (field, value, count, echoed) => {
+      forceRoute(flagStops());
+      const result = await flagged([{ field, value }]);
+      const out = data(result);
+      expect(out.total).toBe(count);
+      expect(out.filters).toEqual([{ field, value: echoed }]);
+      expect(out.stops).toHaveLength(count);
+      expect(text(result)).toContain(`**Filters:** ${field} = "${echoed}"`);
+      expect(text(result)).toContain(`**Stops matched:** ${count} of 6`);
+    });
+
+    it('a filter on the find flag narrows total, unplaced, every breakdown and the page', async () => {
+      forceRoute(flagStops());
+      const out = data(await flagged([{ field: LINKED, value: true }]));
+      expect(out.total).toBe(3);
+      expect(out.unfiltered_total).toBe(6);
+      expect(out.unplaced).toBe(1);
+      expect(out.by_outcome_linked_to_object_of_search).toEqual([{ value: 'true', count: 3 }]);
+      expect(out.by_removal_of_more_than_outer_clothing).toEqual([
+        { value: 'false', count: 2 },
+        { value: 'true', count: 1 },
+      ]);
+      expect(out.by_type).toEqual([{ value: 'Person search', count: 3 }]);
+      expect(out.by_officer_defined_ethnicity).toEqual([
+        { value: 'Asian', count: 1 },
+        { value: 'Black', count: 1 },
+        { value: 'White', count: 1 },
+      ]);
+      expect(out.by_age_range).toEqual([
+        { value: '10-17', count: 2 },
+        { value: '25-34', count: 1 },
+      ]);
+      for (const key of [
+        'by_self_defined_ethnicity',
+        'by_outcome',
+        'by_object_of_search',
+        'by_legislation',
+        'by_gender',
+      ] as const) {
+        expect(
+          out[key].reduce((sum, row) => sum + row.count, 0),
+          key,
+        ).toBe(3);
+      }
+      expect(out.stops.map((stop) => stop.datetime)).toEqual([
+        '2026-08-01T10:00:00+00:00',
+        '2026-08-03T10:00:00+00:00',
+        '2026-08-06T10:00:00+00:00',
+      ]);
+      expect(out.stops.every((stop) => stop.outcome_linked_to_object_of_search === true)).toBe(
+        true,
+      );
+      // The one unplaced stop has the find flag true, so `false` must leave it out.
+      const other = data(await flagged([{ field: LINKED, value: false }]));
+      expect(other.total).toBe(2);
+      expect(other.unplaced).toBe(0);
+    });
+
+    it('a filter on the removal flag narrows total, unplaced, every breakdown and the page', async () => {
+      forceRoute(flagStops());
+      const out = data(await flagged([{ field: REMOVAL, value: 'true' }]));
+      expect(out.total).toBe(2);
+      expect(out.unplaced).toBe(1);
+      // The one unplaced stop removed more than outer clothing, so `false` must leave it out.
+      expect(data(await flagged([{ field: REMOVAL, value: 'false' }])).unplaced).toBe(0);
+      expect(out.by_removal_of_more_than_outer_clothing).toEqual([{ value: 'true', count: 2 }]);
+      expect(out.by_outcome_linked_to_object_of_search).toEqual([
+        { value: 'false', count: 1 },
+        { value: 'true', count: 1 },
+      ]);
+      expect(out.by_officer_defined_ethnicity).toEqual([{ value: 'Black', count: 2 }]);
+      expect(out.by_type).toEqual([{ value: 'Person search', count: 2 }]);
+      expect(out.stops.map((stop) => stop.datetime)).toEqual([
+        '2026-08-02T10:00:00+00:00',
+        '2026-08-03T10:00:00+00:00',
+      ]);
+    });
+
+    it.each<
+      [string, Array<{ value: string; count: number }>, Array<{ value: string; count: number }>]
+    >([
+      [
+        'White',
+        [
+          { value: '(not recorded)', count: 1 },
+          { value: 'false', count: 1 },
+          { value: 'true', count: 1 },
+        ],
+        [
+          { value: 'false', count: 2 },
+          { value: '(not recorded)', count: 1 },
+        ],
+      ],
+      [
+        'black',
+        [
+          { value: 'false', count: 1 },
+          { value: 'true', count: 1 },
+        ],
+        [{ value: 'true', count: 2 }],
+      ],
+    ])(
+      'cross-tab: officer-defined ethnicity %s narrows both flag breakdowns',
+      async (ethnicity, linked, removal) => {
+        forceRoute(flagStops());
+        const result = await flagged([{ field: 'officer_defined_ethnicity', value: ethnicity }]);
+        const out = data(result);
+        expect(out.by_outcome_linked_to_object_of_search).toEqual(linked);
+        expect(out.by_removal_of_more_than_outer_clothing).toEqual(removal);
+        const rendered = text(result);
+        for (const row of linked) expect(rendered).toContain(`| ${row.value} | ${row.count} |`);
+      },
+    );
+
+    it('ANDs a flag with another field: strip searches of 10–17 year olds', async () => {
+      forceRoute(flagStops());
+      const out = data(
+        await flagged([
+          { field: 'age_range', value: '10-17' },
+          { field: REMOVAL, value: 'true' },
+        ]),
+      );
+      expect(out.total).toBe(1);
+      expect(out.stops[0]?.datetime).toBe('2026-08-03T10:00:00+00:00');
+    });
+
+    it.each<[string, string]>([
+      [LINKED, '"true", "false", "(not recorded)"'],
+      [REMOVAL, '"false", "true", "(not recorded)"'],
+    ])(
+      'a %s value no stop carries matches nothing, and the notice lists the values present',
+      async (field, present) => {
+        forceRoute(flagStops());
+        const out = data(await flagged([{ field, value: 'yes' }]));
+        expect(out.total).toBe(0);
+        expect(out.unfiltered_total).toBe(6);
+        expect(out.by_outcome_linked_to_object_of_search).toEqual([]);
+        expect(out.by_removal_of_more_than_outer_clothing).toEqual([]);
+        expect(out.notice).toBe(
+          `No stops matched the filters; values present for ${field}: ${present}.`,
+        );
+      },
+    );
+
+    it('lists only the values present: a force with no null flag lists "true", "false"', async () => {
+      forceRoute([stopRecord(), stopRecord({ outcome_linked_to_object_of_search: false })]);
+      const out = data(await flagged([{ field: LINKED, value: '(not recorded)' }]));
+      expect(out.total).toBe(0);
+      expect(out.notice).toBe(
+        `No stops matched the filters; values present for ${LINKED}: "false", "true".`,
+      );
+    });
+
+    it.each<[string, boolean, string]>([
+      ['gender', true, '"Male"'],
+      ['type', false, '"Person search", "Person and Vehicle search", "Vehicle search"'],
+    ])(
+      'a JSON boolean on %s reads as its string and matches nothing instead of failing validation',
+      async (field, value, present) => {
+        forceRoute(flagStops());
+        const out = data(await flagged([{ field, value }]));
+        expect(out.total).toBe(0);
+        expect(out.filters).toEqual([{ field, value: String(value) }]);
+        expect(out.notice).toBe(
+          `No stops matched the filters; values present for ${field}: ${present}.`,
+        );
+      },
+    );
+
+    it('pages a flag-filtered set past the first page, with breakdowns over the whole filtered set', async () => {
+      forceRoute(
+        Array.from({ length: 30 }, (_, i) =>
+          stopRecord({
+            datetime: `2026-08-${String(i + 1).padStart(2, '0')}T10:00:00+00:00`,
+            outcome_linked_to_object_of_search: i % 2 === 0,
+          }),
+        ),
+      );
+      const seen: string[] = [];
+      const notices: (string | undefined)[] = [];
+      let offset: number | undefined = 0;
+      while (offset !== undefined) {
+        const out: Output = data(
+          await flagged([{ field: LINKED, value: false }], { limit: 4, offset }),
+        );
+        expect(out.total).toBe(15);
+        expect(out.by_outcome_linked_to_object_of_search).toEqual([{ value: 'false', count: 15 }]);
+        expect(out.stops.every((stop) => stop.outcome_linked_to_object_of_search === false)).toBe(
+          true,
+        );
+        seen.push(...out.stops.map((stop) => stop.datetime));
+        notices.push(out.notice);
+        offset = out.next_offset;
+      }
+      expect(seen).toEqual(
+        Array.from(
+          { length: 15 },
+          (_, i) => `2026-08-${String(2 * i + 2).padStart(2, '0')}T10:00:00+00:00`,
+        ),
+      );
+      expect(notices).toEqual([
+        'Showing 1–4 of 15; call again with offset 4 for more.',
+        'Showing 5–8 of 15; call again with offset 8 for more.',
+        'Showing 9–12 of 15; call again with offset 12 for more.',
+        undefined,
+      ]);
+      const past = data(await flagged([{ field: LINKED, value: false }], { offset: 15 }));
+      expect(past.stops).toEqual([]);
+      expect(past.notice).toBe(
+        'offset 15 is past the last of 15 stops; omit offset to start from the first.',
+      );
+      expect(h.upstream.count('/stops-force')).toBe(1);
+    });
+
+    it('keeps the 8-filter cap: eight filters across both flags are accepted, nine are not', async () => {
+      forceRoute(flagStops());
+      const eight = [
+        { field: LINKED, value: 'true' },
+        { field: LINKED, value: true },
+        { field: REMOVAL, value: 'false' },
+        { field: REMOVAL, value: false },
+        { field: 'type', value: 'Person search' },
+        { field: 'gender', value: 'male' },
+        { field: 'officer_defined_ethnicity', value: 'Asian' },
+        { field: 'age_range', value: '25-34' },
+      ];
+      const out = data(await flagged(eight));
+      expect(out.total).toBe(1);
+      expect(out.stops[0]?.datetime).toBe('2026-08-06T10:00:00+00:00');
+      const calls = h.upstream.calls.length;
+      const error = errorOf(await flagged([...eight, { field: REMOVAL, value: true }]));
+      expect(error.code).toBe(JsonRpcErrorCode.InvalidParams);
+      expect(error.data.reason).toBe('invalid_arguments');
+      expect(h.upstream.calls).toHaveLength(calls);
+    });
+
+    it('a flag filter over an area with no stops returns total 0 with the zero fragment', async () => {
+      forceRoute([]);
+      const out = data(await flagged([{ field: REMOVAL, value: true }]));
+      expect(out.total).toBe(0);
+      expect(out.by_removal_of_more_than_outer_clothing).toEqual([]);
+      expect(out.notice).toBe(ZERO_FORCE('2026-07'));
+    });
+
+    it('renders both flag tables in format(), after the existing eight, and keeps the per-stop yes/no wording', async () => {
+      forceRoute(flagStops());
+      const result = await flagged([]);
+      const rendered = text(result);
+      expect(rendered).toContain(
+        '### By outcome linked to object of search\n\n| Value | Count |\n|:--|--:|\n| true | 3 |\n| false | 2 |\n| (not recorded) | 1 |',
+      );
+      expect(rendered).toContain(
+        '### By more than outer clothing removed\n\n| Value | Count |\n|:--|--:|\n| false | 3 |\n| true | 2 |\n| (not recorded) | 1 |',
+      );
+      expect(rendered).toContain(
+        '- **2026-08-04T10:00:00+00:00** · Vehicle search · person involved: no · gender: Male · age: 25-34 · self-defined ethnicity: White - English/Welsh/Scottish/Northern Irish/British · officer-defined ethnicity: White · legislation: Misuse of Drugs Act 1971 (section 23) · object of search: Controlled drugs · outcome: A no further action disposal · outcome linked to object of search: no\n',
+      );
+      expect(rendered).toContain('more than outer clothing removed: yes');
+      const empty = text(await flagged([{ field: LINKED, value: 'none' }]));
+      expect(empty).toContain('### By outcome linked to object of search\n\n_None._');
+      expect(empty).toContain('### By more than outer clothing removed\n\n_None._');
+    });
+
+    describe('the advertised input schema against the handler: agreed but for three named cases', () => {
+      const advertised = searchStopsTool.input['~standard'].jsonSchema.input({
+        target: 'draft-2020-12',
+      });
+      const validate = new Ajv2020({ strict: true }).compile(advertised);
+
+      it('advertises filters[].value as a string of 1–200 characters or a boolean', () => {
+        const filters = (advertised as { properties: Record<string, unknown> }).properties
+          .filters as { items: { properties: { value: unknown } } };
+        expect(filters.items.properties.value).toMatchObject({
+          anyOf: [{ type: 'string', minLength: 1, maxLength: 200 }, { type: 'boolean' }],
+        });
+      });
+
+      it.each<[string, string, unknown, boolean, boolean]>([
+        ['a string flag value', LINKED, 'true', true, true],
+        ['an upper-case flag value', LINKED, 'TRUE', true, true],
+        ['a JSON true', LINKED, true, true, true],
+        ['a JSON false', REMOVAL, false, true, true],
+        ['(not recorded)', REMOVAL, '(not recorded)', true, true],
+        ['a value no stop carries', LINKED, 'yes', true, true],
+        ['a JSON boolean on a string field', 'gender', true, true, true],
+        ['200 characters', 'type', 'a'.repeat(200), true, true],
+        ['an empty string', LINKED, '', false, false],
+        ['201 characters', 'type', 'a'.repeat(201), false, false],
+        ['null', REMOVAL, null, false, false],
+        ['an object', LINKED, { value: true }, false, false],
+        ['an unknown field', 'involved_person', 'true', false, false],
+        // The strict divergence: trimmed before its length is checked, it is empty.
+        ['a whitespace-only string', LINKED, '   ', true, false],
+      ])(
+        '%s (%s = %j): schema accepts %s, handler accepts %s',
+        async (_name, field, value, schema, handler) => {
+          forceRoute(flagStops());
+          const input = { ...FORCE, month: '2026-07', filters: [{ field, value }] };
+          const result = await callRaw(input);
+          expect(result.isError ?? false, JSON.stringify(result.structuredContent)).toBe(!handler);
+          if (!handler) expect(errorOf(result).data.reason).toBe('invalid_arguments');
+          expect(validate(input), JSON.stringify(validate.errors)).toBe(schema);
+        },
+      );
+
+      it('diverges leniently for an integer (read as its digits) and a padded string over 200 (trimmed), and strictly only for a whitespace-only string (in the table above)', async () => {
+        forceRoute(flagStops());
+        const integer = { ...FORCE, month: '2026-07', filters: [{ field: LINKED, value: 1 }] };
+        expect(validate(integer)).toBe(false);
+        const out = data(await callRaw(integer));
+        expect(out.filters).toEqual([{ field: LINKED, value: '1' }]);
+        expect(out.total).toBe(0);
+        const padded = {
+          ...FORCE,
+          month: '2026-07',
+          filters: [{ field: 'type', value: ` ${'a'.repeat(200)} ` }],
+        };
+        expect(validate(padded)).toBe(false);
+        expect(data(await callRaw(padded)).filters).toEqual([
+          { field: 'type', value: 'a'.repeat(200) },
+        ]);
+      });
+    });
+  });
+
   describe('publication check (force_published)', () => {
+    it('tells the caller in its description what the result says about publication', () => {
+      expect(searchStopsTool.description).toMatch(
+        /Forces skip months and some publish none; the result names each force it finds for the area that did not publish, with the months it skipped\.$/,
+      );
+    });
+
+    it('describes force_published and located_forces by the forces found, not every force the area falls in', () => {
+      const shape = searchStopsTool.output.shape;
+      expect(shape.force_published.description).toBe(
+        "Whether every force found for the area (the one it names, or each located at a point, a polygon's centre and outermost vertices, or a location's map point) published stop and search this month, or in every month of a range: false when any month was missed. Otherwise absent when no force was found, when a month has no row in the publication list, or when none of those found is missing yet a polygon point could not be looked up.",
+      );
+      expect(shape.area.shape.located_forces.description).toBe(
+        "For 'polygon': forces its bounding-box centre and outermost vertices were located in, sorted; a point whose lookup failed adds none. Absent when none was located.",
+      );
+    });
+
     it('is true and silent for a located point whose force published', async () => {
       pointRoutes();
       const out = data(await call({ ...POINT, month: '2026-07' }));
@@ -674,7 +1205,7 @@ describe('ukcrime_search_stops', () => {
       expect(out.notice).toBeUndefined();
     });
 
-    it('leaves force_published out for a point whose locate failed or missed, and for polygon and location', async () => {
+    it('leaves force_published out for a point whose locate failed or missed, a polygon none of whose sample points located, and a location whose stops carry no map point', async () => {
       h.upstream.route('GET', '/stops-street', jsonOk(stopsBody()));
       h.upstream.route('GET', '/locate-neighbourhood', status(500));
       expect(data(await call({ ...POINT, month: '2026-07' }))).not.toHaveProperty(
@@ -685,16 +1216,304 @@ describe('ukcrime_search_stops', () => {
         'force_published',
       );
       h.upstream.route('POST', '/stops-street', jsonOk(stopsBody()));
+      const polygon = data(await call({ area: 'polygon', polygon: RING, month: '2026-07' }));
+      expect(polygon).not.toHaveProperty('force_published');
+      expect(polygon.area).not.toHaveProperty('located_forces');
+      h.upstream.route('GET', '/stops-at-location', jsonOk([sparseStopRecord()]));
       expect(
-        data(await call({ area: 'polygon', polygon: RING, month: '2026-07' })),
+        data(await call({ area: 'location', location_id: '1000001', month: '2026-07' })),
       ).not.toHaveProperty('force_published');
     });
 
     it('reports a non-publisher on the notice and counts a month with other forces’ stops as results', async () => {
       h.upstream.route('POST', '/stops-street', jsonOk(stopsBody()));
+      h.upstream.route(
+        'GET',
+        '/locate-neighbourhood',
+        jsonOk(locateBody({ force: 'metropolitan' })),
+      );
       const out = data(await call({ area: 'polygon', polygon: RING, month: '2026-07' }));
       expect(out.total).toBe(6);
+      expect(out.force_published).toBe(false);
+      expect(out.notice).toBe(
+        notPublished('Metropolitan Police Service', 'metropolitan', '2026-07'),
+      );
+    });
+  });
+
+  describe('forces located for a polygon or a location', () => {
+    /** 2026-07: Cheshire and Leicestershire published stop and search; Greater Manchester and the Metropolitan Police did not. */
+    const publishers = () =>
+      h.upstream.route(
+        'GET',
+        '/crimes-street-dates',
+        jsonOk(streetDatesBody({ stopSearch: ['cheshire', 'leicestershire', 'btp'] })),
+      );
+    const straddle = (north: string, south: string) =>
+      locateBy({
+        [STRADDLE_SAMPLES.centre]: south,
+        [STRADDLE_SAMPLES.north]: north,
+        [STRADDLE_SAMPLES.south]: south,
+        [STRADDLE_SAMPLES.east]: north,
+      });
+    const STRADDLE = { area: 'polygon', polygon: [...STRADDLE_RING], month: '2026-07' } as const;
+
+    it('locates both forces of a straddling polygon: force_published false, and the non-publisher named', async () => {
+      publishers();
+      h.upstream.route('POST', '/stops-street', jsonOk(stopsBody()));
+      h.upstream.route('GET', '/locate-neighbourhood', straddle('greater-manchester', 'cheshire'));
+      const result = await call(STRADDLE);
+      const out = data(result);
+      expect(out.total).toBe(6);
+      expect(out.area).toEqual({
+        type: 'polygon',
+        vertex_count: 4,
+        located_forces: ['cheshire', 'greater-manchester'],
+      });
+      expect(out.force_published).toBe(false);
+      expect(out.notice).toBe(
+        notPublished('Greater Manchester Police', 'greater-manchester', '2026-07'),
+      );
+      expect(h.upstream.count('/locate-neighbourhood')).toBe(4);
+      const rendered = text(result);
+      expect(rendered).toContain(
+        '**Area:** polygon · 4 polygon vertices · located forces cheshire, greater-manchester',
+      );
+      expect(rendered).toContain(
+        '**Every force found for the area published stop and search this month:** no',
+      );
+      expect(rendered).toContain(`> ${out.notice}`);
+    });
+
+    it('is true and silent when every located force published', async () => {
+      publishers();
+      h.upstream.route('POST', '/stops-street', jsonOk(stopsBody()));
+      h.upstream.route('GET', '/locate-neighbourhood', straddle('leicestershire', 'cheshire'));
+      const out = data(await call(STRADDLE));
+      expect(out.force_published).toBe(true);
       expect(out.notice).toBeUndefined();
+    });
+
+    it('names each non-publisher in force-id order, reading the force list once', async () => {
+      publishers();
+      h.upstream.route('POST', '/stops-street', jsonOk(stopsBody()));
+      h.upstream.route(
+        'GET',
+        '/locate-neighbourhood',
+        straddle('metropolitan', 'greater-manchester'),
+      );
+      const out = data(await call(STRADDLE));
+      expect(out.force_published).toBe(false);
+      expect(out.notice).toBe(
+        [
+          notPublished('Greater Manchester Police', 'greater-manchester', '2026-07'),
+          notPublished('Metropolitan Police Service', 'metropolitan', '2026-07'),
+        ].join(' '),
+      );
+      expect(h.upstream.count('/forces')).toBe(1);
+    });
+
+    it('names located non-publishers by id when the force list read fails', async () => {
+      publishers();
+      h.upstream.route('GET', '/forces', status(500));
+      h.upstream.route('POST', '/stops-street', jsonOk(stopsBody()));
+      h.upstream.route(
+        'GET',
+        '/locate-neighbourhood',
+        straddle('metropolitan', 'greater-manchester'),
+      );
+      const out = data(await call(STRADDLE));
+      expect(out.total).toBe(6);
+      expect(out.notice).toBe(
+        [
+          notPublished('greater-manchester', 'greater-manchester', '2026-07'),
+          notPublished('metropolitan', 'metropolitan', '2026-07'),
+        ].join(' '),
+      );
+    });
+
+    it('keeps the generic zero-hit line when a located force did publish', async () => {
+      publishers();
+      h.upstream.route('POST', '/stops-street', jsonOk([]));
+      h.upstream.route('GET', '/locate-neighbourhood', straddle('greater-manchester', 'cheshire'));
+      const out = data(await call(STRADDLE));
+      expect(out.notice).toBe(
+        [
+          notPublished('Greater Manchester Police', 'greater-manchester', '2026-07'),
+          ZERO_HERE('2026-07'),
+        ].join(' '),
+      );
+    });
+
+    it('lets the not-published fragments alone explain a zero when no located force published', async () => {
+      publishers();
+      h.upstream.route('POST', '/stops-street', jsonOk([]));
+      h.upstream.route(
+        'GET',
+        '/locate-neighbourhood',
+        straddle('metropolitan', 'greater-manchester'),
+      );
+      const out = data(await call(STRADDLE));
+      expect(out.notice).toBe(
+        [
+          notPublished('Greater Manchester Police', 'greater-manchester', '2026-07'),
+          notPublished('Metropolitan Police Service', 'metropolitan', '2026-07'),
+        ].join(' '),
+      );
+    });
+
+    describe('a straddle some of whose sample lookups failed', () => {
+      const PARTIAL =
+        "The force at 2 of this polygon's 4 sample points could not be looked up, so the forces named here may not be all it falls in; search again to retry the lookup.";
+      /** The straddle with one side's two samples failing (500) while `failing()` holds, then answering. */
+      const partialStraddle = (
+        answered: { force: string; side: 'north' | 'south' },
+        missed: { force: string; failing?: () => boolean },
+      ) => {
+        const failingOrFound: Responder = (request) =>
+          (missed.failing?.() ?? true)
+            ? status(500)(request)
+            : jsonOk(locateBody({ force: missed.force }))(request);
+        const north = answered.side === 'north' ? answered.force : failingOrFound;
+        const south = answered.side === 'south' ? answered.force : failingOrFound;
+        return locateBy({
+          [STRADDLE_SAMPLES.centre]: south,
+          [STRADDLE_SAMPLES.north]: north,
+          [STRADDLE_SAMPLES.south]: south,
+          [STRADDLE_SAMPLES.east]: north,
+        });
+      };
+
+      it('withholds force_published when every force found published, and says the lookups were partial, on both surfaces', async () => {
+        publishers();
+        h.upstream.route('POST', '/stops-street', jsonOk(stopsBody()));
+        h.upstream.route(
+          'GET',
+          '/locate-neighbourhood',
+          partialStraddle({ force: 'cheshire', side: 'south' }, { force: 'greater-manchester' }),
+        );
+        const result = await call(STRADDLE);
+        const out = data(result);
+        expect(out.total).toBe(6);
+        expect(out.area.located_forces).toEqual(['cheshire']);
+        expect(out).not.toHaveProperty('force_published');
+        expect(out.notice).toBe(PARTIAL);
+        const rendered = text(result);
+        expect(rendered).not.toContain('published stop and search this month');
+        expect(rendered).toContain(`> ${PARTIAL}`);
+      });
+
+      it('still reports force_published false, naming the non-publisher found, beside the partial fragment', async () => {
+        publishers();
+        h.upstream.route('POST', '/stops-street', jsonOk(stopsBody()));
+        h.upstream.route(
+          'GET',
+          '/locate-neighbourhood',
+          partialStraddle({ force: 'greater-manchester', side: 'north' }, { force: 'cheshire' }),
+        );
+        const result = await call(STRADDLE);
+        const out = data(result);
+        expect(out.force_published).toBe(false);
+        expect(out.notice).toBe(
+          [
+            notPublished('Greater Manchester Police', 'greater-manchester', '2026-07'),
+            PARTIAL,
+          ].join(' '),
+        );
+        expect(text(result)).toContain('published stop and search this month:** no');
+      });
+
+      it('keeps the generic zero-hit line though no force found published, since a missed one may have', async () => {
+        publishers();
+        h.upstream.route('POST', '/stops-street', jsonOk([]));
+        h.upstream.route(
+          'GET',
+          '/locate-neighbourhood',
+          partialStraddle({ force: 'greater-manchester', side: 'north' }, { force: 'cheshire' }),
+        );
+        const out = data(await call(STRADDLE));
+        expect(out.notice).toBe(
+          [
+            notPublished('Greater Manchester Police', 'greater-manchester', '2026-07'),
+            PARTIAL,
+            ZERO_HERE('2026-07'),
+          ].join(' '),
+        );
+      });
+
+      it('never says true on one page and false on the next: page 2 re-sends only the failed lookups', async () => {
+        publishers();
+        h.upstream.route('POST', '/stops-street', jsonOk(stopsBody()));
+        let failing = true;
+        h.upstream.route(
+          'GET',
+          '/locate-neighbourhood',
+          partialStraddle(
+            { force: 'cheshire', side: 'south' },
+            { force: 'greater-manchester', failing: () => failing },
+          ),
+        );
+        const first = data(await call({ ...STRADDLE, limit: 3 }));
+        const sentFirst = h.upstream.count('/locate-neighbourhood');
+        failing = false;
+        const second = data(await call({ ...STRADDLE, limit: 3, offset: first.next_offset }));
+        expect(first).not.toHaveProperty('force_published');
+        expect(first.notice).toContain(PARTIAL);
+        expect(second.force_published).toBe(false);
+        expect(second.area.located_forces).toEqual(['cheshire', 'greater-manchester']);
+        expect(second.notice).toContain(
+          notPublished('Greater Manchester Police', 'greater-manchester', '2026-07'),
+        );
+        expect(second.notice).not.toContain(PARTIAL);
+        // The two answered samples are cached; the two that failed are sent again.
+        expect(h.upstream.count('/locate-neighbourhood') - sentFirst).toBe(2);
+        expect(h.upstream.count('/stops-street')).toBe(1);
+      });
+    });
+
+    it('leaves force_published out when no sample point was located', async () => {
+      publishers();
+      h.upstream.route('POST', '/stops-street', jsonOk(stopsBody()));
+      h.upstream.route('GET', '/locate-neighbourhood', status(500));
+      const out = data(await call(STRADDLE));
+      expect(out).not.toHaveProperty('force_published');
+      expect(out.area).toEqual({ type: 'polygon', vertex_count: 4 });
+      expect(out.notice).toBeUndefined();
+    });
+
+    it('locates a location from its stops’ map point and checks that force’s publication', async () => {
+      publishers();
+      h.upstream.route('GET', '/stops-at-location', jsonOk([stopRecord()]));
+      h.upstream.route(
+        'GET',
+        '/locate-neighbourhood',
+        locateBy({ '52.630000,-1.130000': 'metropolitan' }),
+      );
+      const result = await call({ area: 'location', location_id: '1000001', month: '2026-07' });
+      const out = data(result);
+      expect(out.area).toEqual({
+        type: 'location',
+        location_id: '1000001',
+        located_force: 'metropolitan',
+        located_neighbourhood: 'NX01',
+      });
+      expect(out.force_published).toBe(false);
+      expect(out.notice).toBe(
+        notPublished('Metropolitan Police Service', 'metropolitan', '2026-07'),
+      );
+      expect(text(result)).toContain('located force metropolitan');
+    });
+
+    it('locates a location from the first stop that carries a map point', async () => {
+      h.upstream.route('GET', '/stops-at-location', jsonOk(stopsBody()));
+      h.upstream.route(
+        'GET',
+        '/locate-neighbourhood',
+        locateBy({ '52.630000,-1.130000': 'leicestershire' }),
+      );
+      const out = data(await call({ area: 'location', location_id: '1000001', month: '2026-07' }));
+      expect(out.area.located_force).toBe('leicestershire');
+      expect(out.force_published).toBe(true);
     });
   });
 
@@ -849,9 +1668,10 @@ describe('ukcrime_search_stops', () => {
 
     it('polygon inside the box, nothing recorded', async () => {
       h.upstream.route('POST', '/stops-street', jsonOk([]));
-      expect(data(await call({ area: 'polygon', polygon: RING, month: '2026-07' })).notice).toBe(
-        ZERO_HERE('2026-07'),
-      );
+      h.upstream.route('GET', '/locate-neighbourhood', jsonOk(locateBody()));
+      const out = data(await call({ area: 'polygon', polygon: RING, month: '2026-07' }));
+      expect(out.area.located_forces).toEqual(['leicestershire']);
+      expect(out.notice).toBe(ZERO_HERE('2026-07'));
     });
 
     it('a force that did not publish: only the not-published fragment, not “no stops recorded”', async () => {
@@ -887,6 +1707,7 @@ describe('ukcrime_search_stops', () => {
 
     it('filters over a non-empty location result keep the filter fragment, not the location one', async () => {
       h.upstream.route('GET', '/stops-at-location', jsonOk(stopsBody()));
+      h.upstream.route('GET', '/locate-neighbourhood', jsonOk(locateBody()));
       const out = data(
         await callRaw({
           area: 'location',
@@ -1227,6 +2048,22 @@ describe('ukcrime_search_stops', () => {
       expect(log.calls.filter((c) => c.level === 'warning')).toHaveLength(1);
       expect(log.calls.some((c) => c.level === 'error')).toBe(false);
     });
+
+    it('logs one warning saying how it names the located forces when the force list read fails', async () => {
+      h.upstream.route('GET', '/forces', status(500));
+      h.upstream.route('GET', '/stops-street', jsonOk(stopsBody()));
+      h.upstream.route(
+        'GET',
+        '/locate-neighbourhood',
+        jsonOk(locateBody({ force: 'metropolitan' })),
+      );
+      const { ctx, output } = await run({ ...POINT, month: '2026-07' });
+      expect(output).toMatchObject({ total: 6 });
+      const log = ctx.log as MockContextLogger;
+      expect(log.calls.filter((c) => c.level === 'warning').map((c) => c.msg)).toEqual([
+        'Force list read failed; naming each located force by its id',
+      ]);
+    });
   });
 
   describe('upstream failures on the area query', () => {
@@ -1326,6 +2163,7 @@ describe('ukcrime_search_stops', () => {
 
     it('polygon: area_too_large with the declared recovery', async () => {
       h.upstream.route('POST', '/stops-street', overloaded);
+      h.upstream.route('GET', '/locate-neighbourhood', jsonOk(locateBody()));
       const error = errorOf(await call({ area: 'polygon', polygon: RING, month: '2026-07' }));
       expect(error.data.reason).toBe('area_too_large');
       expect(error.data.recovery?.hint).toBe(
@@ -1384,7 +2222,9 @@ describe('ukcrime_search_stops', () => {
       );
       expect(rendered).toContain('**Filters:** none');
       expect(rendered).toContain('**Stops matched:** 6 of 6 · **Without a location:** 2');
-      expect(rendered).toContain('**Force published stop and search for this month:** yes');
+      expect(rendered).toContain(
+        '**Every force found for the area published stop and search this month:** yes',
+      );
       for (const title of [
         'By search type',
         'By self-defined ethnicity',
@@ -1409,6 +2249,23 @@ describe('ukcrime_search_stops', () => {
       expect(rendered).toContain('### Stops on this page (6)');
       for (const stop of out.stops) expect(rendered).toContain(`**${stop.datetime}**`);
       expect(rendered).toContain(`> ${out.notice}`);
+    });
+
+    it('renders the breakdown sections in field order', async () => {
+      forceRoute();
+      const rendered = text(await call({ ...FORCE, month: '2026-07' }));
+      expect(rendered.split('\n').filter((line) => line.startsWith('### By '))).toEqual([
+        '### By search type',
+        '### By self-defined ethnicity',
+        '### By officer-defined ethnicity',
+        '### By outcome',
+        '### By object of search',
+        '### By legislation',
+        '### By age range',
+        '### By gender',
+        '### By outcome linked to object of search',
+        '### By more than outer clothing removed',
+      ]);
     });
 
     it('renders every stop field, booleans as yes and no', async () => {
@@ -1455,10 +2312,12 @@ describe('ukcrime_search_stops', () => {
       forceRoute();
       expect(
         text(await call({ area: 'force', force: 'metropolitan', month: '2026-07' })),
-      ).toContain('**Force published stop and search for this month:** no');
+      ).toContain('**Every force found for the area published stop and search this month:** no');
       h.upstream.route('POST', '/stops-street', jsonOk(stopsBody()));
+      // No sample point locates, so no force is known.
+      h.upstream.route('GET', '/locate-neighbourhood', status(500));
       expect(text(await call({ area: 'polygon', polygon: RING, month: '2026-07' }))).not.toContain(
-        'Force published',
+        'Every force found for the area published',
       );
     });
 
@@ -1537,12 +2396,14 @@ describe('ukcrime_search_stops', () => {
         by_legislation: [],
         by_age_range: [],
         by_gender: [],
+        by_outcome_linked_to_object_of_search: [],
+        by_removal_of_more_than_outer_clothing: [],
         stops: [],
       });
       const rendered =
         blocks?.map((block) => (block.type === 'text' ? block.text : '')).join('') ?? '';
       expect(rendered).toContain('**Stops matched:** 0 of 0');
-      expect(rendered).not.toContain('Force published');
+      expect(rendered).not.toContain('Every force found for the area published');
     });
   });
 

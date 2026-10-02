@@ -106,10 +106,19 @@ export function coverageNotes(force: string, aspects?: readonly KnownGapAspect[]
   ).map((gap) => `${gap.text} ${ATTRIBUTION}.`);
 }
 
-/** True when the table says the force publishes none of the aspect's data, so a zero count there needs no other explanation. */
-export function publishesNothing(force: string, aspect: KnownGapAspect): boolean {
-  return KNOWN_GAPS.some(
-    (gap) => gap.force === force && gap.aspect === aspect && gap.nothingPublished === true,
+/**
+ * True when the table says every one of `forces` publishes none of the aspect's
+ * data, so a zero count over them needs no explanation beyond their coverage
+ * notes. False for an empty list, and when any force publishes some.
+ */
+export function publishesNothing(forces: readonly string[], aspect: KnownGapAspect): boolean {
+  return (
+    forces.length > 0 &&
+    forces.every((force) =>
+      KNOWN_GAPS.some(
+        (gap) => gap.force === force && gap.aspect === aspect && gap.nothingPublished === true,
+      ),
+    )
   );
 }
 

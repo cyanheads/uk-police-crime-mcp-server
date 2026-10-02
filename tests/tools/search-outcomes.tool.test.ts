@@ -32,10 +32,13 @@ import {
   htmlOk,
   jsonOk,
   locateBody,
+  locateBy,
   outcomesBody,
   overloaded,
   plainNotFound,
   rateLimited,
+  STRADDLE_RING,
+  STRADDLE_SAMPLES,
   status,
   wireLocation,
 } from '../fixtures/police-api-upstream.js';
@@ -209,10 +212,15 @@ describe('ukcrime_search_outcomes', () => {
   });
 
   describe('area polygon', () => {
-    it('POSTs the ring as a six-decimal poly form body with the date, and echoes the vertex count', async () => {
+    it('POSTs the ring as a six-decimal poly form body with the date, and echoes the vertex count and located forces', async () => {
       h.upstream.route('POST', '/outcomes-at-location', jsonOk(outcomesBody()));
+      h.upstream.route('GET', '/locate-neighbourhood', jsonOk(locateBody()));
       const out = data(await call({ area: 'polygon', polygon: RING, month: '2026-07' }));
-      expect(out.area).toEqual({ type: 'polygon', vertex_count: 4 });
+      expect(out.area).toEqual({
+        type: 'polygon',
+        vertex_count: 4,
+        located_forces: ['leicestershire'],
+      });
       expect(out.total).toBe(3);
       const [sent] = h.upstream.callsTo('/outcomes-at-location');
       expect(sent?.method).toBe('POST');
@@ -222,11 +230,25 @@ describe('ukcrime_search_outcomes', () => {
       expect(form.get('poly')).toBe(
         '52.630000,-1.140000:52.630000,-1.120000:52.640000,-1.120000:52.640000,-1.140000',
       );
-      expect(h.upstream.count('/locate-neighbourhood')).toBe(0);
+      // The bounding-box centre, then the N, S and E vertices; the W vertex repeats S.
+      expect(
+        h.upstream
+          .callsTo('/locate-neighbourhood')
+          .map((c) => c.query.get('q'))
+          .sort(),
+      ).toEqual(
+        [
+          '52.635000,-1.130000',
+          '52.640000,-1.120000',
+          '52.630000,-1.140000',
+          '52.630000,-1.120000',
+        ].sort(),
+      );
     });
 
     it('accepts the string form and the poly alias', async () => {
       h.upstream.route('POST', '/outcomes-at-location', jsonOk(outcomesBody()));
+      h.upstream.route('GET', '/locate-neighbourhood', jsonOk(locateBody()));
       const out = data(
         await callRaw({
           area: 'polygon',
@@ -234,23 +256,33 @@ describe('ukcrime_search_outcomes', () => {
           date: '2026-07',
         }),
       );
-      expect(out.area).toEqual({ type: 'polygon', vertex_count: 3 });
+      expect(out.area).toEqual({
+        type: 'polygon',
+        vertex_count: 3,
+        located_forces: ['leicestershire'],
+      });
       expect(out.month).toBe('2026-07');
     });
   });
 
   describe('area location', () => {
-    it('GETs /outcomes-at-location by location_id and date, and echoes the id', async () => {
+    it('GETs /outcomes-at-location by location_id and date, and echoes the id and the located force', async () => {
       h.upstream.route('GET', '/outcomes-at-location', jsonOk(outcomesBody()));
+      h.upstream.route('GET', '/locate-neighbourhood', jsonOk(locateBody()));
       const out = data(await call({ area: 'location', location_id: '1000001', month: '2026-07' }));
-      expect(out.area).toEqual({ type: 'location', location_id: '1000001' });
+      expect(out.area).toEqual({
+        type: 'location',
+        location_id: '1000001',
+        located_force: 'leicestershire',
+        located_neighbourhood: 'NX01',
+      });
       expect(out.total).toBe(3);
       const [sent] = h.upstream.callsTo('/outcomes-at-location');
       expect(Object.fromEntries(sent?.query ?? [])).toEqual({
         location_id: '1000001',
         date: '2026-07',
       });
-      expect(h.upstream.count('/locate-neighbourhood')).toBe(0);
+      expect(h.upstream.count('/locate-neighbourhood')).toBe(1);
     });
 
     it('fails unknown_location (NotFound) when upstream answers 404 for the id, with the id in the message and a recovery hint', async () => {
@@ -343,6 +375,39 @@ describe('ukcrime_search_outcomes', () => {
       expect(error.data.reason).toBe('unknown_force');
       expect(error.message).toBe("No police force 'atlantis'.");
       expect(h.upstream.count('/outcomes-at-location')).toBe(0);
+    });
+
+    it('takes a display name, reading the boundary by the matched id and echoing that id on both surfaces', async () => {
+      hoodRoutes();
+      const result = await call({ ...HOOD, force: 'Leicestershire Police', month: '2026-07' });
+      expect(data(result).area).toEqual({
+        type: 'neighbourhood',
+        force: 'leicestershire',
+        neighbourhood_id: 'NX01',
+        vertex_count: 5,
+      });
+      expect(text(result)).toContain('force leicestershire · neighbourhood_id NX01');
+      expect(
+        h.upstream.calls.filter((c) => c.path.endsWith('/boundary')).map((c) => c.path),
+      ).toEqual(['/leicestershire/NX01/boundary']);
+      expect(h.upstream.count('/outcomes-at-location')).toBe(1);
+    });
+
+    it('names the matched id when a display name finds no such neighbourhood', async () => {
+      h.upstream.route('GET', '/leicestershire/nx01/boundary', plainNotFound);
+      const error = errorOf(
+        await call({ ...HOOD, force: 'LEICESTERSHIRE POLICE', neighbourhood_id: 'nx01' }),
+      );
+      expect(error.message).toBe(
+        "Force 'leicestershire' has no neighbourhood 'nx01'; ids are case-sensitive.",
+      );
+    });
+
+    it('refuses British Transport Police with the no-neighbourhoods message', async () => {
+      const error = errorOf(await call({ ...HOOD, force: 'British Transport Police' }));
+      expect(error.data.reason).toBe('unknown_force');
+      expect(error.message).toBe('British Transport Police has no neighbourhoods.');
+      expect(h.upstream.calls.some((c) => c.path.endsWith('/boundary'))).toBe(false);
     });
   });
 
@@ -714,7 +779,9 @@ describe('ukcrime_search_outcomes', () => {
 
     it('a polygon inside coverage with no hits gets the generic fragment', async () => {
       h.upstream.route('POST', '/outcomes-at-location', jsonOk([]));
+      h.upstream.route('GET', '/locate-neighbourhood', jsonOk(locateBody()));
       const out = data(await call({ area: 'polygon', polygon: RING, month: '2026-07' }));
+      expect(out.area.located_forces).toEqual(['leicestershire']);
       expect(out.notice).toBe(
         'No outcomes recorded here in 2026-07; try another month or a wider area.',
       );
@@ -759,11 +826,43 @@ describe('ukcrime_search_outcomes', () => {
     });
 
     it('orders month fragment, coverage fact, then the zero-hit fragment', async () => {
-      pointRoutes([], locateBody({ force: 'greater-manchester', neighbourhood: 'GM1' }));
+      pointRoutes([], locateBody({ force: 'devon-and-cornwall', neighbourhood: 'DC1' }));
       const out = data(await call({ ...POINT }));
       expect(out.notice).toBe(
-        [MONTH_NOTE, ...coverageNotes('greater-manchester', ['outcomes']), ZERO_GENERIC].join(' '),
+        [MONTH_NOTE, ...coverageNotes('devon-and-cornwall', ['outcomes']), ZERO_GENERIC].join(' '),
       );
+    });
+
+    it.each(['northern-ireland', 'greater-manchester'])(
+      'lets the coverage note alone explain a zero at a point in %s, which publishes no outcomes',
+      async (force) => {
+        pointRoutes([], locateBody({ force, neighbourhood: 'ZZ1' }));
+        const result = await call({ area: 'point', lat: 54.595, lng: -5.93 });
+        const out = data(result);
+        expect(out.total).toBe(0);
+        expect(out.notice).toBe([MONTH_NOTE, ...coverageNotes(force, ['outcomes'])].join(' '));
+        expect(text(result)).toContain(`> ${out.notice}`);
+      },
+    );
+
+    it('drops the generic fragment with a category too, when the force publishes no outcomes', async () => {
+      pointRoutes([], locateBody({ force: 'northern-ireland', neighbourhood: 'ZZ1' }));
+      const out = data(await call({ ...POINT, month: '2026-07', category: 'burglary' }));
+      expect(out.notice).toBe(coverageNotes('northern-ireland', ['outcomes']).join(' '));
+    });
+
+    it('does the same on the neighbourhood arm of a force that publishes no outcomes', async () => {
+      h.upstream.route('GET', '/greater-manchester/NX01/boundary', jsonOk(boundaryBody()));
+      h.upstream.route('POST', '/outcomes-at-location', jsonOk([]));
+      const out = data(
+        await call({
+          area: 'neighbourhood',
+          force: 'greater-manchester',
+          neighbourhood_id: 'NX01',
+          month: '2026-07',
+        }),
+      );
+      expect(out.notice).toBe(coverageNotes('greater-manchester', ['outcomes']).join(' '));
     });
 
     it('no zero-hit fragment when a point lookup failed (no coverage claim is possible)', async () => {
@@ -820,6 +919,193 @@ describe('ukcrime_search_outcomes', () => {
     });
   });
 
+  describe('forces located for a polygon or a location', () => {
+    /** Central Belfast, all inside the Police Service of Northern Ireland. */
+    const BELFAST_RING = [
+      { lat: 54.6, lng: -5.94 },
+      { lat: 54.6, lng: -5.92 },
+      { lat: 54.59, lng: -5.92 },
+      { lat: 54.59, lng: -5.94 },
+    ];
+    const BELFAST_SAMPLES = [
+      '54.595000,-5.930000',
+      '54.600000,-5.940000',
+      '54.590000,-5.920000',
+      '54.600000,-5.920000',
+    ];
+    const every = (samples: readonly string[], force: string) =>
+      Object.fromEntries(samples.map((q) => [q, force]));
+    const NI_NOTE = coverageNotes('northern-ireland', ['outcomes']);
+    const JULY_GENERIC = 'No outcomes recorded here in 2026-07; try another month or a wider area.';
+
+    it('locates a polygon and lets the coverage note alone explain a zero where no located force publishes outcomes', async () => {
+      h.upstream.route('POST', '/outcomes-at-location', jsonOk([]));
+      h.upstream.route(
+        'GET',
+        '/locate-neighbourhood',
+        locateBy(every(BELFAST_SAMPLES, 'northern-ireland')),
+      );
+      const result = await call({ area: 'polygon', polygon: BELFAST_RING, month: '2026-07' });
+      const out = data(result);
+      expect(out.total).toBe(0);
+      expect(out.area).toEqual({
+        type: 'polygon',
+        vertex_count: 4,
+        located_forces: ['northern-ireland'],
+      });
+      expect(out.notice).toBe(NI_NOTE.join(' '));
+      expect(h.upstream.count('/locate-neighbourhood')).toBe(4);
+      const rendered = text(result);
+      expect(rendered).toContain('located forces northern-ireland');
+      expect(rendered).toContain(`> ${out.notice}`);
+    });
+
+    it('notes each located force in force-id order and keeps the generic line for a mixed area', async () => {
+      h.upstream.route('POST', '/outcomes-at-location', jsonOk([]));
+      h.upstream.route(
+        'GET',
+        '/locate-neighbourhood',
+        locateBy({
+          [STRADDLE_SAMPLES.centre]: 'northern-ireland',
+          [STRADDLE_SAMPLES.north]: 'leicestershire',
+          [STRADDLE_SAMPLES.south]: 'devon-and-cornwall',
+          [STRADDLE_SAMPLES.east]: 'northern-ireland',
+        }),
+      );
+      const out = data(
+        await call({ area: 'polygon', polygon: [...STRADDLE_RING], month: '2026-07' }),
+      );
+      expect(out.area.located_forces).toEqual([
+        'devon-and-cornwall',
+        'leicestershire',
+        'northern-ireland',
+      ]);
+      expect(out.notice).toBe(
+        [...coverageNotes('devon-and-cornwall', ['outcomes']), ...NI_NOTE, JULY_GENERIC].join(' '),
+      );
+    });
+
+    it('drops the generic line when every located force publishes no outcomes, across two forces', async () => {
+      h.upstream.route('POST', '/outcomes-at-location', jsonOk([]));
+      h.upstream.route(
+        'GET',
+        '/locate-neighbourhood',
+        locateBy({
+          [STRADDLE_SAMPLES.centre]: 'northern-ireland',
+          [STRADDLE_SAMPLES.north]: 'greater-manchester',
+          [STRADDLE_SAMPLES.south]: 'northern-ireland',
+          [STRADDLE_SAMPLES.east]: 'greater-manchester',
+        }),
+      );
+      const out = data(
+        await call({ area: 'polygon', polygon: [...STRADDLE_RING], month: '2026-07' }),
+      );
+      expect(out.notice).toBe(
+        [...coverageNotes('greater-manchester', ['outcomes']), ...NI_NOTE].join(' '),
+      );
+    });
+
+    it('says a straddle’s lookups were partial and keeps the generic line when the publishing side failed, on both surfaces', async () => {
+      // Northern Ireland (no outcomes) answers on two samples; the other two fail.
+      h.upstream.route('POST', '/outcomes-at-location', jsonOk([]));
+      h.upstream.route(
+        'GET',
+        '/locate-neighbourhood',
+        locateBy({
+          [STRADDLE_SAMPLES.centre]: 'northern-ireland',
+          [STRADDLE_SAMPLES.north]: status(500),
+          [STRADDLE_SAMPLES.south]: 'northern-ireland',
+          [STRADDLE_SAMPLES.east]: status(500),
+        }),
+      );
+      const result = await call({ area: 'polygon', polygon: [...STRADDLE_RING], month: '2026-07' });
+      const out = data(result);
+      expect(out.total).toBe(0);
+      expect(out.area.located_forces).toEqual(['northern-ireland']);
+      expect(out.notice).toBe(
+        [
+          ...NI_NOTE,
+          "The force at 2 of this polygon's 4 sample points could not be looked up, so the forces named here may not be all it falls in; search again to retry the lookup.",
+          JULY_GENERIC,
+        ].join(' '),
+      );
+      expect(text(result)).toContain(`> ${out.notice}`);
+    });
+
+    it('adds the partial-locate fragment to a polygon with results too, where no zero line applies', async () => {
+      h.upstream.route('POST', '/outcomes-at-location', jsonOk(outcomesBody()));
+      h.upstream.route(
+        'GET',
+        '/locate-neighbourhood',
+        locateBy({
+          [STRADDLE_SAMPLES.centre]: 'leicestershire',
+          [STRADDLE_SAMPLES.north]: status(500),
+          [STRADDLE_SAMPLES.south]: 'leicestershire',
+          [STRADDLE_SAMPLES.east]: 'leicestershire',
+        }),
+      );
+      const out = data(
+        await call({ area: 'polygon', polygon: [...STRADDLE_RING], month: '2026-07' }),
+      );
+      expect(out.total).toBeGreaterThan(0);
+      expect(out.notice).toBe(
+        "The force at 1 of this polygon's 4 sample points could not be looked up, so the forces named here may not be all it falls in; search again to retry the lookup.",
+      );
+    });
+
+    it('reads a polygon whose every sample point answered 404 as outside coverage', async () => {
+      h.upstream.route('POST', '/outcomes-at-location', jsonOk([]));
+      h.upstream.route('GET', '/locate-neighbourhood', plainNotFound);
+      const out = data(
+        await call({
+          area: 'polygon',
+          polygon: [
+            { lat: 57.5, lng: -4.3 },
+            { lat: 57.5, lng: -4.1 },
+            { lat: 57.4, lng: -4.1 },
+          ],
+          month: '2026-07',
+        }),
+      );
+      expect(out.notice).toBe(
+        'This polygon lies outside data.police.uk coverage; each vertex is {lat, lng}, so check the two were not swapped.',
+      );
+    });
+
+    it('locates a location by the map point of its outcomes’ crimes, after the area answer', async () => {
+      h.upstream.route('GET', '/outcomes-at-location', jsonOk(outcomesBody()));
+      h.upstream.route(
+        'GET',
+        '/locate-neighbourhood',
+        locateBy({ '52.630000,-1.130000': 'devon-and-cornwall' }),
+      );
+      const result = await call({ area: 'location', location_id: '1000001', month: '2026-07' });
+      const out = data(result);
+      expect(out.area).toEqual({
+        type: 'location',
+        location_id: '1000001',
+        located_force: 'devon-and-cornwall',
+        located_neighbourhood: 'NX01',
+      });
+      expect(out.notice).toBe(coverageNotes('devon-and-cornwall', ['outcomes']).join(' '));
+      expect(h.upstream.calls.map((c) => c.path).indexOf('/locate-neighbourhood')).toBeGreaterThan(
+        h.upstream.calls.map((c) => c.path).indexOf('/outcomes-at-location'),
+      );
+    });
+
+    it('sends no locate for a location whose outcomes carry no map point', async () => {
+      h.upstream.route(
+        'GET',
+        '/outcomes-at-location',
+        jsonOk([areaOutcomeRecord({ crime: crimeRecord({ location: null }) })]),
+      );
+      const out = data(await call({ area: 'location', location_id: '1000001', month: '2026-07' }));
+      expect(out.total).toBe(1);
+      expect(out.area).toEqual({ type: 'location', location_id: '1000001' });
+      expect(h.upstream.count('/locate-neighbourhood')).toBe(0);
+    });
+  });
+
   describe('enrichment: the zero-result page and the under-cap page', () => {
     it('zero-result page: attribution, data_note, truncated false, shown 0, cap and the notice', async () => {
       pointRoutes([]);
@@ -864,6 +1150,7 @@ describe('ukcrime_search_outcomes', () => {
       h.upstream.route('POST', '/outcomes-at-location', jsonOk([]));
       h.upstream.route('GET', '/outcomes-at-location', jsonOk([]));
       h.upstream.route('GET', '/leicestershire/NX01/boundary', jsonOk(boundaryBody()));
+      h.upstream.route('GET', '/locate-neighbourhood', jsonOk(locateBody()));
       const inputs: Input[] = [
         { area: 'polygon', polygon: RING, month: '2026-07' },
         { area: 'location', location_id: '1000001', month: '2026-07' },
@@ -1066,6 +1353,7 @@ describe('ukcrime_search_outcomes', () => {
 
     it('treats a blank lat and lng on a polygon search as unset', async () => {
       h.upstream.route('POST', '/outcomes-at-location', jsonOk(outcomesBody()));
+      h.upstream.route('GET', '/locate-neighbourhood', jsonOk(locateBody()));
       const out = data(
         await callRaw({ area: 'polygon', polygon: RING, lat: '', lng: null, month: '' }),
       );
@@ -1319,7 +1607,10 @@ describe('ukcrime_search_outcomes', () => {
       [
         'polygon',
         { area: 'polygon', polygon: RING, month: '2026-07' },
-        () => h.upstream.route('POST', '/outcomes-at-location', overloaded),
+        () => {
+          h.upstream.route('POST', '/outcomes-at-location', overloaded);
+          h.upstream.route('GET', '/locate-neighbourhood', jsonOk(locateBody()));
+        },
       ],
       [
         'neighbourhood',

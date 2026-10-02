@@ -21,6 +21,7 @@ import type { z } from 'zod';
 import { searchCrimesTool } from '@/mcp-server/tools/definitions/search-crimes.tool.js';
 import { ATTRIBUTION } from '@/mcp-server/tools/shared-schemas.js';
 import { coverageNotes } from '@/services/police-api/known-gaps.js';
+import { initPoliceApiService } from '@/services/police-api/police-api-service.js';
 import {
   boundaryBody,
   crimeRecord,
@@ -31,10 +32,14 @@ import {
   jsonOk,
   lastUpdatedBody,
   locateBody,
+  locateBy,
   manyCrimes,
   overloaded,
   plainNotFound,
+  type Responder,
   rateLimited,
+  STRADDLE_RING,
+  STRADDLE_SAMPLES,
   sequence,
   sparseCrimeRecord,
   status,
@@ -232,17 +237,27 @@ describe('ukcrime_search_crimes', () => {
 
     it('reads poly as polygon', async () => {
       h.upstream.route('POST', '/crimes-street/all-crime', jsonOk(crimesBody()));
+      h.upstream.route('GET', '/locate-neighbourhood', jsonOk(locateBody()));
       const out = data(await callRaw({ area: 'polygon', poly: RING }));
-      expect(out.area).toEqual({ type: 'polygon', vertex_count: 4 });
+      expect(out.area).toEqual({
+        type: 'polygon',
+        vertex_count: 4,
+        located_forces: ['leicestershire'],
+      });
     });
   });
 
   describe('area polygon', () => {
-    it('POSTs the ring as a form (poly, date), 6 dp, and echoes the vertex count; no locate, no force notes', async () => {
+    it('POSTs the ring as a form (poly, date), 6 dp, and echoes the vertex count; locates its sample points, and a force with no table facts adds no notes', async () => {
       h.upstream.route('POST', '/crimes-street/all-crime', jsonOk(crimesBody()));
+      h.upstream.route('GET', '/locate-neighbourhood', jsonOk(locateBody()));
       const result = await call({ area: 'polygon', polygon: RING, month: '2026-07' });
       const out = data(result);
-      expect(out.area).toEqual({ type: 'polygon', vertex_count: 4 });
+      expect(out.area).toEqual({
+        type: 'polygon',
+        vertex_count: 4,
+        located_forces: ['leicestershire'],
+      });
       expect(out.total).toBe(7);
       expect(out.notice).toBeUndefined();
       const [request] = h.upstream.callsTo('/crimes-street/all-crime');
@@ -253,11 +268,25 @@ describe('ukcrime_search_crimes', () => {
         '52.630000,-1.140000:52.630000,-1.120000:52.640000,-1.120000:52.640000,-1.140000',
       );
       expect(form.get('date')).toBe('2026-07');
-      expect(h.upstream.count('/locate-neighbourhood')).toBe(0);
+      // The bounding-box centre, then the N, S and E vertices; the W vertex repeats S.
+      expect(
+        h.upstream
+          .callsTo('/locate-neighbourhood')
+          .map((c) => c.query.get('q'))
+          .sort(),
+      ).toEqual(
+        [
+          '52.635000,-1.130000',
+          '52.640000,-1.120000',
+          '52.630000,-1.140000',
+          '52.630000,-1.120000',
+        ].sort(),
+      );
     });
 
     it('accepts the string form lat,lng:lat,lng:…', async () => {
       h.upstream.route('POST', '/crimes-street/all-crime', jsonOk(crimesBody()));
+      h.upstream.route('GET', '/locate-neighbourhood', jsonOk(locateBody()));
       const out = data(
         await call({
           area: 'polygon',
@@ -265,11 +294,16 @@ describe('ukcrime_search_crimes', () => {
           month: '2026-07',
         }),
       );
-      expect(out.area).toEqual({ type: 'polygon', vertex_count: 3 });
+      expect(out.area).toEqual({
+        type: 'polygon',
+        vertex_count: 3,
+        located_forces: ['leicestershire'],
+      });
     });
 
     it('accepts a ring of exactly 2,500 vertices', async () => {
       h.upstream.route('POST', '/crimes-street/all-crime', jsonOk([]));
+      h.upstream.route('GET', '/locate-neighbourhood', jsonOk(locateBody()));
       const ring = Array.from({ length: 2500 }, (_, i) => ({
         lat: 52 + (i % 100) / 1000,
         lng: -1 + Math.floor(i / 100) / 1000,
@@ -282,18 +316,25 @@ describe('ukcrime_search_crimes', () => {
   describe('area location', () => {
     it('reads /crimes-at-location by location_id and month, returning every category when none is given', async () => {
       h.upstream.route('GET', '/crimes-at-location', jsonOk(crimesBody()));
+      h.upstream.route('GET', '/locate-neighbourhood', jsonOk(locateBody()));
       const out = data(await call({ area: 'location', location_id: '1000001', month: '2026-07' }));
-      expect(out.area).toEqual({ type: 'location', location_id: '1000001' });
+      expect(out.area).toEqual({
+        type: 'location',
+        location_id: '1000001',
+        located_force: 'leicestershire',
+        located_neighbourhood: 'NX01',
+      });
       expect(out.total).toBe(7);
       expect(out.category).toEqual({ slug: 'all-crime', name: 'All crime' });
       expect(Object.fromEntries(h.upstream.callsTo('/crimes-at-location')[0]?.query ?? [])).toEqual(
         { location_id: '1000001', date: '2026-07' },
       );
-      expect(h.upstream.count('/locate-neighbourhood')).toBe(0);
+      expect(h.upstream.count('/locate-neighbourhood')).toBe(1);
     });
 
     it('filters a narrowed category locally, because the route takes none', async () => {
       h.upstream.route('GET', '/crimes-at-location', jsonOk(crimesBody()));
+      h.upstream.route('GET', '/locate-neighbourhood', jsonOk(locateBody()));
       const out = data(
         await call({
           area: 'location',
@@ -361,6 +402,48 @@ describe('ukcrime_search_crimes', () => {
       );
       expect(error.data.recovery?.hint).toContain("topic 'neighbourhoods'");
       expect(h.upstream.count('/crimes-street/all-crime')).toBe(0);
+    });
+
+    it('takes a display name, reading the boundary by the matched id and echoing that id on both surfaces', async () => {
+      h.upstream.route('GET', '/devon-and-cornwall/NX01/boundary', jsonOk(boundaryBody()));
+      h.upstream.route('POST', '/crimes-street/all-crime', jsonOk(crimesBody()));
+      const result = await call({ ...NEIGHBOURHOOD, force: 'Devon & Cornwall Police' });
+      const out = data(result);
+      expect(out.area).toEqual({
+        type: 'neighbourhood',
+        force: 'devon-and-cornwall',
+        neighbourhood_id: 'NX01',
+        vertex_count: 5,
+      });
+      expect(
+        h.upstream.calls
+          .filter((c) => c.path !== '/crimes-street-dates' && c.path !== '/crime-categories')
+          .map((c) => `${c.method} ${c.path}`),
+      ).toEqual([
+        'GET /forces',
+        'GET /devon-and-cornwall/NX01/boundary',
+        'POST /crimes-street/all-crime',
+      ]);
+      expect(text(result)).toContain('force devon-and-cornwall · neighbourhood_id NX01');
+      expect(JSON.stringify(result)).not.toContain('cornwall-police');
+    });
+
+    it('names the matched id, not the display name sent, when the neighbourhood is unknown', async () => {
+      h.upstream.route('GET', '/metropolitan/zz99/boundary', plainNotFound);
+      const error = errorOf(
+        await call({ ...NEIGHBOURHOOD, force: 'Metropolitan Police', neighbourhood_id: 'zz99' }),
+      );
+      expect(error.data.reason).toBe('unknown_neighbourhood');
+      expect(error.message).toBe(
+        "Force 'metropolitan' has no neighbourhood 'zz99'; ids are case-sensitive.",
+      );
+    });
+
+    it('refuses British Transport Police here with the btp message, before reading a boundary', async () => {
+      const error = errorOf(await call({ ...NEIGHBOURHOOD, force: 'British Transport Police' }));
+      expect(error.data.reason).toBe('unknown_force');
+      expect(error.message).toBe('British Transport Police has no neighbourhoods.');
+      expect(h.upstream.calls.some((c) => c.path.endsWith('/boundary'))).toBe(false);
     });
 
     it('path-encodes an id with a space (a Northern Ireland neighbourhood)', async () => {
@@ -496,6 +579,51 @@ describe('ukcrime_search_crimes', () => {
       expect(error.code).toBe(JsonRpcErrorCode.ValidationError);
       expect(error.data.reason).toBe('unknown_force');
       expect(error.message).toBe("No police force 'atlantis'.");
+      expect(h.upstream.count('/crimes-no-location')).toBe(0);
+    });
+
+    it.each([
+      ['Leicestershire Police', 'leicestershire'],
+      ['Police Service of Northern Ireland', 'northern-ireland'],
+      ['British Transport Police', 'btp'],
+    ])(
+      'takes the display name %j, sending force=%s and echoing it on both surfaces',
+      async (name, id) => {
+        h.upstream.route('GET', '/crimes-no-location', jsonOk(unplacedCrimesBody()));
+        const result = await call({ ...UNPLACED, force: name });
+        expect(data(result).area).toEqual({ type: 'force_unplaced', force: id });
+        expect(text(result)).toContain(`**Area:** force_unplaced · force ${id}`);
+        expect(
+          Object.fromEntries(h.upstream.callsTo('/crimes-no-location')[0]?.query ?? []),
+        ).toEqual({ category: 'all-crime', force: id, date: '2026-07' });
+      },
+    );
+
+    it('fails unknown_force with the declared recovery for a name that matches no force', async () => {
+      const result = await call({ ...UNPLACED, force: 'Atlantis Police' });
+      const error = errorOf(result);
+      expect(error.data.reason).toBe('unknown_force');
+      expect(error.message).toBe("No police force 'atlantis-police'.");
+      expect(text(result)).toContain(
+        "Recovery: Call ukcrime_list_reference with topic 'forces' for valid force ids such as 'leicestershire'.",
+      );
+      expect(h.upstream.count('/crimes-no-location')).toBe(0);
+    });
+
+    it('fails unknown_force naming both forces when a name matches two, sending nothing', async () => {
+      h.upstream.route(
+        'GET',
+        '/forces',
+        jsonOk([
+          { id: 'northshire', name: 'Southshire Police' },
+          { id: 'southshire', name: 'Southshire Constabulary' },
+        ]),
+      );
+      const error = errorOf(await call({ ...UNPLACED, force: 'Southshire Police' }));
+      expect(error.data.reason).toBe('unknown_force');
+      expect(error.message).toBe(
+        "'southshire-police' matches more than one police force: 'northshire', 'southshire'; send one of their ids.",
+      );
       expect(h.upstream.count('/crimes-no-location')).toBe(0);
     });
 
@@ -860,7 +988,9 @@ describe('ukcrime_search_crimes', () => {
 
     it('polygon inside the box is generic', async () => {
       h.upstream.route('POST', '/crimes-street/all-crime', jsonOk([]));
+      h.upstream.route('GET', '/locate-neighbourhood', jsonOk(locateBody()));
       const out = data(await call({ area: 'polygon', polygon: RING, month: '2026-07' }));
+      expect(out.area.located_forces).toEqual(['leicestershire']);
       expect(out.notice).toBe(ZERO_GENERIC.replace('2026-08', '2026-07'));
     });
 
@@ -900,15 +1030,65 @@ describe('ukcrime_search_crimes', () => {
       h.upstream.route(
         'GET',
         '/locate-neighbourhood',
-        jsonOk(locateBody({ force: 'greater-manchester' })),
+        jsonOk(locateBody({ force: 'avon-and-somerset' })),
       );
       const out = data(await call({ ...POINT }));
-      expect(out.area.located_force).toBe('greater-manchester');
+      expect(out.area.located_force).toBe('avon-and-somerset');
       expect(out.notice).toBe(
         [
           MONTH_NOTE,
-          ...coverageNotes('greater-manchester', ['crime', 'locations', 'asb']),
+          ...coverageNotes('avon-and-somerset', ['crime', 'locations', 'asb']),
           ZERO_GENERIC,
+        ].join(' '),
+      );
+    });
+
+    it('lets the coverage note alone explain a zero at a point in a force that publishes no crime data', async () => {
+      h.upstream.route('GET', '/crimes-street/all-crime', jsonOk([]));
+      h.upstream.route(
+        'GET',
+        '/locate-neighbourhood',
+        jsonOk(locateBody({ force: 'greater-manchester' })),
+      );
+      const result = await call({ ...POINT });
+      const out = data(result);
+      expect(out.area.located_force).toBe('greater-manchester');
+      expect(out.notice).toBe(
+        [MONTH_NOTE, ...coverageNotes('greater-manchester', ['crime', 'locations', 'asb'])].join(
+          ' ',
+        ),
+      );
+      expect(text(result)).toContain(`> ${out.notice}`);
+    });
+
+    it('does the same on the neighbourhood arm of a force that publishes no crime data', async () => {
+      h.upstream.route('GET', '/greater-manchester/NX01/boundary', jsonOk(boundaryBody()));
+      h.upstream.route('POST', '/crimes-street/all-crime', jsonOk([]));
+      const out = data(
+        await call({
+          area: 'neighbourhood',
+          force: 'greater-manchester',
+          neighbourhood_id: 'NX01',
+          month: '2026-07',
+        }),
+      );
+      expect(out.notice).toBe(
+        coverageNotes('greater-manchester', ['crime', 'locations', 'asb']).join(' '),
+      );
+    });
+
+    it('keeps the narrowed-category fragment in a force that publishes no crime data', async () => {
+      h.upstream.route('GET', '/crimes-street/burglary', jsonOk([]));
+      h.upstream.route(
+        'GET',
+        '/locate-neighbourhood',
+        jsonOk(locateBody({ force: 'greater-manchester' })),
+      );
+      const out = data(await call({ ...POINT, category: 'burglary', month: '2026-07' }));
+      expect(out.notice).toBe(
+        [
+          ...coverageNotes('greater-manchester', ['crime', 'locations', 'asb']),
+          'Only Burglary was searched; omit category to search all crime.',
         ].join(' '),
       );
     });
@@ -967,6 +1147,7 @@ describe('ukcrime_search_crimes', () => {
       h.upstream.route('GET', '/crimes-at-location', jsonOk([]));
       h.upstream.route('GET', '/crimes-no-location', jsonOk([]));
       h.upstream.route('GET', '/leicestershire/NX01/boundary', jsonOk(boundaryBody()));
+      h.upstream.route('GET', '/locate-neighbourhood', jsonOk(locateBody()));
       const inputs: Input[] = [
         { area: 'polygon', polygon: RING, month: '2026-07' },
         { area: 'location', location_id: '1000001', month: '2026-07' },
@@ -991,6 +1172,7 @@ describe('ukcrime_search_crimes', () => {
 
     it('under-cap page on a narrowed category and a short page', async () => {
       h.upstream.route('GET', '/crimes-at-location', jsonOk(crimesBody()));
+      h.upstream.route('GET', '/locate-neighbourhood', jsonOk(locateBody()));
       const out = data(
         await call({
           area: 'location',
@@ -1194,6 +1376,7 @@ describe('ukcrime_search_crimes', () => {
 
     it('reads blank coordinates as unset on an arm that does not use them', async () => {
       h.upstream.route('GET', '/crimes-at-location', jsonOk(crimesBody()));
+      h.upstream.route('GET', '/locate-neighbourhood', jsonOk(locateBody()));
       const out = data(
         await callRaw({
           area: 'location',
@@ -1203,7 +1386,12 @@ describe('ukcrime_search_crimes', () => {
           month: '2026-07',
         }),
       );
-      expect(out.area).toEqual({ type: 'location', location_id: '1000001' });
+      expect(out.area).toEqual({
+        type: 'location',
+        location_id: '1000001',
+        located_force: 'leicestershire',
+        located_neighbourhood: 'NX01',
+      });
     });
 
     it('treats a blank required field as missing (invalid_area), not as a value', async () => {
@@ -1296,8 +1484,8 @@ describe('ukcrime_search_crimes', () => {
       ],
       [
         'force',
-        { area: 'force_unplaced', force: 'avon & somerset' },
-        "force: Expected a force id: lower-case words joined by hyphens, such as 'leicestershire' or 'devon-and-cornwall'.",
+        { area: 'force_unplaced', force: 'st. albans' },
+        "force: Expected a force id or name such as 'leicestershire' or 'Devon & Cornwall Police': letters, with words joined by spaces, hyphens, underscores or '&'.",
       ],
       [
         'location_id',
@@ -1504,7 +1692,10 @@ describe('ukcrime_search_crimes', () => {
         'polygon',
         { area: 'polygon', polygon: RING, month: '2026-07' },
         '/crimes-street/all-crime',
-        () => h.upstream.route('POST', '/crimes-street/all-crime', overloaded),
+        () => {
+          h.upstream.route('POST', '/crimes-street/all-crime', overloaded);
+          h.upstream.route('GET', '/locate-neighbourhood', jsonOk(locateBody()));
+        },
       ],
       [
         'neighbourhood',
@@ -1559,6 +1750,7 @@ describe('ukcrime_search_crimes', () => {
 
     it('polygon: area_too_large with the declared split-the-area recovery, not retried', async () => {
       h.upstream.route('POST', '/crimes-street/all-crime', oversized());
+      h.upstream.route('GET', '/locate-neighbourhood', jsonOk(locateBody()));
       const result = await call({ area: 'polygon', polygon: RING, month: '2026-07' });
       const error = errorOf(result);
       expect(error.code).toBe(JsonRpcErrorCode.ValidationError);
@@ -1615,6 +1807,295 @@ describe('ukcrime_search_crimes', () => {
       await call({ ...POINT, month: '2026-07' });
       await call({ ...POINT, month: '2026-06' });
       expect(h.upstream.count('/locate-neighbourhood')).toBe(1);
+    });
+  });
+
+  describe('forces located for a polygon or a location', () => {
+    /** Central Manchester, all inside Greater Manchester Police. */
+    const GMP_RING = [
+      { lat: 53.49, lng: -2.26 },
+      { lat: 53.49, lng: -2.22 },
+      { lat: 53.47, lng: -2.22 },
+      { lat: 53.47, lng: -2.26 },
+    ];
+    /** Its sample points: the bounding-box centre, then the N, S and E vertices (W repeats N). */
+    const GMP_SAMPLES = [
+      '53.480000,-2.240000',
+      '53.490000,-2.260000',
+      '53.470000,-2.220000',
+      '53.490000,-2.220000',
+    ];
+    const every = (samples: readonly string[], answer: string | Responder) =>
+      Object.fromEntries(samples.map((q) => [q, answer]));
+    const GMP_NOTES = coverageNotes('greater-manchester', ['crime', 'locations', 'asb']);
+    const NI_NOTES = coverageNotes('northern-ireland', ['crime', 'locations', 'asb']);
+    const ZERO_JULY = ZERO_GENERIC.replace('2026-08', '2026-07');
+
+    it('locates a polygon beside the area query and adds the located force’s coverage notes on both surfaces', async () => {
+      h.upstream.route('POST', '/crimes-street/all-crime', jsonOk(crimesBody()));
+      h.upstream.route(
+        'GET',
+        '/locate-neighbourhood',
+        locateBy(every(GMP_SAMPLES, 'greater-manchester')),
+      );
+      const result = await call({ area: 'polygon', polygon: GMP_RING, month: '2026-07' });
+      const out = data(result);
+      expect(out.total).toBe(7);
+      expect(out.area).toEqual({
+        type: 'polygon',
+        vertex_count: 4,
+        located_forces: ['greater-manchester'],
+      });
+      expect(out.notice).toBe(GMP_NOTES.join(' '));
+      const locates = h.upstream.callsTo('/locate-neighbourhood');
+      expect(locates.map((c) => c.query.get('q')).sort()).toEqual([...GMP_SAMPLES].sort());
+      const [area] = h.upstream.callsTo('/crimes-street/all-crime');
+      expect(locates.every((c) => c.at === area?.at)).toBe(true);
+      const rendered = text(result);
+      expect(rendered).toContain(
+        '**Area:** polygon · 4 polygon vertices · located forces greater-manchester',
+      );
+      expect(rendered).toContain(`> ${out.notice}`);
+    });
+
+    it('notes each located force of a straddling polygon in force-id order, and keeps the generic line for a mixed area', async () => {
+      h.upstream.route('POST', '/crimes-street/all-crime', jsonOk([]));
+      h.upstream.route(
+        'GET',
+        '/locate-neighbourhood',
+        locateBy({
+          [STRADDLE_SAMPLES.centre]: 'greater-manchester',
+          [STRADDLE_SAMPLES.north]: 'northern-ireland',
+          [STRADDLE_SAMPLES.south]: 'greater-manchester',
+          [STRADDLE_SAMPLES.east]: 'northern-ireland',
+        }),
+      );
+      const out = data(
+        await call({ area: 'polygon', polygon: [...STRADDLE_RING], month: '2026-07' }),
+      );
+      expect(out.area.located_forces).toEqual(['greater-manchester', 'northern-ireland']);
+      expect(out.notice).toBe([...GMP_NOTES, ...NI_NOTES, ZERO_JULY].join(' '));
+    });
+
+    it('drops the generic retry line for a polygon whose every located force publishes no crime data', async () => {
+      h.upstream.route('POST', '/crimes-street/all-crime', jsonOk([]));
+      h.upstream.route(
+        'GET',
+        '/locate-neighbourhood',
+        locateBy(every(GMP_SAMPLES, 'greater-manchester')),
+      );
+      const out = data(await call({ area: 'polygon', polygon: GMP_RING, month: '2026-07' }));
+      expect(out.total).toBe(0);
+      expect(out.notice).toBe(GMP_NOTES.join(' '));
+    });
+
+    it('reads a polygon whose every sample point answered 404 as outside coverage, though its vertices are in the box', async () => {
+      // The Highlands: inside the coverage box, outside every force.
+      const highlands = [
+        { lat: 57.5, lng: -4.3 },
+        { lat: 57.5, lng: -4.1 },
+        { lat: 57.4, lng: -4.1 },
+      ];
+      h.upstream.route('POST', '/crimes-street/all-crime', jsonOk([]));
+      h.upstream.route('GET', '/locate-neighbourhood', plainNotFound);
+      const out = data(await call({ area: 'polygon', polygon: highlands, month: '2026-07' }));
+      expect(out.area).toEqual({ type: 'polygon', vertex_count: 3 });
+      expect(out.notice).toBe(
+        'This polygon lies outside data.police.uk coverage; each vertex is {lat, lng}, so check the two were not swapped.',
+      );
+      expect(h.upstream.count('/locate-neighbourhood')).toBe(4);
+    });
+
+    it('skips a sample point whose locate failed and locates the polygon from the rest, logging a warning', async () => {
+      h.upstream.route('POST', '/crimes-street/all-crime', jsonOk([]));
+      h.upstream.route(
+        'GET',
+        '/locate-neighbourhood',
+        locateBy({
+          ...every(GMP_SAMPLES, 'greater-manchester'),
+          [GMP_SAMPLES[1] as string]: status(500),
+        }),
+      );
+      const out = data(await call({ area: 'polygon', polygon: GMP_RING, month: '2026-07' }));
+      expect(out.area.located_forces).toEqual(['greater-manchester']);
+      // A failed sample leaves the force set possibly short, so the zero keeps its generic line.
+      expect(out.notice).toBe(
+        [
+          ...GMP_NOTES,
+          "The force at 1 of this polygon's 4 sample points could not be looked up, so the forces named here may not be all it falls in; search again to retry the lookup.",
+          ZERO_JULY,
+        ].join(' '),
+      );
+      // The direct handler exposes the context's log; one warning for the one failed sample.
+      const ctx = createMockContext({ errors: searchCrimesTool.errors });
+      const input = searchCrimesTool.input.parse({
+        area: 'polygon',
+        polygon: GMP_RING,
+        month: '2026-06',
+      });
+      await settle(Promise.resolve(searchCrimesTool.handler(input, ctx)));
+      const warnings = (ctx.log as MockContextLogger).calls.filter((c) => c.level === 'warning');
+      expect(warnings.map((c) => c.msg)).toEqual([
+        'Point lookup failed; searching without the located force',
+      ]);
+    });
+
+    it('keeps the generic line when a failed sample leaves the rest all 404 (not every point answered 404)', async () => {
+      h.upstream.route('POST', '/crimes-street/all-crime', jsonOk([]));
+      h.upstream.route(
+        'GET',
+        '/locate-neighbourhood',
+        locateBy({ ...every(GMP_SAMPLES, plainNotFound), [GMP_SAMPLES[0] as string]: status(500) }),
+      );
+      const out = data(await call({ area: 'polygon', polygon: GMP_RING, month: '2026-07' }));
+      expect(out.area).not.toHaveProperty('located_forces');
+      expect(out.notice).toBe(ZERO_JULY);
+    });
+
+    it('says a straddle’s lookups were partial and keeps the generic line when the publishing side failed, on both surfaces', async () => {
+      // Greater Manchester (no crime data) to the north answers; the Cheshire side fails.
+      h.upstream.route('POST', '/crimes-street/all-crime', jsonOk([]));
+      h.upstream.route(
+        'GET',
+        '/locate-neighbourhood',
+        locateBy({
+          [STRADDLE_SAMPLES.centre]: status(500),
+          [STRADDLE_SAMPLES.north]: 'greater-manchester',
+          [STRADDLE_SAMPLES.south]: status(500),
+          [STRADDLE_SAMPLES.east]: 'greater-manchester',
+        }),
+      );
+      const result = await call({ area: 'polygon', polygon: [...STRADDLE_RING], month: '2026-07' });
+      const out = data(result);
+      expect(out.total).toBe(0);
+      expect(out.area.located_forces).toEqual(['greater-manchester']);
+      expect(out.notice).toBe(
+        [
+          ...GMP_NOTES,
+          "The force at 2 of this polygon's 4 sample points could not be looked up, so the forces named here may not be all it falls in; search again to retry the lookup.",
+          ZERO_JULY,
+        ].join(' '),
+      );
+      expect(text(result)).toContain(`> ${out.notice}`);
+    });
+
+    it('sends no locate for a polygon with no vertex in the coverage box', async () => {
+      h.upstream.route('POST', '/crimes-street/all-crime', jsonOk([]));
+      const out = data(
+        await call({
+          area: 'polygon',
+          polygon: RING.map(({ lat, lng }) => ({ lat: lng, lng: lat })),
+          month: '2026-07',
+        }),
+      );
+      expect(out.notice).toContain('This polygon lies outside data.police.uk coverage');
+      expect(h.upstream.count('/locate-neighbourhood')).toBe(0);
+    });
+
+    it('pages and repeats a located polygon with no further locate or area request', async () => {
+      h.upstream.route('POST', '/crimes-street/all-crime', jsonOk(crimesBody()));
+      h.upstream.route(
+        'GET',
+        '/locate-neighbourhood',
+        locateBy(every(GMP_SAMPLES, 'greater-manchester')),
+      );
+      const input = { area: 'polygon', polygon: GMP_RING, month: '2026-07', limit: 3 } as const;
+      const first = data(await call(input));
+      const second = data(await call({ ...input, offset: first.next_offset }));
+      const again = data(await call(input));
+      expect(second.crimes.map((c) => c.id)).not.toEqual(first.crimes.map((c) => c.id));
+      expect(again).toEqual(first);
+      expect(second.area).toEqual(first.area);
+      expect(h.upstream.count('/locate-neighbourhood')).toBe(4);
+      expect(h.upstream.count('/crimes-street/all-crime')).toBe(1);
+    });
+
+    it('answers a polygon the same on a fresh service and on one other areas have primed', async () => {
+      const routes = () => {
+        h.upstream.route('POST', '/crimes-street/all-crime', jsonOk(crimesBody()));
+        h.upstream.route('GET', '/crimes-street/all-crime', jsonOk(crimesBody()));
+        h.upstream.route('GET', '/crimes-at-location', jsonOk([crimeRecord()]));
+        h.upstream.route(
+          'GET',
+          '/locate-neighbourhood',
+          locateBy({
+            [STRADDLE_SAMPLES.centre]: 'greater-manchester',
+            [STRADDLE_SAMPLES.north]: 'northern-ireland',
+            [STRADDLE_SAMPLES.south]: 'greater-manchester',
+            [STRADDLE_SAMPLES.east]: 'northern-ireland',
+            ...every(GMP_SAMPLES, 'metropolitan'),
+            '52.630000,-1.130000': 'leicestershire',
+          }),
+        );
+      };
+      routes();
+      const straddle = { area: 'polygon', polygon: [...STRADDLE_RING], month: '2026-07' } as const;
+      const fresh = await call(straddle);
+      const primedService = initPoliceApiService({
+        fetch: h.upstream.fetch,
+        now: () => Date.now(),
+      });
+      try {
+        await call({ area: 'polygon', polygon: GMP_RING, month: '2026-07' });
+        await call({ ...POINT, month: '2026-07' });
+        await call({ area: 'location', location_id: '1000001', month: '2026-07' });
+        const primed = await call(straddle);
+        expect(primed.structuredContent).toEqual(fresh.structuredContent);
+        expect(text(primed)).toBe(text(fresh));
+      } finally {
+        primedService.dispose();
+      }
+    });
+
+    it('locates a location by its records’ map point once the area has answered', async () => {
+      h.upstream.route('GET', '/crimes-at-location', async (request) => {
+        await new Promise((resolve) => setTimeout(resolve, 5000));
+        return jsonOk([crimeRecord({ id: 2 }), crimeRecord({ id: 1 })])(request);
+      });
+      h.upstream.route(
+        'GET',
+        '/locate-neighbourhood',
+        jsonOk(locateBody({ force: 'greater-manchester', neighbourhood: 'AC29' })),
+      );
+      const result = await call({ area: 'location', location_id: '1000001', month: '2026-07' });
+      const out = data(result);
+      expect(out.area).toEqual({
+        type: 'location',
+        location_id: '1000001',
+        located_force: 'greater-manchester',
+        located_neighbourhood: 'AC29',
+      });
+      expect(out.notice).toBe(GMP_NOTES.join(' '));
+      const [area] = h.upstream.callsTo('/crimes-at-location');
+      const locates = h.upstream.callsTo('/locate-neighbourhood');
+      expect(locates).toHaveLength(1);
+      expect(locates[0]?.query.get('q')).toBe('52.630000,-1.130000');
+      expect(locates[0]?.at).toBeGreaterThanOrEqual((area?.at ?? 0) + 5000);
+      expect(text(result)).toContain(
+        '**Area:** location · location_id 1000001 · located force greater-manchester · located neighbourhood AC29',
+      );
+    });
+
+    it('sends no locate for a location with no records, or whose records carry no map point', async () => {
+      h.upstream.route('GET', '/crimes-at-location', jsonOk([]));
+      const empty = data(
+        await call({ area: 'location', location_id: '1000001', month: '2026-07' }),
+      );
+      expect(empty.area).toEqual({ type: 'location', location_id: '1000001' });
+      expect(empty.notice).toBe(ZERO_JULY);
+      h.upstream.route(
+        'GET',
+        '/crimes-at-location',
+        jsonOk([
+          crimeRecord({ location: wireLocation(1_000_002, 'On or near Nowhere', '0', '0') }),
+        ]),
+      );
+      const pointless = data(
+        await call({ area: 'location', location_id: '1000002', month: '2026-07' }),
+      );
+      expect(pointless.total).toBe(1);
+      expect(pointless.area).toEqual({ type: 'location', location_id: '1000002' });
+      expect(h.upstream.count('/locate-neighbourhood')).toBe(0);
     });
   });
 
@@ -1766,6 +2247,65 @@ describe('ukcrime_search_crimes', () => {
       await call({ ...POINT, month: '2026-07' });
       await call({ ...POINT, month: '2026-07', limit: 10 });
       expect(h.upstream.count('/crimes-street/all-crime')).toBe(1);
+    });
+  });
+
+  describe('one month (no month_from): the result shape and the requests sent', () => {
+    const requests = () =>
+      h.upstream.calls.map(({ method, path, query }) => `${method} ${path} ${query}`).sort();
+
+    it('point: the same keys on structuredContent, one area request for the month, one locate', async () => {
+      pointRoutes();
+      const result = await call({ ...POINT, month: '2026-07' });
+      expect(Object.keys(result.structuredContent ?? {}).sort()).toEqual([
+        'area',
+        'attribution',
+        'by_category',
+        'by_outcome',
+        'cap',
+        'category',
+        'crimes',
+        'data_note',
+        'month',
+        'shown',
+        'top_locations',
+        'total',
+        'truncated',
+      ]);
+      expect(requests()).toEqual([
+        'GET /crime-categories ',
+        'GET /crimes-street-dates ',
+        'GET /crimes-street/all-crime lat=52.630000&lng=-1.130000&date=2026-07',
+        'GET /locate-neighbourhood q=52.630000%2C-1.130000',
+      ]);
+      expect(text(result)).toContain('## Street-level crimes — 2026-07\n');
+      expect(text(result)).not.toContain('By month');
+    });
+
+    it('force_unplaced: no top_locations, one crimes-no-location request for the month', async () => {
+      h.upstream.route('GET', '/crimes-no-location', jsonOk(unplacedCrimesBody()));
+      const result = await call({ area: 'force_unplaced', force: 'leicestershire' });
+      expect(Object.keys(result.structuredContent ?? {}).sort()).toEqual([
+        'area',
+        'attribution',
+        'by_category',
+        'by_outcome',
+        'cap',
+        'category',
+        'crimes',
+        'data_note',
+        'month',
+        'notice',
+        'shown',
+        'total',
+        'truncated',
+      ]);
+      expect(requests()).toEqual([
+        'GET /crime-categories ',
+        'GET /crimes-no-location category=all-crime&force=leicestershire&date=2026-08',
+        'GET /crimes-street-dates ',
+        'GET /forces ',
+      ]);
     });
   });
 });

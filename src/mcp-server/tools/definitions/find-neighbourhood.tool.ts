@@ -20,16 +20,13 @@ import {
 } from '@/mcp-server/tools/shared-schemas.js';
 import { polyParam } from '@/services/police-api/area.js';
 import { forceGaps } from '@/services/police-api/known-gaps.js';
-import { BTP_FORCE, getPoliceApiService } from '@/services/police-api/police-api-service.js';
+import { getPoliceApiService } from '@/services/police-api/police-api-service.js';
 
 const SECTIONS = ['priorities', 'team', 'events', 'boundary'] as const;
 
 type Section = (typeof SECTIONS)[number];
 
 const DEFAULT_INCLUDE: readonly Section[] = ['priorities', 'team', 'events'];
-
-/** Most events listed; `events_total` gives the full count. */
-const MAX_EVENTS = 10;
 
 const DATA_NOTE =
   "Team, priorities and events are published by the force and can lag; the boundary is the force's own neighbourhood polygon.";
@@ -211,12 +208,12 @@ const OutputSchema = z.object({
     )
     .optional()
     .describe(
-      "Up to 10 upcoming engagement events, soonest first; present when include has 'events' and they loaded.",
+      "Every upcoming engagement event the force published, soonest first and undated last; present when include has 'events' and they loaded.",
     ),
   events_total: z
     .number()
     .optional()
-    .describe('Upcoming events published in all; more than shown when over 10.'),
+    .describe('Upcoming events published; every one is in events.'),
   boundary: z
     .object({
       vertex_count: z.number().describe('Vertices in the polygon as returned.'),
@@ -243,7 +240,7 @@ export const findNeighbourhoodTool = tool('ukcrime_find_neighbourhood', {
     lat: latInput.describe('Latitude, WGS84 decimal degrees, to look up by point (with lng).'),
     lng: lngInput.describe('Longitude, WGS84 decimal degrees, to look up by point (with lat).'),
     force: forceInput.describe(
-      "Force id such as 'leicestershire' (ukcrime_list_reference topic 'forces' lists them), to look up by id (with neighbourhood_id); trimmed, lower-cased, spaces and underscores become hyphens.",
+      "Force id such as 'leicestershire', or its name such as 'Leicestershire Police' (ukcrime_list_reference topic 'forces' lists both), to look up by id (with neighbourhood_id); case-insensitive, spaces, underscores and hyphens match each other, '&' matches 'and', and a trailing 'Police', 'Police Service' or 'Constabulary' is optional.",
     ),
     neighbourhood_id: neighbourhoodIdInput.describe(
       "Neighbourhood id from ukcrime_list_reference topic 'neighbourhoods', to look up by id (with force). Case-sensitive; only trimmed.",
@@ -290,10 +287,45 @@ export const findNeighbourhoodTool = tool('ukcrime_find_neighbourhood', {
     {
       reason: 'unknown_force',
       code: JsonRpcErrorCode.ValidationError,
-      when: "force is not in the force list, or is 'btp' (British Transport Police has no neighbourhoods)",
+      when: "force matches no listed force id or name, or more than one, or is 'btp' (British Transport Police has no neighbourhoods)",
       recovery:
         "Call ukcrime_list_reference with topic 'forces' for valid force ids such as 'leicestershire'.",
       severity: 'notice',
+    },
+    {
+      reason: 'rate_limited',
+      code: JsonRpcErrorCode.RateLimited,
+      when: 'data.police.uk is rate-limiting this server for longer than this call can wait',
+      recovery:
+        'data.police.uk is rate-limiting this server; wait a few seconds, then call this tool again.',
+      retryable: true,
+      thrownBy: 'service',
+    },
+    {
+      reason: 'pacer_shed',
+      code: JsonRpcErrorCode.RateLimited,
+      when: 'too many requests to data.police.uk are already queued in this server',
+      recovery:
+        "This server's queue for data.police.uk is busy; wait a few seconds, then call this tool again.",
+      retryable: true,
+      thrownBy: 'service',
+    },
+    {
+      reason: 'upstream_unavailable',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      when: 'data.police.uk is not answering',
+      recovery: 'data.police.uk is not answering right now; call this tool again in a few minutes.',
+      retryable: true,
+      thrownBy: 'service',
+    },
+    {
+      reason: 'retry_deadline_exceeded',
+      code: JsonRpcErrorCode.Timeout,
+      when: 'data.police.uk did not answer within the time one call allows',
+      recovery:
+        'data.police.uk did not answer within the time one call allows; call this tool again in a minute.',
+      retryable: true,
+      thrownBy: 'service',
     },
   ],
 
@@ -318,16 +350,9 @@ export const findNeighbourhoodTool = tool('ukcrime_find_neighbourhood', {
       forceId = located.value.force;
       neighbourhoodId = located.value.neighbourhood;
     } else {
-      const known = await service.findForce(lookup.force, ctx, budget, { allowBtp: false });
-      if (!known) {
-        throw ctx.fail(
-          'unknown_force',
-          lookup.force === BTP_FORCE.id
-            ? 'British Transport Police has no neighbourhoods.'
-            : `No police force '${lookup.force}'.`,
-        );
-      }
-      forceId = known.id;
+      const match = await service.findForce(lookup.force, ctx, budget, { allowBtp: false });
+      if (match.kind === 'unknown') throw ctx.fail('unknown_force', match.message);
+      forceId = match.force.id;
       neighbourhoodId = lookup.neighbourhoodId;
     }
 
@@ -372,7 +397,10 @@ export const findNeighbourhoodTool = tool('ukcrime_find_neighbourhood', {
       settled;
     const forceDetail = loaded(forceResult, 'force details');
     const forceInfo = forceDetail?.kind === 'found' ? forceDetail.value : undefined;
-    const listed = listedResult.status === 'fulfilled' ? listedResult.value : undefined;
+    const listed =
+      listedResult.status === 'fulfilled' && listedResult.value.kind === 'found'
+        ? listedResult.value.force
+        : undefined;
     if (listedResult.status === 'rejected') {
       ctx.log.warning('Could not load the force list; naming the force from its detail', {
         error:
@@ -415,7 +443,7 @@ export const findNeighbourhoodTool = tool('ukcrime_find_neighbourhood', {
       },
       ...(priorities ? { priorities: [...priorities] } : {}),
       ...(team ? { team: [...team] } : {}),
-      ...(events ? { events: events.slice(0, MAX_EVENTS), events_total: events.length } : {}),
+      ...(events ? { events: [...events], events_total: events.length } : {}),
       ...(boundary
         ? { boundary: { vertex_count: boundary.length, polygon: polyParam(boundary) } }
         : {}),
@@ -526,8 +554,7 @@ export const findNeighbourhoodTool = tool('ukcrime_find_neighbourhood', {
     }
 
     if (result.events) {
-      const total = result.events_total ?? result.events.length;
-      lines.push('', `### Upcoming events (${result.events.length} of ${total})`);
+      lines.push('', `### Upcoming events (${result.events_total ?? result.events.length})`);
       if (result.events.length === 0) lines.push('', '_None published._');
       else lines.push('');
       for (const [index, event] of result.events.entries()) {

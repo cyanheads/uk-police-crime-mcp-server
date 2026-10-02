@@ -285,6 +285,17 @@ describe('ukcrime_list_reference', () => {
       expect(error.message).toBe("No police force 'atlantis'.");
       expect(error.data.recovery?.hint).toContain("topic 'forces'");
     });
+
+    it.each([
+      ['British Transport Police', 'btp', ['2026-08']],
+      ['Metropolitan Police Service', 'metropolitan', []],
+    ])('takes the display name %j as %s, on both surfaces', async (name, id, published) => {
+      const result = await call({ topic: 'availability', force: name, month: '2026-08' });
+      const availability = data(result).availability;
+      expect(availability?.force).toBe(id);
+      expect(availability?.force_stop_search_published_months).toEqual(published);
+      expect(text(result)).toContain(`**Force:** ${id}`);
+    });
   });
 
   describe('topic neighbourhoods', () => {
@@ -424,6 +435,39 @@ describe('ukcrime_list_reference', () => {
       const error = errorOf(await call({ topic: 'neighbourhoods', force: 'leicestershire' }));
       expect(error.data.reason).toBe('unknown_force');
       expect(error.message).toContain('lists no neighbourhoods');
+    });
+
+    it('takes a display name, asking for the neighbourhoods by the matched id and echoing it on both surfaces', async () => {
+      lookup('devon-and-cornwall', neighbourhoodsBody());
+      const result = await call({ topic: 'neighbourhoods', force: 'Devon & Cornwall Police' });
+      expect(data(result).force).toBe('devon-and-cornwall');
+      expect(text(result)).toContain('**Force:** devon-and-cornwall');
+      expect(h.upstream.calls.map((c) => c.path)).toContain('/devon-and-cornwall/neighbourhoods');
+    });
+
+    it('names the matched id when upstream lists no neighbourhoods for a display-named force', async () => {
+      h.upstream.route('GET', '/northern-ireland/neighbourhoods', plainNotFound);
+      const error = errorOf(
+        await call({ topic: 'neighbourhoods', force: 'Police Service of Northern Ireland' }),
+      );
+      expect(error.message).toBe(
+        "data.police.uk lists no neighbourhoods for force 'northern-ireland'.",
+      );
+    });
+
+    it('fails unknown_force for British Transport Police, which has no neighbourhoods', async () => {
+      const error = errorOf(
+        await call({ topic: 'neighbourhoods', force: 'British Transport Police' }),
+      );
+      expect(error.data.reason).toBe('unknown_force');
+      expect(error.message).toBe('British Transport Police has no neighbourhoods.');
+    });
+
+    it('declares unknown_force with a when naming every case above', () => {
+      const entry = listReferenceTool.errors?.find((e) => e.reason === 'unknown_force');
+      expect(entry?.when).toBe(
+        "force matches no listed force id or name, or more than one, or is 'btp' on topic 'neighbourhoods', or data.police.uk lists no neighbourhoods for it",
+      );
     });
   });
 

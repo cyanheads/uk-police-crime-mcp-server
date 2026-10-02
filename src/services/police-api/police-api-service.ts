@@ -12,6 +12,7 @@
 
 import type { Context, z } from '@cyanheads/mcp-ts-core';
 import {
+  JsonRpcErrorCode,
   McpError,
   serviceUnavailable,
   timeout,
@@ -19,6 +20,7 @@ import {
 } from '@cyanheads/mcp-ts-core/errors';
 import {
   createPacer,
+  defaultIsTransient,
   httpErrorFromResponse,
   type Pacer,
   withRetry,
@@ -70,9 +72,11 @@ const BASE_URL = 'https://data.police.uk/api';
 
 /** Each tool call's total budget, inside a typical 60 s client timeout. */
 const CALL_BUDGET_MS = 50_000;
-/** Ceiling on any one service call's retry deadline, within the call budget. */
+/** Ceiling on any one service call's retry deadline, within the call budget; an upstream `Retry-After` is waited out when it leaves the next attempt {@link MIN_ATTEMPT_AFTER_WAIT_MS} of what remains. */
 const SERVICE_CALL_DEADLINE_MS = 45_000;
-/** One attempt's ceiling; the slowest successful call observed took 17.3 s. */
+/** Least time the attempt after an honoured `Retry-After` must still have; a wait leaving less fails at once, naming the wait. */
+const MIN_ATTEMPT_AFTER_WAIT_MS = 10_000;
+/** One attempt's ceiling on every route but `/outcomes-at-location`; the slowest successful call observed on them took 17.3 s. */
 const ATTEMPT_TIMEOUT_MS = 30_000;
 /** Longest a request waits in the pacer queue before it is shed; an area request's wait for an area slot counts toward it. */
 const PACER_MAX_WAIT_MS = 20_000;
@@ -88,8 +92,15 @@ const HOUR_MS = 60 * MINUTE_MS;
 const DAY_MS = 24 * HOUR_MS;
 
 /** Area-response cache: weight is decoded body bytes × 1.25, a heap estimate for the parsed records. */
-const AREA_CACHE_CAPACITY = 64 * 1024 * 1024;
+const AREA_CACHE_CAPACITY = 128 * 1024 * 1024;
 const AREA_WEIGHT_PER_BYTE = 1.25;
+
+/**
+ * Most area-cache weight one month-range call may hold, and the heaviest entry
+ * the area cache takes: a quarter of the cache, so the months of four
+ * maximum-size ranges can all stay cached while they page.
+ */
+export const RANGE_MAX_WEIGHT = 32 * 1024 * 1024;
 
 const SINGLETON_KEY = 'all';
 
@@ -106,6 +117,10 @@ export interface PoliceApiServiceOptions {
 
 /** An area route request for {@link PoliceApiService.queryArea}. */
 export interface AreaQuery<T> {
+  /** Lets each attempt run to the retry deadline instead of 30 s, for a route that can take longer to answer a month it has not served recently. */
+  readonly attemptToDeadline?: boolean;
+  /** The recovery hint a failure at the retry deadline carries for this request. */
+  readonly deadlineHint?: string;
   /** `POST` sends `params` as a form body — polygons always go this way. Default `GET`. */
   readonly method?: 'GET' | 'POST';
   /**
@@ -124,9 +139,30 @@ export interface AreaQuery<T> {
   readonly tooLargeHint?: string;
 }
 
+/** Records an area query answered, and the weight they carry in the area cache, the same whether fetched or cached. */
+interface AreaRecords<T> {
+  readonly records: readonly T[];
+  /** Decoded body bytes × 1.25, a heap estimate for the records; reported even when they were too heavy to cache. */
+  readonly weight: number;
+}
+
+/** {@link PoliceApiService.queryArea}'s answer: the records and their weight, or a 404 the route answers as a miss. */
+export type AreaAnswer<T> =
+  | { readonly kind: 'found'; readonly value: readonly T[]; readonly weight: number }
+  | { readonly kind: 'miss' };
+
+/** A range month that reached the front of the queues too late for one full attempt, so it was never sent. */
+export type Late = { readonly kind: 'late' };
+
 interface UpstreamRequest {
   /** An area route: a 503 leaves the attempt as `overloaded`, and a body over the ceiling as `too_large`, instead of failing it. */
   readonly area?: boolean;
+  /** Each attempt runs to the retry deadline instead of {@link ATTEMPT_TIMEOUT_MS}, so a slow answer is never aborted and resent. */
+  readonly attemptToDeadline?: boolean;
+  /** Recovery hint for a failure at the retry deadline. */
+  readonly deadlineHint?: string;
+  /** The first attempt is sent only if one full attempt still fits in the call budget once it has waited for its slots; otherwise the answer is `late`, unsent. */
+  readonly fullAttempt?: boolean;
   readonly method?: 'GET' | 'POST';
   /** A 404 is an answer: returned as `miss`, body unread. */
   readonly notFoundIsMiss?: boolean;
@@ -143,8 +179,9 @@ interface Body {
 type Miss = { readonly kind: 'miss' };
 type Overloaded = { readonly kind: 'overloaded' };
 type TooLarge = { readonly kind: 'too_large' };
-type Answer = Body | Miss | Overloaded | TooLarge;
+type Answer = Body | Late | Miss | Overloaded | TooLarge;
 
+const LATE: Late = { kind: 'late' };
 const MISS: Miss = { kind: 'miss' };
 const TOO_LARGE: TooLarge = { kind: 'too_large' };
 
@@ -176,8 +213,115 @@ const areaTooLarge = (query: AreaQuery<unknown>, message: string): McpError =>
     ...(query.tooLargeHint ? { recovery: { hint: query.tooLargeHint } } : {}),
   });
 
+/**
+ * `retryAfter` as milliseconds from `now`, read as delta-seconds (a number, or a
+ * string of digits) or an HTTP-date; `NaN` when absent or unreadable.
+ */
+function retryAfterMs(retryAfter: unknown, now: number): number {
+  if (typeof retryAfter === 'number') return retryAfter * 1000;
+  if (typeof retryAfter !== 'string') return Number.NaN;
+  const value = retryAfter.trim();
+  return /^\d+$/.test(value) ? Number(value) * 1000 : Date.parse(value) - now;
+}
+
+/**
+ * The wait a failure asks for, as `call again in N s`: `retryAfter` (either
+ * header form) rounded up to whole seconds from `now`. `undefined` when absent,
+ * unreadable, or already past.
+ */
+export function callAgainAfter(retryAfter: unknown, now: number): string | undefined {
+  const seconds = Math.ceil(retryAfterMs(retryAfter, now) / 1000);
+  return Number.isFinite(seconds) && seconds > 0 ? `call again in ${seconds} s` : undefined;
+}
+
+const SHED_MESSAGE =
+  'Too many requests to data.police.uk are queued in this server, so this one was not sent.';
+
+/**
+ * Gives a failure that left the retry loop what a caller acts on: a reason,
+ * `retryable: true`, and a recovery hint where the wait or the route is known.
+ * It runs after every retry, cooldown and shed decision was made on the raw
+ * error. An upstream 429 becomes `rate_limited` and a pacer shed keeps
+ * `pacer_shed` under server-written text, each naming its wait; a 5xx or network
+ * failure that outlasted the retries becomes `upstream_unavailable`, naming the
+ * wait when its last answer carried a `Retry-After`; the retry
+ * deadline keeps `retry_deadline_exceeded`, with the request's own hint when it
+ * has one, and so does a last attempt that timed out before the deadline (a
+ * `Timeout` with no reason and no status). Any other failure, one that already
+ * names a reason, and one marked `retryable: false` (a 501) pass through. A
+ * hint left unset is the calling tool's declared recovery.
+ */
+function typedFailure(error: unknown, request: UpstreamRequest, now: number): unknown {
+  if (!(error instanceof McpError)) return error;
+  const data = error.data ?? {};
+  const typed = (
+    code: JsonRpcErrorCode,
+    message: string,
+    reason: string,
+    hint: string | undefined,
+  ): McpError =>
+    new McpError(
+      code,
+      message,
+      { ...data, reason, retryable: true, ...(hint ? { recovery: { hint } } : {}) },
+      error.cause === undefined ? undefined : { cause: error.cause },
+    );
+  const wait = callAgainAfter(data.retryAfter, now);
+  if (error.code === JsonRpcErrorCode.RateLimited && data.reason === 'pacer_shed') {
+    const hint = wait && `This server's queue for data.police.uk is busy; ${wait}.`;
+    return typed(error.code, SHED_MESSAGE, 'pacer_shed', hint);
+  }
+  if (error.code === JsonRpcErrorCode.RateLimited && data.reason === undefined) {
+    const hint = wait && `data.police.uk is rate-limiting this server; ${wait}.`;
+    return typed(error.code, error.message, 'rate_limited', hint);
+  }
+  const attemptTimedOut = data.reason === undefined && data.status === undefined;
+  if (
+    error.code === JsonRpcErrorCode.Timeout &&
+    (data.reason === 'retry_deadline_exceeded' || attemptTimedOut)
+  ) {
+    return typed(error.code, error.message, 'retry_deadline_exceeded', request.deadlineHint);
+  }
+  const upstreamDown =
+    data.reason === undefined &&
+    data.retryable !== false &&
+    (error.code === JsonRpcErrorCode.ServiceUnavailable ||
+      (typeof data.status === 'number' && data.status >= 500));
+  if (upstreamDown) {
+    const hint = wait && `data.police.uk is not answering right now; ${wait}.`;
+    return typed(JsonRpcErrorCode.ServiceUnavailable, error.message, 'upstream_unavailable', hint);
+  }
+  return error;
+}
+
 /** A category's match key: lower-cased, each run of spaces, underscores and hyphens folded to one `-`. */
 const categoryKey = (value: string): string => value.toLowerCase().replace(/[\s_-]+/g, '-');
+
+/**
+ * A force id or display name folded the way the `force` inputs read it:
+ * lower-cased, `&` read as `and`, each run of whitespace, `_` and `-` folded to
+ * one `-`. `Devon & Cornwall Police` becomes `devon-and-cornwall-police`.
+ */
+export const foldForce = (value: string): string =>
+  value
+    .toLowerCase()
+    .replace(/&/g, ' and ')
+    .replace(/[\s_-]+/g, '-');
+
+/** The suffix a force's display name may carry and its id does not. */
+const FORCE_SUFFIX = /-(police-service|police|constabulary)$/;
+
+/**
+ * A force's match key: {@link foldForce}, then one trailing `-police-service`,
+ * `-police` or `-constabulary` removed. Applied to the input, every id and every
+ * display name, it gives each of the 45 forces its own keys (2026-10-01).
+ */
+const forceKey = (value: string): string => foldForce(value).replace(FORCE_SUFFIX, '');
+
+/** What a `force` input matched: the one force it names, or the `unknown_force` message saying why none was chosen. */
+export type ForceMatch =
+  | { readonly force: Force; readonly kind: 'found' }
+  | { readonly kind: 'unknown'; readonly message: string };
 
 /** A neighbourhood route, `/{force}/{id}` or one of its sections, with both ids path-encoded. */
 const neighbourhoodPath = (force: string, neighbourhoodId: string, section?: string): string =>
@@ -259,6 +403,8 @@ export class PoliceApiService {
   /** Admits area requests to {@link pacer} at most {@link AREA_SLOTS} at a time. */
   private readonly areaGate: Pacer;
   private lastRecheckAt = Number.NEGATIVE_INFINITY;
+  /** The latest month of the last availability read; when it moves, the area cache is cleared. */
+  private releaseSeen: string | undefined;
 
   private readonly availabilityCache: LruCache<Availability>;
   private readonly forcesCache: LruCache<readonly Force[]>;
@@ -268,7 +414,7 @@ export class PoliceApiService {
   private readonly boundaryCache: LruCache<Lookup<readonly MapPoint[]>>;
   private readonly locateCache: LruCache<Lookup<LocatedNeighbourhood>>;
   private readonly crimeHistoryMissCache: LruCache<Miss>;
-  private readonly areaCache: LruCache<readonly unknown[]>;
+  private readonly areaCache: LruCache<AreaRecords<unknown>>;
 
   constructor(options: PoliceApiServiceOptions) {
     this.fetchFn = options.fetch;
@@ -296,7 +442,7 @@ export class PoliceApiService {
     this.crimeHistoryMissCache = new LruCache({ capacity: 10_000, ttlMs: 15 * MINUTE_MS, now });
     this.areaCache = new LruCache({
       capacity: AREA_CACHE_CAPACITY,
-      maxEntryWeight: AREA_CACHE_CAPACITY / 2,
+      maxEntryWeight: RANGE_MAX_WEIGHT,
       ttlMs: 15 * MINUTE_MS,
       now,
     });
@@ -307,6 +453,16 @@ export class PoliceApiService {
     return { deadlineAt: this.now() + CALL_BUDGET_MS };
   }
 
+  /** `budget`, cut to end at most `ms` from now: for a request that only annotates a result. */
+  narrowBudget(budget: CallBudget, ms: number): CallBudget {
+    return { deadlineAt: Math.min(budget.deadlineAt, this.now() + ms) };
+  }
+
+  /** Whether one full attempt (30 s) still fits in what remains of the budget: the condition for starting another month of a range, and for sending it once it has its slots. */
+  fitsAttempt(budget: CallBudget): boolean {
+    return budget.deadlineAt - this.now() >= ATTEMPT_TIMEOUT_MS;
+  }
+
   /** Releases both pacers: clears their timers and rejects queued requests. Wired to `createApp({ teardown })`. */
   dispose(): void {
     this.areaGate.dispose();
@@ -315,7 +471,7 @@ export class PoliceApiService {
 
   // --- Reference methods ---------------------------------------------------
 
-  /** The published-month window and each month's stop-and-search publishers (cached 1 h). */
+  /** The published-month window and each month's stop-and-search publishers (cached 1 h). A read whose latest month differs from the last one read clears the area cache. */
   async getAvailability(ctx: Context, budget: CallBudget): Promise<Availability> {
     const cached = this.availabilityCache.get(SINGLETON_KEY);
     if (cached) return cached;
@@ -335,6 +491,10 @@ export class PoliceApiService {
       .map((row) => ({ month: row.date, stopSearchForces: row['stop-and-search'] }))
       .sort((a, b) => compareText(b.month, a.month));
     const availability: Availability = { latest, earliest, months };
+    // A new latest month is a monthly release that can revise or backfill earlier months:
+    // area answers cached before it would sit beside publication lists read after it.
+    if (this.releaseSeen !== undefined && latest !== this.releaseSeen) this.areaCache.clear();
+    this.releaseSeen = latest;
     this.availabilityCache.set(SINGLETON_KEY, availability);
     return availability;
   }
@@ -372,18 +532,39 @@ export class PoliceApiService {
   }
 
   /**
-   * A force by id from the cached list, or `undefined` when unknown. `btp` is
-   * returned (as {@link BTP_FORCE}) only with `allowBtp` — on the routes that
-   * answer for it.
+   * Matches a force by id (`leicestershire`) or display name (`Leicestershire
+   * Police`, `Metropolitan Police`, `Devon & Cornwall Police`) against the cached
+   * list and {@link BTP_FORCE}. An exact id wins; otherwise the input, each id
+   * and each name are compared by {@link forceKey}, and a key two forces share
+   * picks neither. `btp` matches like any force but is returned only with
+   * `allowBtp`, on the routes that answer for it; an exact `btp` needs no list.
    */
   async findForce(
-    id: string,
+    input: string,
     ctx: Context,
     budget: CallBudget,
     options: { readonly allowBtp: boolean },
-  ): Promise<Force | undefined> {
-    if (id === BTP_FORCE.id) return options.allowBtp ? BTP_FORCE : undefined;
-    return (await this.getForces(ctx, budget)).find((force) => force.id === id);
+  ): Promise<ForceMatch> {
+    const folded = foldForce(input);
+    const forces =
+      folded === BTP_FORCE.id ? [BTP_FORCE] : [...(await this.getForces(ctx, budget)), BTP_FORCE];
+    const exact = forces.find((force) => force.id === folded);
+    const key = forceKey(folded);
+    const matches = exact
+      ? [exact]
+      : forces.filter((force) => forceKey(force.id) === key || forceKey(force.name) === key);
+    const [force, ...others] = matches;
+    if (!force) return { kind: 'unknown', message: `No police force '${input}'.` };
+    if (others.length > 0) {
+      return {
+        kind: 'unknown',
+        message: `'${input}' matches more than one police force: ${matches.map(({ id }) => `'${id}'`).join(', ')}; send one of their ids.`,
+      };
+    }
+    if (force.id === BTP_FORCE.id && !options.allowBtp) {
+      return { kind: 'unknown', message: 'British Transport Police has no neighbourhoods.' };
+    }
+    return { kind: 'found', force };
   }
 
   /** The 15 crime categories, `all-crime` included, cached 24 h (the list does not vary by month). */
@@ -612,8 +793,9 @@ export class PoliceApiService {
    * location, or force-wide) through the area cache. A hit returns the cached
    * records — shared and read-only: callers filter and page into new arrays and
    * never sort or mutate them. A miss fetches, normalizes and caches (15 min
-   * from insert; weight = decoded bytes × 1.25; an entry over half the 64 MiB
-   * cap is returned uncached).
+   * from insert; weight = decoded bytes × 1.25; an entry over 32 MiB of weight,
+   * a quarter of the 128 MiB cache, is returned uncached). Either way the answer
+   * carries that weight.
    *
    * A 404 on a `notFoundIsMiss` route returns `miss`. A body over the 32 MiB
    * ceiling throws `ValidationError` with `data.reason: 'area_too_large'` (the
@@ -621,46 +803,82 @@ export class PoliceApiService {
    * leaves the retry loop as a value, then one health probe
    * (`/crime-last-updated`, paced on its own, never retried) decides: probe 200
    * → the same `area_too_large`; otherwise → `ServiceUnavailable` with
-   * `data.reason: 'upstream_unavailable'`, `retryable: true`. Other failures
-   * bubble as baseline errors.
+   * `data.reason: 'upstream_unavailable'`, `retryable: true`. Both
+   * `area_too_large` messages name the month refused (`params.date`). Other
+   * failures bubble as baseline errors.
    */
-  async queryArea<T>(
+  queryArea<T>(query: AreaQuery<T>, ctx: Context, budget: CallBudget): Promise<AreaAnswer<T>> {
+    return this.areaRequest(query, ctx, budget, false);
+  }
+
+  /**
+   * One month of a range: {@link queryArea}, except that an uncached month is
+   * sent only if one full attempt still fits in the budget once it has waited
+   * for its area and pacer slots — otherwise `late`, never sent — so a month
+   * held behind other calls fails as time running short, not as an upstream timeout.
+   */
+  queryRangeMonth<T>(
     query: AreaQuery<T>,
     ctx: Context,
     budget: CallBudget,
-  ): Promise<Lookup<readonly T[]>> {
+  ): Promise<AreaAnswer<T> | Late> {
+    return this.areaRequest(query, ctx, budget, true);
+  }
+
+  private areaRequest<T>(
+    query: AreaQuery<T>,
+    ctx: Context,
+    budget: CallBudget,
+    fullAttempt: false,
+  ): Promise<AreaAnswer<T>>;
+  private areaRequest<T>(
+    query: AreaQuery<T>,
+    ctx: Context,
+    budget: CallBudget,
+    fullAttempt: true,
+  ): Promise<AreaAnswer<T> | Late>;
+  private async areaRequest<T>(
+    query: AreaQuery<T>,
+    ctx: Context,
+    budget: CallBudget,
+    fullAttempt: boolean,
+  ): Promise<AreaAnswer<T> | Late> {
     const method = query.method ?? 'GET';
     const key = await areaCacheKey(method, query.path, query.params);
     // The key covers method, route and params, and each route has one normalizer, so a hit holds T[].
-    const cached = this.areaCache.get(key) as readonly T[] | undefined;
-    if (cached) return { kind: 'found', value: cached };
+    const cached = this.areaCache.get(key) as AreaRecords<T> | undefined;
+    if (cached) return { kind: 'found', value: cached.records, weight: cached.weight };
     const answer = await this.send(
       {
         path: query.path,
         method,
         params: query.params,
         notFoundIsMiss: query.notFoundIsMiss ?? false,
+        attemptToDeadline: query.attemptToDeadline ?? false,
+        ...(query.deadlineHint ? { deadlineHint: query.deadlineHint } : {}),
+        fullAttempt,
         area: true,
       },
       ctx,
       budget,
     );
-    if (answer.kind === 'miss') return answer;
+    if (answer.kind === 'miss' || answer.kind === 'late') return answer;
     if (answer.kind === 'overloaded') return this.refuseOverloaded(query, ctx, budget);
     if (answer.kind === 'too_large') {
       throw areaTooLarge(
         query,
-        'data.police.uk answered with more than the 32 MiB this server reads for one area, so the area is too large to answer.',
+        `data.police.uk answered this area for ${query.params.date} with more than the 32 MiB this server reads for one area, so the area is too large to answer.`,
       );
     }
     const records = query.normalize(answer.json);
-    const cachedNow = this.areaCache.set(key, records, answer.bytes * AREA_WEIGHT_PER_BYTE);
+    const weight = answer.bytes * AREA_WEIGHT_PER_BYTE;
+    const cachedNow = this.areaCache.set(key, { records, weight }, weight);
     if (!cachedNow)
       ctx.log.info('Area response too large to cache; served uncached', {
         path: query.path,
         bytes: answer.bytes,
       });
-    return { kind: 'found', value: records };
+    return { kind: 'found', value: records, weight };
   }
 
   // --- Request boundary ------------------------------------------------------
@@ -703,7 +921,7 @@ export class PoliceApiService {
     if (healthy) {
       throw areaTooLarge(
         query,
-        'data.police.uk refused this area as too large to answer, though the service itself is up.',
+        `data.police.uk refused this area for ${query.params.date} as too large to answer, though the service itself is up.`,
       );
     }
     throw serviceUnavailable(
@@ -746,8 +964,14 @@ export class PoliceApiService {
    * Sends one request: retry outside, pacer inside, status handling, the capped
    * read and the JSON parse inside each attempt. An area request first waits for
    * one of the {@link AREA_SLOTS} area slots, and that wait comes out of the same
-   * 20 s it may then wait for a pacer slot. The retry deadline is
-   * `min(45 s, what remains of the call budget)`.
+   * 20 s it may then wait for a pacer slot; a `fullAttempt` request whose first
+   * attempt comes out of those waits with less than one full attempt left in the
+   * call budget is answered `late` and never sent. The retry deadline is
+   * `min(45 s, what remains of the call budget)`; an upstream `Retry-After` that
+   * leaves the next attempt {@link MIN_ATTEMPT_AFTER_WAIT_MS} of it is waited out
+   * between attempts, holding no slot, and one that does not fails at once. A
+   * failure that leaves the loop is typed by {@link typedFailure}; a cancelled
+   * call rethrows untouched.
    */
   private send(
     request: UpstreamRequest & { readonly area: true },
@@ -767,32 +991,57 @@ export class PoliceApiService {
         reason: 'call_budget_exhausted',
       });
     }
-    return await withRetry(
-      ({ signal, remainingMs: attemptBudgetMs }) => {
-        const paced = (pacedSignal: AbortSignal, maxWaitMs: number) =>
-          this.pacer.run(
-            (runSignal) =>
-              this.attempt(request, runSignal, Math.min(ATTEMPT_TIMEOUT_MS, attemptBudgetMs), ctx),
-            { signal: pacedSignal, maxWaitMs },
+    const deadlineMs = Math.min(SERVICE_CALL_DEADLINE_MS, remainingMs);
+    const latestRetryAt = this.now() + deadlineMs - MIN_ATTEMPT_AFTER_WAIT_MS;
+    let attempts = 0;
+    /** The framework's verdict, except that a `Retry-After` ending after `latestRetryAt` is not waited out. */
+    const isTransient = (error: unknown): boolean => {
+      if (!defaultIsTransient(error)) return false;
+      if (!(error instanceof McpError)) return true;
+      const now = this.now();
+      // NaN (no readable Retry-After) compares false, so the error stays transient.
+      return !(now + retryAfterMs(error.data?.retryAfter, now) > latestRetryAt);
+    };
+    try {
+      return await withRetry(
+        ({ signal, remainingMs: attemptBudgetMs }) => {
+          attempts += 1;
+          const mustFit = request.fullAttempt === true && attempts === 1;
+          const timeoutMs = request.attemptToDeadline
+            ? attemptBudgetMs
+            : Math.min(ATTEMPT_TIMEOUT_MS, attemptBudgetMs);
+          const paced = (pacedSignal: AbortSignal, maxWaitMs: number) =>
+            this.pacer.run(
+              (runSignal) =>
+                mustFit && !this.fitsAttempt(budget)
+                  ? Promise.resolve(LATE)
+                  : this.attempt(request, runSignal, timeoutMs, ctx),
+              { signal: pacedSignal, maxWaitMs },
+            );
+          if (!request.area) return paced(signal, PACER_MAX_WAIT_MS);
+          const queuedAt = this.now();
+          return this.areaGate.run(
+            (gateSignal) =>
+              paced(gateSignal, Math.max(0, PACER_MAX_WAIT_MS - (this.now() - queuedAt))),
+            { signal, maxWaitMs: PACER_MAX_WAIT_MS },
           );
-        if (!request.area) return paced(signal, PACER_MAX_WAIT_MS);
-        const queuedAt = this.now();
-        return this.areaGate.run(
-          (gateSignal) =>
-            paced(gateSignal, Math.max(0, PACER_MAX_WAIT_MS - (this.now() - queuedAt))),
-          { signal, maxWaitMs: PACER_MAX_WAIT_MS },
-        );
-      },
-      {
-        maxRetries: 2,
-        baseDelayMs: 1000,
-        maxDelayMs: 10_000,
-        deadlineMs: Math.min(SERVICE_CALL_DEADLINE_MS, remainingMs),
-        signal: ctx.signal,
-        context: ctx,
-        operation: `data.police.uk ${request.method ?? 'GET'} ${request.path}`,
-      },
-    );
+        },
+        {
+          maxRetries: 2,
+          baseDelayMs: 1000,
+          // No Retry-After cap of its own: isTransient decides which waits are taken.
+          maxDelayMs: deadlineMs,
+          deadlineMs,
+          isTransient,
+          signal: ctx.signal,
+          context: ctx,
+          operation: `data.police.uk ${request.method ?? 'GET'} ${request.path}`,
+        },
+      );
+    } catch (error) {
+      if (ctx.signal.aborted) throw error;
+      throw typedFailure(error, request, this.now());
+    }
   }
 
   /** One paced attempt under its own timeout, combined with the retry loop's signal. */

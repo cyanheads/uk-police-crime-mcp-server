@@ -143,7 +143,7 @@ export const listReferenceTool = tool('ukcrime_list_reference', {
         "What to list: 'forces' (force ids), 'categories' (crime category slugs), 'availability' (published months and stop-and-search publication), or 'neighbourhoods' (one force's neighbourhood ids; needs force).",
       ),
     force: forceInput.describe(
-      "Force id such as 'leicestershire'; trimmed, lower-cased, spaces and underscores become hyphens. Required for topic 'neighbourhoods'. On 'availability', where 'btp' (British Transport Police) is also accepted, adds the months this force did and did not publish stop and search. Not accepted on 'forces' or 'categories'.",
+      "Force id such as 'leicestershire', or its name such as 'Leicestershire Police'; case-insensitive, spaces, underscores and hyphens match each other, '&' matches 'and', and a trailing 'Police', 'Police Service' or 'Constabulary' is optional. Required for topic 'neighbourhoods'. On 'availability', where 'btp' (British Transport Police) is also accepted, adds the months this force did and did not publish stop and search. Not accepted on 'forces' or 'categories'.",
     ),
     name_contains: nameContainsInput.describe(
       "Words that must all appear in the name, in any order — case, accents and punctuation ignored, so the value needs at least one letter or digit. Topics 'forces' and 'neighbourhoods' only.",
@@ -177,7 +177,7 @@ export const listReferenceTool = tool('ukcrime_list_reference', {
     {
       reason: 'unknown_force',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'force is not in the force list',
+      when: "force matches no listed force id or name, or more than one, or is 'btp' on topic 'neighbourhoods', or data.police.uk lists no neighbourhoods for it",
       recovery:
         "Call ukcrime_list_reference with topic 'forces' for valid force ids such as 'leicestershire'.",
       severity: 'notice',
@@ -189,6 +189,41 @@ export const listReferenceTool = tool('ukcrime_list_reference', {
       recovery:
         "Call ukcrime_list_reference again with name_contains only on topic 'forces' or 'neighbourhoods', month only on 'availability', and force only on 'neighbourhoods' or 'availability'.",
       severity: 'notice',
+    },
+    {
+      reason: 'rate_limited',
+      code: JsonRpcErrorCode.RateLimited,
+      when: 'data.police.uk is rate-limiting this server for longer than this call can wait',
+      recovery:
+        'data.police.uk is rate-limiting this server; wait a few seconds, then call this tool again.',
+      retryable: true,
+      thrownBy: 'service',
+    },
+    {
+      reason: 'pacer_shed',
+      code: JsonRpcErrorCode.RateLimited,
+      when: 'too many requests to data.police.uk are already queued in this server',
+      recovery:
+        "This server's queue for data.police.uk is busy; wait a few seconds, then call this tool again.",
+      retryable: true,
+      thrownBy: 'service',
+    },
+    {
+      reason: 'upstream_unavailable',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      when: 'data.police.uk is not answering',
+      recovery: 'data.police.uk is not answering right now; call this tool again in a few minutes.',
+      retryable: true,
+      thrownBy: 'service',
+    },
+    {
+      reason: 'retry_deadline_exceeded',
+      code: JsonRpcErrorCode.Timeout,
+      when: 'data.police.uk did not answer within the time one call allows',
+      recovery:
+        'data.police.uk did not answer within the time one call allows; call this tool again in a minute.',
+      retryable: true,
+      thrownBy: 'service',
     },
   ],
 
@@ -245,13 +280,12 @@ export const listReferenceTool = tool('ukcrime_list_reference', {
         service.getAvailability(ctx, budget),
         service.getForces(ctx, budget),
       ]);
-      const forceEntry =
+      const match =
         force === undefined
           ? undefined
           : await service.findForce(force, ctx, budget, { allowBtp: true });
-      if (force !== undefined && !forceEntry) {
-        throw ctx.fail('unknown_force', `No police force '${force}'.`);
-      }
+      if (match?.kind === 'unknown') throw ctx.fail('unknown_force', match.message);
+      const forceEntry = match?.force;
       const everyForce = [...forces.map(({ id }) => id), BTP_FORCE.id];
       const rows =
         month === undefined
@@ -293,20 +327,14 @@ export const listReferenceTool = tool('ukcrime_list_reference', {
       if (force === undefined) {
         throw ctx.fail('force_required', "topic 'neighbourhoods' needs force.");
       }
-      const forceEntry = await service.findForce(force, ctx, budget, { allowBtp: false });
-      if (!forceEntry) {
-        throw ctx.fail(
-          'unknown_force',
-          force === BTP_FORCE.id
-            ? 'British Transport Police has no neighbourhoods.'
-            : `No police force '${force}'.`,
-        );
-      }
+      const match = await service.findForce(force, ctx, budget, { allowBtp: false });
+      if (match.kind === 'unknown') throw ctx.fail('unknown_force', match.message);
+      const forceEntry = match.force;
       const lookup = await service.getNeighbourhoods(forceEntry.id, ctx, budget);
       if (lookup.kind === 'miss') {
         throw ctx.fail(
           'unknown_force',
-          `data.police.uk lists no neighbourhoods for force '${force}'.`,
+          `data.police.uk lists no neighbourhoods for force '${forceEntry.id}'.`,
         );
       }
       const sorted = [...lookup.value].sort((a, b) => a.name.localeCompare(b.name, 'en'));

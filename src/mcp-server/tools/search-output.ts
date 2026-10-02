@@ -1,8 +1,8 @@
 /**
  * @fileoverview Output vocabulary shared by the ukcrime search tools
  * (docs/design.md, Shared output conventions): the location object, the area
- * echo, breakdowns, the enrichment block every search declares, and the
- * markdown renderers `format()` uses for them.
+ * echo, breakdowns, a range's per-month totals, the enrichment block every
+ * search declares, and the markdown renderers `format()` uses for them.
  * @module mcp-server/tools/search-output
  */
 
@@ -36,7 +36,7 @@ export const LocationSchema = z
 
 export type LocationOutput = z.infer<typeof LocationSchema>;
 
-/** The area as searched: the arm and its fields, plus what the point lookup found. */
+/** The area as searched: the arm and its fields, plus the forces its lookups found. */
 export const AreaEchoSchema = z
   .object({
     type: z.enum(AREA_KINDS).describe('The area arm searched.'),
@@ -52,11 +52,17 @@ export const AreaEchoSchema = z
     located_force: z
       .string()
       .optional()
-      .describe("Force covering the point, for 'point' when located."),
+      .describe("Force covering the point, or the location's map point, when located."),
     located_neighbourhood: z
       .string()
       .optional()
-      .describe("Neighbourhood covering the point, for 'point' when located."),
+      .describe("Neighbourhood covering the point, or the location's map point, when located."),
+    located_forces: z
+      .array(z.string().describe('Force id.'))
+      .optional()
+      .describe(
+        "For 'polygon': forces its bounding-box centre and outermost vertices were located in, sorted; a point whose lookup failed adds none. Absent when none was located.",
+      ),
   })
   .describe('The area as the server searched it.');
 
@@ -80,6 +86,23 @@ export const breakdownSchema = (description: string) =>
         .describe('A value and its count.'),
     )
     .describe(description);
+
+/** One month of a range: the month and its matched total. A tool with more per-month facts extends it. */
+export const MonthTotalSchema = z.object({
+  month: z.string().describe('Month, YYYY-MM.'),
+  total: z.number().describe('Matched records in this month, after every filter.'),
+});
+
+/** One by-month row as the renderer reads it; `force_published` is the stop-and-search column. */
+export interface MonthTotalRow {
+  readonly force_published?: boolean | undefined;
+  readonly month: string;
+  readonly total: number;
+}
+
+/** `by_month`: present only when `month_from` was given. */
+export const byMonthSchema = <Row extends z.ZodType>(row: Row, description: string) =>
+  z.array(row.describe('One month of the range.')).optional().describe(description);
 
 /** The enrichment block every search tool declares; each writes the required fields first. */
 export const SEARCH_ENRICHMENT = {
@@ -116,6 +139,8 @@ export function renderArea(area: AreaEcho): string {
   if (area.located_force !== undefined) parts.push(`located force ${inline(area.located_force)}`);
   if (area.located_neighbourhood !== undefined)
     parts.push(`located neighbourhood ${inline(area.located_neighbourhood)}`);
+  if (area.located_forces !== undefined)
+    parts.push(`located forces ${area.located_forces.map(inline).join(', ')}`);
   return parts.join(' · ');
 }
 
@@ -130,6 +155,32 @@ export function renderLocation(location: LocationOutput): string {
   if (location.type) parts.push(location.type === 'BTP' ? 'BTP (station)' : 'Force');
   if (location.subtype) parts.push(inline(location.subtype));
   return parts.join(' · ');
+}
+
+/**
+ * A range's per-month totals as a markdown section, oldest month first; a
+ * published column appears when any row carries `force_published` (`unknown`
+ * where one does not).
+ */
+export function renderByMonth(noun: string, rows: readonly MonthTotalRow[]): string[] {
+  const flagged = rows.some((row) => row.force_published !== undefined);
+  const lines = ['', '### By month', ''];
+  lines.push(
+    flagged
+      ? `| Month | ${noun} | Every force found for the area published |`
+      : `| Month | ${noun} |`,
+    flagged ? '|:--|--:|:--|' : '|:--|--:|',
+  );
+  for (const row of rows) {
+    const published =
+      row.force_published === undefined ? 'unknown' : row.force_published ? 'yes' : 'no';
+    lines.push(
+      flagged
+        ? `| ${row.month} | ${row.total} | ${published} |`
+        : `| ${row.month} | ${row.total} |`,
+    );
+  }
+  return lines;
 }
 
 /** A breakdown as a markdown section with a two-column table. */

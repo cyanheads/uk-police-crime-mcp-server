@@ -109,7 +109,15 @@ describe('publishesNothing', () => {
     ['btp', 'crime', false],
     ['leicestershire', 'crime', false],
   ])('%s %s → %s', (force, aspect, expected) => {
-    expect(publishesNothing(force, aspect)).toBe(expected);
+    expect(publishesNothing([force], aspect)).toBe(expected);
+  });
+
+  it.each<[string, readonly string[], KnownGapAspect, boolean]>([
+    ['no force known', [], 'outcomes', false],
+    ['every force silent', ['greater-manchester', 'northern-ireland'], 'outcomes', true],
+    ['one force publishing', ['northern-ireland', 'leicestershire'], 'outcomes', false],
+  ])('a list: %s → %s', (_name, forces, aspect, expected) => {
+    expect(publishesNothing(forces, aspect)).toBe(expected);
   });
 });
 
