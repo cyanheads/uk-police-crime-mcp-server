@@ -73,6 +73,13 @@ export function createUpstream(): Upstream {
   const routes = new Map<string, Responder>();
   const calls: UpstreamCall[] = [];
   const unhandled: string[] = [];
+  /**
+   * Requests whose responder has not settled, held as a real fetch holds a
+   * request in flight. A `Request` follows its caller's signal through a weak
+   * link, so once nothing else holds it a garbage collection cuts the abort
+   * path and a responder waiting on `request.signal` never ends.
+   */
+  const inFlight = new Set<Request>();
   const keyOf = (method: string, path: string) => `${method.toUpperCase()} ${path}`;
   const pathOf = (url: string) => new URL(url).pathname.slice(new URL(API_BASE).pathname.length);
 
@@ -83,7 +90,10 @@ export function createUpstream(): Upstream {
         respond: (request) => {
           const respond = routes.get(keyOf(request.method, pathOf(request.url)));
           if (!respond) throw new Error('route vanished');
-          return respond(request);
+          const answer = respond(request);
+          if (!(answer instanceof Promise)) return answer;
+          inFlight.add(request);
+          return answer.finally(() => inFlight.delete(request));
         },
       },
     ],
@@ -149,26 +159,28 @@ function uninstallVirtualClock(): void {
 
 /**
  * Waits in real time, with the virtual clock held still, until every digest the
- * test has started has finished and its caller has run on. The native digest
- * takes real time that load stretches, so a clock that moves meanwhile expires
- * timers and cache entries before the request they time has even started.
+ * test has started from index `from` on has finished and its caller has run on.
+ * The native digest takes real time that load stretches, so a clock that moves
+ * meanwhile expires timers and cache entries before the request they time has
+ * even started. Returns how many digests have been waited for.
  */
-async function untilDigested(): Promise<void> {
-  let seen = 0;
+async function untilDigested(from: number): Promise<number> {
+  let seen = from;
   while (digests && seen < digests.mock.results.length) {
     const started = digests.mock.results.slice(seen);
     seen += started.length;
     await Promise.all(started.map((result) => result.value));
     await new Promise<void>((resolve) => realSetImmediate(resolve));
   }
+  return seen;
 }
 
 /**
- * Drives a pending service call to completion on the virtual clock: first waits
- * for the digests already started ({@link untilDigested}), yields a few real
- * milliseconds (native stream work), then advances virtual time in `stepMs`
- * slices until the promise settles. Returns what the promise resolved to, or
- * rejects with what it rejected with.
+ * Drives a pending service call to completion on the virtual clock: yields a
+ * few real milliseconds (native stream work), then advances virtual time in
+ * `stepMs` slices until the promise settles, waiting before every slice for the
+ * digests started so far ({@link untilDigested}). Returns what the promise
+ * resolved to, or rejects with what it rejected with.
  */
 export async function settle<T>(promise: Promise<T>, stepMs = 50, limitMs = 300_000): Promise<T> {
   let done = false;
@@ -176,7 +188,7 @@ export async function settle<T>(promise: Promise<T>, stepMs = 50, limitMs = 300_
     done = true;
   };
   promise.then(watch, watch);
-  await untilDigested();
+  let digested = await untilDigested(0);
   let advanced = 0;
   let rounds = 0;
   while (!done && advanced <= limitMs) {
@@ -185,6 +197,7 @@ export async function settle<T>(promise: Promise<T>, stepMs = 50, limitMs = 300_
       rounds < 3 ? realSetTimeout(resolve, 2) : realSetImmediate(resolve),
     );
     rounds += 1;
+    digested = await untilDigested(digested);
     if (done) break;
     await vi.advanceTimersByTimeAsync(stepMs);
     advanced += stepMs;

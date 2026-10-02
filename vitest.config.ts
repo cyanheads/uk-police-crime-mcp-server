@@ -24,6 +24,7 @@ export default mergeConfig(
             name: 'unit',
             include: ['src/**/*.test.ts', 'tests/**/*.test.ts'],
             exclude: ['tests/smoke/**', 'tests/integration/**', 'tests/fuzz/**'],
+            testTimeout: 30_000,
           },
         },
         {

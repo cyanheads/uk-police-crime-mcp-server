@@ -142,24 +142,59 @@ describe('htmlToText', () => {
   });
 
   describe('time stays linear in the input', () => {
-    /** Loose enough for a busy machine; a quadratic scan takes seconds on these inputs. */
-    const BOUND_MS = 250;
+    /**
+     * Each input is converted at two sizes 16 times apart and timed in this
+     * thread's CPU time, which other load on the machine barely moves, keeping
+     * the fastest of five samples per size taken alternately. Linear time puts
+     * the large size near 16 times the small one and a quadratic scan near 256
+     * times; the test allows 64 times, and 50 ms of CPU for the large size,
+     * where a quadratic scan takes seconds.
+     */
+    const SMALL = 1_250;
+    const LARGE = 20_000;
+    const SAMPLES = 5;
+    const MAX_RATIO = 4 * (LARGE / SMALL);
+    const MAX_LARGE_MS = 50;
+    /** Room for a super-linear regression, seconds a sample, to fail on its numbers rather than on the clock. */
+    const REGRESSION_TIMEOUT_MS = 60_000;
+
+    /** CPU milliseconds this thread spends converting `html`. */
+    const cpuMs = (html: string): number => {
+      const start = process.threadCpuUsage();
+      htmlToText(html);
+      const spent = process.threadCpuUsage(start);
+      return (spent.user + spent.system) / 1000;
+    };
 
     it.each([
-      ['<script>', '<script>'.repeat(100_000)],
-      ['<!--', '<!--'.repeat(100_000)],
-      ['<br', '<br'.repeat(100_000)],
-      ['<a', '<a'.repeat(100_000)],
-      ['<a closed by one final ">"', `${'<a'.repeat(100_000)}>`],
-      ['<br closed by one final ">"', `${'<br'.repeat(100_000)}>`],
-      ['unclosed quoted values', `${'<a href="x '.repeat(100_000)}`],
-      ['</p with no ">"', '</p '.repeat(100_000)],
-      ['entity-like text', '&a'.repeat(100_000)],
-    ])('converts 100,000 repeats of %s in under 250 ms', (_name, html) => {
-      const start = performance.now();
-      htmlToText(html);
-      expect(performance.now() - start).toBeLessThan(BOUND_MS);
-    });
+      ['<script>', '<script>', ''],
+      ['<!--', '<!--', ''],
+      ['<br', '<br', ''],
+      ['<a', '<a', ''],
+      ['<a closed by one final ">"', '<a', '>'],
+      ['<br closed by one final ">"', '<br', '>'],
+      ['unclosed quoted values', '<a href="x ', ''],
+      ['</p with no ">"', '</p ', ''],
+      ['entity-like text', '&a', ''],
+    ])(
+      'takes time linear in 1,250 to 20,000 repeats of %s',
+      (_name, unit, tail) => {
+        const small = unit.repeat(SMALL) + tail;
+        const large = unit.repeat(LARGE) + tail;
+        // A first pass flattens both strings and compiles the paths they take.
+        htmlToText(small);
+        htmlToText(large);
+        let fastestSmall = Number.POSITIVE_INFINITY;
+        let fastestLarge = Number.POSITIVE_INFINITY;
+        for (let sample = 0; sample < SAMPLES; sample++) {
+          fastestSmall = Math.min(fastestSmall, cpuMs(small));
+          fastestLarge = Math.min(fastestLarge, cpuMs(large));
+        }
+        expect(fastestLarge).toBeLessThan(MAX_LARGE_MS);
+        expect(fastestLarge / fastestSmall).toBeLessThan(MAX_RATIO);
+      },
+      REGRESSION_TIMEOUT_MS,
+    );
   });
 
   describe('entities', () => {
