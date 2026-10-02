@@ -86,7 +86,7 @@ export const getCrimeOutcomesTool = tool('ukcrime_get_crime_outcomes', {
 });
 ```
 
-The three search tools share more: `parseArea()` validates the area arm, `runAreaQuery()` in `src/mcp-server/tools/area-search.ts` runs it (a neighbourhood resolves to its boundary polygon), the input fields come from `shared-schemas.ts`, and the output shapes (location, area echo, breakdowns, enrichment block) from `search-output.ts`. Describe a shared field once, there.
+The three search tools share more: `parseArea()` validates the area arm, `runAreaQuery()` in `src/mcp-server/tools/area-search.ts` runs it (a neighbourhood resolves to its boundary polygon) and returns `forces`, the force ids found for the area — the one a named arm carries, or those `/locate-neighbourhood` finds for a point, a polygon's sample points or a location's map point — which every coverage note and `force_published` read. Crimes and stops also take `month_from`: `resolveMonthWindow()` checks the range's months before any area request, and `runAreaWindow()` runs the area: through `runAreaQuery()` for one month, or once per month of a range — two months in flight, all-or-nothing, stopped by the call's budget or the range's size bound — and finds the forces once for the range. The input schemas come from `shared-schemas.ts`, and the area fields the searches share, `month_from` included, are described once in `area-search.ts`; the output shapes (location, area echo, breakdowns, `by_month`, enrichment block) come from `search-output.ts`. Describe a shared field once, in one of those two.
 
 ### Entry point
 
