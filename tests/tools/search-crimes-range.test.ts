@@ -738,18 +738,19 @@ describe('ukcrime_search_crimes over a month range', () => {
         short(4, '2026-01'),
         short(2, '2025-11'),
       ]);
-      // Each month went out with at least 30 s of its call's 50 s budget left.
+      // Each month went out with at least 30 s of its call's 50 s budget left; sorted, since months sent at the same instant can go in either order.
       expect(
         h.upstream
           .callsTo(STREET)
-          .map((sent) => `${sent.query.get('lat')} ${sent.query.get('date')} ${sent.at - start}`),
+          .map((sent) => `${sent.query.get('lat')} ${sent.query.get('date')} ${sent.at - start}`)
+          .sort(),
       ).toEqual([
         '52.610000 2025-09 0',
         '52.610000 2025-10 0',
-        '52.620000 2025-09 0',
-        '52.620000 2025-10 17000',
         '52.610000 2025-11 17000',
         '52.610000 2025-12 17000',
+        '52.620000 2025-09 0',
+        '52.620000 2025-10 17000',
       ]);
     });
 
