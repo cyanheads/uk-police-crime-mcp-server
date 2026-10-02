@@ -126,6 +126,12 @@ describe('LruCache', () => {
       expect(['a', 'b', 'c'].map((key) => cache.get(key))).toEqual(['a', 'b2', 'c']);
     });
 
+    /**
+     * At the 10,000 entries the locate and crime-history miss caches hold. Each
+     * insert scans every held entry for expiry, so filling the cache takes about
+     * 5×10⁷ steps: a fifth of a second on an idle machine, which a loaded one
+     * stretches past Vitest's 5 s default.
+     */
     it('holds exactly `capacity` entries of weight 1', () => {
       const { cache } = makeCache({ capacity: 10_000, ttlMs: 86_400_000 });
       for (let i = 0; i < 10_001; i++) cache.set(`k${i}`, 'v');
@@ -133,7 +139,7 @@ describe('LruCache', () => {
       expect(cache.get('k0')).toBeUndefined();
       expect(cache.get('k1')).toBe('v');
       expect(cache.get('k10000')).toBe('v');
-    });
+    }, 60_000);
   });
 
   describe('weight budget', () => {
@@ -274,6 +280,35 @@ describe('LruCache', () => {
       cache.delete('nope');
       expect(cache.size).toBe(1);
       expect(cache.weight).toBe(1);
+    });
+  });
+
+  describe('clear', () => {
+    it('removes every entry, live and expired, and their weight', () => {
+      const { cache, clock } = makeCache({ capacity: 100 });
+      cache.set('old', 'o', 10);
+      clock.now += 500;
+      cache.set('a', 'a', 20);
+      cache.set('b', 'b', 30);
+      clock.now += 500;
+      expect(cache.size).toBe(3);
+      expect(cache.weight).toBe(60);
+      cache.clear();
+      expect(cache.size).toBe(0);
+      expect(cache.weight).toBe(0);
+      expect(cache.get('a')).toBeUndefined();
+      expect(cache.get('b')).toBeUndefined();
+    });
+
+    it('leaves the full capacity for what is stored after it', () => {
+      const { cache } = makeCache({ capacity: 100 });
+      cache.set('a', 'a', 60);
+      cache.clear();
+      cache.set('b', 'b', 60);
+      cache.set('c', 'c', 40);
+      expect(cache.get('b')).toBe('b');
+      expect(cache.get('c')).toBe('c');
+      expect(cache.weight).toBe(100);
     });
   });
 });

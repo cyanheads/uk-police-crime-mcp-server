@@ -83,6 +83,12 @@ export class LruCache<V> {
     return true;
   }
 
+  /** Removes every entry. */
+  clear(): void {
+    this.entries.clear();
+    this.totalWeight = 0;
+  }
+
   /** Removes `key` if present. */
   delete(key: string): void {
     const entry = this.entries.get(key);
