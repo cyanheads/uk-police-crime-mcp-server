@@ -1,6 +1,6 @@
 # uk-police-crime-mcp-server - Directory Structure
 
-Generated on: 2026-10-01 17:42:43
+Generated on: 2026-10-02 15:36:52
 
 ```text
 uk-police-crime-mcp-server/
@@ -171,6 +171,7 @@ uk-police-crime-mcp-server/
 │   │   ├── lru-cache.test.ts
 │   │   ├── police-api-service.boundary.test.ts
 │   │   ├── police-api-service.cache.test.ts
+│   │   ├── police-api-service.force-match.test.ts
 │   │   ├── police-api-service.neighbourhood.test.ts
 │   │   ├── police-api-service.reference.test.ts
 │   │   ├── records-neighbourhood.test.ts
@@ -183,10 +184,13 @@ uk-police-crime-mcp-server/
 │       ├── find-neighbourhood.tool.test.ts
 │       ├── get-crime-outcomes.tool.test.ts
 │       ├── list-reference.tool.test.ts
+│       ├── search-crimes-range.test.ts
 │       ├── search-crimes.tool.test.ts
 │       ├── search-outcomes.tool.test.ts
 │       ├── search-output.test.ts
-│       └── search-stops.tool.test.ts
+│       ├── search-stops-range.test.ts
+│       ├── search-stops.tool.test.ts
+│       └── upstream-failures.test.ts
 ├── .dockerignore
 ├── .env.example
 ├── .gitattributes
