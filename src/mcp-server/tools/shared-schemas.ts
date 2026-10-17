@@ -56,7 +56,7 @@ export const forceInput = blankAsUnset(
 );
 
 /**
- * Neighbourhood id: trimmed only (ids are case-sensitive); path-safe — no `/`,
+ * Neighbourhood id: trimmed, preserving spelling for the exact-first request; path-safe — no `/`,
  * `\`, `?`, `#`, control characters, or a whole `.`/`..` — and well-formed
  * UTF-16, since `encodeURIComponent` throws on an unpaired surrogate.
  */
@@ -176,9 +176,9 @@ export const polygonInput = z.preprocess(
   z.array(PolygonVertex).min(3).max(POLYGON_MAX_VERTICES).optional(),
 );
 
-/** Page size for the search tools, 1–200. */
+/** Accepted requested page size; handlers apply the 200-row response cap. */
 export const limitInput = (defaultLimit: number) =>
-  z.number().int().min(1).max(200).default(defaultLimit);
+  z.number().int().min(1).max(10_000).default(defaultLimit);
 
 /** Rows to skip before the page. */
 export const offsetInput = z.number().int().min(0).default(0);

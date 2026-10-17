@@ -393,13 +393,12 @@ describe('ukcrime_search_crimes', () => {
     });
 
     it('fails unknown_neighbourhood (NotFound) on a boundary 404, before any crime request', async () => {
+      h.upstream.route('GET', '/leicestershire/neighbourhoods', jsonOk([]));
       h.upstream.route('GET', '/leicestershire/zz99/boundary', plainNotFound);
       const error = errorOf(await call({ ...NEIGHBOURHOOD, neighbourhood_id: 'zz99' }));
       expect(error.code).toBe(JsonRpcErrorCode.NotFound);
       expect(error.data.reason).toBe('unknown_neighbourhood');
-      expect(error.message).toBe(
-        "Force 'leicestershire' has no neighbourhood 'zz99'; ids are case-sensitive.",
-      );
+      expect(error.message).toBe("Force 'leicestershire' has no neighbourhood 'zz99'.");
       expect(error.data.recovery?.hint).toContain("topic 'neighbourhoods'");
       expect(h.upstream.count('/crimes-street/all-crime')).toBe(0);
     });
@@ -429,14 +428,13 @@ describe('ukcrime_search_crimes', () => {
     });
 
     it('names the matched id, not the display name sent, when the neighbourhood is unknown', async () => {
+      h.upstream.route('GET', '/metropolitan/neighbourhoods', jsonOk([]));
       h.upstream.route('GET', '/metropolitan/zz99/boundary', plainNotFound);
       const error = errorOf(
         await call({ ...NEIGHBOURHOOD, force: 'Metropolitan Police', neighbourhood_id: 'zz99' }),
       );
       expect(error.data.reason).toBe('unknown_neighbourhood');
-      expect(error.message).toBe(
-        "Force 'metropolitan' has no neighbourhood 'zz99'; ids are case-sensitive.",
-      );
+      expect(error.message).toBe("Force 'metropolitan' has no neighbourhood 'zz99'.");
     });
 
     it('refuses British Transport Police here with the btp message, before reading a boundary', async () => {
@@ -836,18 +834,23 @@ describe('ukcrime_search_crimes', () => {
       },
     );
 
-    it('applies limit 200 and pages a large area, with breakdowns over the whole matched set', async () => {
-      pointRoutes(manyCrimes(1500));
-      const out = data(await call({ ...POINT, limit: 200, month: '2026-07' }));
-      expect(out.total).toBe(1500);
-      expect(out.crimes).toHaveLength(200);
-      expect(out.next_offset).toBe(200);
-      expect(out.cap).toBe(200);
-      expect(out.by_category.reduce((sum, row) => sum + row.count, 0)).toBe(1500);
-      expect(out.top_locations).toHaveLength(10);
-      expect(out.top_locations?.every((spot) => spot.count === 60)).toBe(true);
-      expect(out.notice).toBe('Showing 1–200 of 1500; call again with offset 200 for more.');
-    });
+    it.each([200, 201, 10000])(
+      'applies limit %d as cap 200 and pages a large area, with full-match breakdowns',
+      async (limit) => {
+        pointRoutes(manyCrimes(1500));
+        const result = await call({ ...POINT, limit, month: '2026-07' });
+        const out = data(result);
+        expect(out.total).toBe(1500);
+        expect(out.crimes).toHaveLength(200);
+        expect(out.next_offset).toBe(200);
+        expect(out.cap).toBe(200);
+        expect(out.by_category.reduce((sum, row) => sum + row.count, 0)).toBe(1500);
+        expect(out.top_locations).toHaveLength(10);
+        expect(out.top_locations?.every((spot) => spot.count === 60)).toBe(true);
+        expect(out.notice).toBe('Showing 1–200 of 1500; call again with offset 200 for more.');
+        expect(text(result)).toContain('Next offset:');
+      },
+    );
 
     it('uses a default page of 25', async () => {
       pointRoutes(manyCrimes(120));
@@ -859,9 +862,9 @@ describe('ukcrime_search_crimes', () => {
 
     it.each<[string, Record<string, unknown>]>([
       ['limit 0', { limit: 0 }],
-      ['limit 201', { limit: 201 }],
+      ['limit 10001', { limit: 10001 }],
       ['a fractional limit', { limit: 1.5 }],
-      ['a string limit', { limit: '5' }],
+      ['a non-numeric string limit', { limit: 'five' }],
       ['a negative offset', { offset: -1 }],
       ['a fractional offset', { offset: 0.5 }],
     ])('rejects %s as invalid_arguments, before any request', async (_name, extra) => {
@@ -869,6 +872,14 @@ describe('ukcrime_search_crimes', () => {
       expect(error.code).toBe(JsonRpcErrorCode.InvalidParams);
       expect(error.data.reason).toBe('invalid_arguments');
       expect(h.upstream.calls).toHaveLength(0);
+    });
+
+    it('repairs a numeric string limit before paging', async () => {
+      pointRoutes(manyCrimes(10));
+      const out = data(await callRaw({ ...POINT, month: '2026-07', limit: '5' }));
+      expect(out.crimes).toHaveLength(5);
+      expect(out.cap).toBe(5);
+      expect(out.next_offset).toBe(5);
     });
 
     it('caps top_locations at 10 map points, most crimes first, then by id', async () => {
@@ -953,7 +964,8 @@ describe('ukcrime_search_crimes', () => {
       h.upstream.route('GET', '/locate-neighbourhood', status(500));
       const out = data(await call({ ...POINT, month: '2026-07' }));
       expect(out.area).toEqual({ type: 'point', lat: LAT, lng: LNG });
-      expect(out.notice).toBe(ZERO_GENERIC.replace('2026-08', '2026-07'));
+      expect(out.notice).toContain(ZERO_GENERIC.replace('2026-08', '2026-07'));
+      expect(out.notice).toContain('Coverage could not be checked');
     });
 
     it('polygon outside the coverage box', async () => {
@@ -1781,7 +1793,7 @@ describe('ukcrime_search_crimes', () => {
       const out = data(await call({ ...POINT, month: '2026-07' }));
       expect(out.total).toBe(7);
       expect(out.area).toEqual({ type: 'point', lat: LAT, lng: LNG });
-      expect(out.notice).toBeUndefined();
+      expect(out.notice).toContain('Coverage could not be checked');
     });
 
     it('degrades the same way for a locate body of the wrong shape and for a hung locate', async () => {
@@ -1949,7 +1961,8 @@ describe('ukcrime_search_crimes', () => {
       );
       const out = data(await call({ area: 'polygon', polygon: GMP_RING, month: '2026-07' }));
       expect(out.area).not.toHaveProperty('located_forces');
-      expect(out.notice).toBe(ZERO_JULY);
+      expect(out.notice).toContain(ZERO_JULY);
+      expect(out.notice).toContain('Coverage could not be checked');
     });
 
     it('says a straddle’s lookups were partial and keeps the generic line when the publishing side failed, on both surfaces', async () => {

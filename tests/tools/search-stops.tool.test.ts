@@ -115,6 +115,85 @@ describe('ukcrime_search_stops', () => {
   const forceRoute = (body: unknown = stopsBody()) =>
     h.upstream.route('GET', '/stops-force', jsonOk(body));
 
+  it.each([200, 201, 10000])(
+    'applies requested stop limit %d as cap 200 through cached page re-slices',
+    async (limit) => {
+      const records = manyStops(450).map((stop, index) => ({
+        ...stop,
+        datetime: `2026-08-01T00:${String(Math.floor(index / 60)).padStart(2, '0')}:${String(index % 60).padStart(2, '0')}+00:00`,
+      }));
+      forceRoute(records);
+      const seen: string[] = [];
+      for (const offset of [0, 200, 400, 600]) {
+        const result = await call({ ...FORCE, month: '2026-08', limit, offset });
+        const out = data(result);
+        expect(out.cap).toBe(200);
+        expect(out.total).toBe(450);
+        expect(out.stops).toHaveLength(
+          offset === 0 || offset === 200 ? 200 : offset === 400 ? 50 : 0,
+        );
+        expect(out.next_offset).toBe(offset < 400 ? offset + 200 : undefined);
+        expect(out.truncated).toBe(offset < 400);
+        expect(text(result)).toContain(`### Stops on this page (${out.stops.length})`);
+        seen.push(...out.stops.map((stop) => stop.datetime));
+      }
+      expect(seen).toHaveLength(450);
+      expect(seen).toEqual(records.map((stop) => stop.datetime));
+      expect(h.upstream.count('/stops-force')).toBe(1);
+    },
+  );
+
+  describe('documented false outcomes', () => {
+    it.each(['nothing FOUND', '(NOT RECORDED)', 'missing'])(
+      'filters normalized false separately from missing for %s',
+      async (value) => {
+        const { outcome: _outcome, ...absent } = stopRecord();
+        forceRoute([
+          stopRecord({ outcome: false, outcome_linked_to_object_of_search: true }),
+          stopRecord({ outcome: 'Arrest' }),
+          stopRecord({ outcome: '' }),
+          stopRecord({ outcome: null }),
+          absent,
+        ]);
+        const all = await call({ ...FORCE, month: '2026-08' });
+        expect(data(all).by_outcome).toEqual([
+          { value: '(not recorded)', count: 3 },
+          { value: 'Arrest', count: 1 },
+          { value: 'Nothing found', count: 1 },
+        ]);
+        expect(text(all)).toContain('Nothing found');
+        const result = await call({
+          ...FORCE,
+          month: '2026-08',
+          filters: [{ field: 'outcome', value }],
+        });
+        const out = data(result);
+        expect(out.total).toBe(value === 'nothing FOUND' ? 1 : value === '(NOT RECORDED)' ? 3 : 0);
+        expect(out.by_outcome.reduce((sum, row) => sum + row.count, 0)).toBe(out.total);
+        if (value === 'nothing FOUND') {
+          expect(out.stops[0]).toMatchObject({
+            outcome: 'Nothing found',
+            outcome_linked_to_object_of_search: true,
+          });
+          expect(text(result)).toContain('Nothing found');
+        } else if (value === 'missing') {
+          expect(out.notice).toContain('Nothing found');
+          expect(out.notice).toContain('(not recorded)');
+          expect(text(result)).toContain('Nothing found');
+        } else for (const stop of out.stops) expect(stop).not.toHaveProperty('outcome');
+      },
+    );
+
+    it('still rejects true outcome as a non-retryable upstream-shape failure on both surfaces', async () => {
+      forceRoute([stopRecord({ outcome: true })]);
+      const result = await call({ ...FORCE, month: '2026-08' });
+      const error = errorOf(result);
+      expect(error.data.reason).toBe('unexpected_response');
+      expect(error.data.retryable).toBe(false);
+      expect(text(result)).toContain(error.message);
+    });
+  });
+
   describe('area point', () => {
     it('returns totals, every breakdown and a page sorted by datetime then location, located and published', async () => {
       pointRoutes();
@@ -347,13 +426,12 @@ describe('ukcrime_search_stops', () => {
     });
 
     it('fails unknown_neighbourhood (NotFound) on a boundary 404, before any stop request', async () => {
+      h.upstream.route('GET', '/leicestershire/neighbourhoods', jsonOk([]));
       h.upstream.route('GET', '/leicestershire/zz99/boundary', plainNotFound);
       const error = errorOf(await call({ ...NEIGHBOURHOOD, neighbourhood_id: 'zz99' }));
       expect(error.code).toBe(JsonRpcErrorCode.NotFound);
       expect(error.data.reason).toBe('unknown_neighbourhood');
-      expect(error.message).toBe(
-        "Force 'leicestershire' has no neighbourhood 'zz99'; ids are case-sensitive.",
-      );
+      expect(error.message).toBe("Force 'leicestershire' has no neighbourhood 'zz99'.");
       expect(error.data.recovery?.hint).toContain("topic 'neighbourhoods'");
       expect(h.upstream.count('/stops-street')).toBe(0);
     });
@@ -391,14 +469,13 @@ describe('ukcrime_search_stops', () => {
     });
 
     it('names the matched id when a display name finds no such neighbourhood', async () => {
+      h.upstream.route('GET', '/leicestershire/neighbourhoods', jsonOk([]));
       h.upstream.route('GET', '/leicestershire/zz99/boundary', plainNotFound);
       const error = errorOf(
         await call({ ...NEIGHBOURHOOD, force: 'Leicestershire Police', neighbourhood_id: 'zz99' }),
       );
       expect(error.data.reason).toBe('unknown_neighbourhood');
-      expect(error.message).toBe(
-        "Force 'leicestershire' has no neighbourhood 'zz99'; ids are case-sensitive.",
-      );
+      expect(error.message).toBe("Force 'leicestershire' has no neighbourhood 'zz99'.");
     });
 
     it('refuses British Transport Police with the no-neighbourhoods message', async () => {
@@ -1478,7 +1555,7 @@ describe('ukcrime_search_stops', () => {
       const out = data(await call(STRADDLE));
       expect(out).not.toHaveProperty('force_published');
       expect(out.area).toEqual({ type: 'polygon', vertex_count: 4 });
-      expect(out.notice).toBeUndefined();
+      expect(out.notice).toContain('Coverage could not be checked');
     });
 
     it('locates a location from its stops’ map point and checks that force’s publication', async () => {
@@ -1770,7 +1847,7 @@ describe('ukcrime_search_stops', () => {
 
     it.each<[string, Record<string, unknown>]>([
       ['limit 0', { limit: 0 }],
-      ['limit 201', { limit: 201 }],
+      ['limit 10001', { limit: 10001 }],
       ['a fractional limit', { limit: 2.5 }],
       ['a negative offset', { offset: -1 }],
     ])('rejects %s as invalid_arguments', async (_name, extra) => {
@@ -2199,7 +2276,7 @@ describe('ukcrime_search_stops', () => {
       expect(out.total).toBe(6);
       expect(out.area).toEqual({ type: 'point', lat: LAT, lng: LNG });
       expect(out).not.toHaveProperty('force_published');
-      expect(out.notice).toBeUndefined();
+      expect(out.notice).toContain('Coverage could not be checked');
     });
 
     it('caches the locate across searches of the same point', async () => {

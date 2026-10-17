@@ -25,6 +25,7 @@ import {
   type Pacer,
   withRetry,
 } from '@cyanheads/mcp-ts-core/utils';
+import { inline } from '@/mcp-server/tools/format-helpers.js';
 import { LruCache } from './lru-cache.js';
 import {
   RawBoundary,
@@ -645,6 +646,37 @@ export class PoliceApiService {
   }
 
   // --- Area lookups ----------------------------------------------------------
+
+  /** After a genuine detail/boundary miss, find an exact or uniquely case-folded catalog id. */
+  async matchNeighbourhoodAfterMiss(
+    force: string,
+    id: string,
+    ctx: Context,
+    budget: CallBudget,
+  ): Promise<string | undefined> {
+    const listed = await this.getNeighbourhoods(force, ctx, budget);
+    ctx.signal.throwIfAborted();
+    if (listed.kind === 'miss') return;
+    const exact = listed.value.find((entry) => entry.id === id);
+    if (exact) return exact.id;
+    const folded = id.toLowerCase();
+    const candidates = [
+      ...new Set(
+        listed.value.filter((entry) => entry.id.toLowerCase() === folded).map((entry) => entry.id),
+      ),
+    ];
+    if (candidates.length > 1) {
+      const hint = `Send one of these exact neighbourhood ids: ${candidates.map((candidate) => `'${inline(candidate)}'`).join(', ')}.`;
+      throw validationError(
+        `Neighbourhood '${inline(id)}' matches more than one id in force '${inline(force)}'. ${hint}`,
+        {
+          reason: 'ambiguous_neighbourhood',
+          recovery: { hint },
+        },
+      );
+    }
+    return candidates[0];
+  }
 
   /**
    * `/locate-neighbourhood?q=lat,lng` — the force and neighbourhood covering a

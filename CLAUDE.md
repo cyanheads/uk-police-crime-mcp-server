@@ -2,10 +2,10 @@
 
 **Server:** uk-police-crime-mcp-server
 **Version:** 0.1.2
-**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.10`
+**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.15`
 **Engines:** Bun ≥1.4.0, Node ≥24.0.0
-**MCP SDK:** `@modelcontextprotocol/server` ^2.1.0
-**Zod:** ^4.6.5
+**MCP SDK:** `@modelcontextprotocol/server` ^2.3.1
+**Zod:** ^4.6.7
 
 > **Read the framework docs first:** `node_modules/@cyanheads/mcp-ts-core/CLAUDE.md` contains the full API reference — builders, Context, error codes, exports, patterns. This file covers server-specific conventions only.
 
@@ -55,9 +55,9 @@ import { getPoliceApiService } from '@/services/police-api/police-api-service.js
 
 export const getCrimeOutcomesTool = tool('ukcrime_get_crime_outcomes', {
   title: 'Get UK Crime Outcome Histories',
-  description: 'Fetch the full police outcome history of up to 25 crimes by persistent_id …',
+  description: 'Fetch up to 25 histories per call; accept up to 1,000 ids and return remaining_ids …',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
-  input: z.object({ persistent_ids: /* 1–25 64-hex ids; a delimited string is accepted */ }),
+  input: z.object({ persistent_ids: /* up to 1,000 raw elements/tokens, 128,000 UTF-16 units; process 25 unique ids */ }),
   inputAliases: { persistent_id: 'persistent_ids' },
   output: OutputSchema,
   enrichment: {
@@ -71,7 +71,7 @@ export const getCrimeOutcomesTool = tool('ukcrime_get_crime_outcomes', {
     const service = getPoliceApiService();
     const budget = service.openBudget();
     const results = await Promise.all(
-      input.persistent_ids.map((id) =>
+      input.persistent_ids.slice(0, 25).map((id) =>
         service.getCrimeHistory(id, ctx, budget).then(
           (lookup) => ({ id, lookup }),
           (error: unknown) => ({ id, error }),
@@ -79,7 +79,7 @@ export const getCrimeOutcomesTool = tool('ukcrime_get_crime_outcomes', {
       ),
     );
     // … sort into crimes / not_found / failed; every lookup failing rethrows as an outage
-    return { crimes, not_found: notFound, failed };
+    return { crimes, not_found: notFound, failed, remaining_ids: input.persistent_ids.slice(25) };
   },
 
   format: (result) => [{ type: 'text', text: renderHistories(result) }],
@@ -343,7 +343,7 @@ security: false                            # optional — true ONLY for a source
 
 ## Publishing
 
-**Every release goes through a release PR, straight-through** — `git-wrapup`'s "Release PR mode", mode `straight-through`. One run: `git-wrapup` lands the commit stack on `release/<version>`, pushes it, and opens the PR (title = the release commit subject, body = the changelog entry plus a gates section); `release-and-publish` then fast-forwards `main` locally with `git merge --ff-only`, creates the tag on `main`'s tip, pushes `main` and the tag, deletes the branch, and publishes. A caller's brief may run a given release as `gated` instead — a `release-pr-review` pass on the open PR before `release-and-publish`. **Never merge through the GitHub UI or `gh pr merge`**: squash and rebase-merge are disabled in the repo settings because both rewrite the stack (rebase-merge also strips the SSH signatures), and a merge commit breaks the linear history.
+**Every release goes through a release PR, straight-through** — `git-wrapup`'s "Release PR mode", mode `straight-through`. One run: `git-wrapup` lands the commit stack on `release/<version>`, pushes it, and opens the PR (title = the release commit subject, body = the release digest: theme line, `## Changes`, `## Gates`, changelog link last); `release-and-publish` then fast-forwards `main` locally with `git merge --ff-only`, creates the tag on `main`'s tip, pushes `main` and the tag, deletes the branch, and publishes. A caller's brief may run a given release as `gated` instead — a `release-pr-review` pass on the open PR before `release-and-publish`. **Never merge through the GitHub UI or `gh pr merge`**: squash and rebase-merge are disabled in the repo settings because both rewrite the stack (rebase-merge also strips the SSH signatures), and a merge commit breaks the linear history.
 
 ---
 

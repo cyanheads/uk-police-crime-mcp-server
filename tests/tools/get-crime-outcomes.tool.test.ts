@@ -2,7 +2,7 @@
  * @fileoverview ukcrime_get_crime_outcomes through `runToolContract` (the
  * production parse of output extended with enrichment): input preprocessing
  * (strings split on commas and whitespace, lower-cased, blanks and repeats
- * dropped, cut at 26), the `persistent_id` alias, per-id isolation (404 is a
+ * dropped within raw bounds, first 25 processed, remainder returned), the `persistent_id` alias, per-id isolation (404 is a
  * result, other failures are results, an all-ids failure fails with the first
  * one's class in server-written text, an aborted signal throws), `outcomes:
  * null`, request pacing (four lookups per call, misses cached), the enrichment
@@ -303,6 +303,61 @@ describe('ukcrime_get_crime_outcomes', () => {
   });
 
   describe('input limits and validation', () => {
+    it('walks three continuation batches without losing, repeating or reordering ids', async () => {
+      const ids = persistentIds(60);
+      found(...ids);
+      let remaining = [...ids];
+      const seen: string[] = [];
+      const sizes: number[] = [];
+      while (remaining.length > 0) {
+        const out = data(await call({ persistent_ids: remaining }));
+        seen.push(...out.crimes.map((crime) => crime.persistent_id));
+        sizes.push(out.crimes.length);
+        remaining = out.remaining_ids;
+      }
+      expect(sizes).toEqual([25, 25, 10]);
+      expect(seen).toEqual(ids);
+      expect(h.upstream.calls).toHaveLength(60);
+    });
+    it('advertises the raw array and string ceilings', () => {
+      const advertised = getCrimeOutcomesTool.input['~standard'].jsonSchema.input({
+        target: 'draft-2020-12',
+      });
+      expect(advertised).toMatchObject({
+        properties: {
+          persistent_ids: {
+            anyOf: [
+              { type: 'string', maxLength: 128000 },
+              { type: 'array', maxItems: 1000 },
+            ],
+          },
+        },
+      });
+    });
+    it('characterizes ordered results for a full 25-id batch', async () => {
+      const ids = persistentIds(25);
+      found(...ids);
+      expect(
+        data(await call({ persistent_ids: ids })).crimes.map((crime) => crime.persistent_id),
+      ).toEqual(ids);
+      expect(h.upstream.calls).toHaveLength(25);
+    });
+
+    it('processes 25 of 26 ids and continues the ordered remainder on both surfaces', async () => {
+      const ids = persistentIds(26);
+      found(...ids);
+      const first = await call({ persistent_ids: ids });
+      expect(data(first).crimes.map((crime) => crime.persistent_id)).toEqual(ids.slice(0, 25));
+      expect(data(first).remaining_ids).toEqual(ids.slice(25));
+      expect(data(first).failed).toEqual([]);
+      expect(data(first).not_found).toEqual([]);
+      expect(text(first)).toContain(ids[25]);
+      expect(text(first)).toContain('remaining_ids');
+      expect(h.upstream.calls).toHaveLength(25);
+      const last = data(await call({ persistent_ids: data(first).remaining_ids }));
+      expect(last.crimes.map((crime) => crime.persistent_id)).toEqual(ids.slice(25));
+      expect(last.remaining_ids).toEqual([]);
+    });
     it('accepts exactly 25 ids and sends 25 requests', async () => {
       const ids = persistentIds(25);
       found(...ids);
@@ -318,19 +373,60 @@ describe('ukcrime_get_crime_outcomes', () => {
       expect(out.crimes).toHaveLength(25);
     });
 
-    it('rejects 26 distinct ids as InvalidParams, before any request', async () => {
-      const error = errorOf(await callRaw({ persistent_ids: persistentIds(26) }));
+    it('rejects 1,001 raw ids as InvalidParams, before any request', async () => {
+      const error = errorOf(await callRaw({ persistent_ids: persistentIds(1001) }));
       expect(error.code).toBe(JsonRpcErrorCode.InvalidParams);
       expect(error.data.reason).toBe('invalid_arguments');
       expect(h.upstream.calls).toHaveLength(0);
     });
 
-    it('cuts an over-long list at 26 first, so the rejection names the list once, not once per extra id', async () => {
-      const error = errorOf(await callRaw({ persistent_ids: persistentIds(300).join(',') }));
+    it('rejects too many tokens with one bounded error', async () => {
+      const error = errorOf(await callRaw({ persistent_ids: persistentIds(1001).join(',') }));
       expect(error.code).toBe(JsonRpcErrorCode.InvalidParams);
       expect(error.message.match(/persistent_ids/g)?.length ?? 0).toBeLessThanOrEqual(2);
       expect(error.message.length).toBeLessThan(600);
       expect(h.upstream.calls).toHaveLength(0);
+    });
+
+    it.each([25, 26, 1000])(
+      'accepts %d tokens and processes only the first 25 unique ids',
+      async (count) => {
+        const ids = persistentIds(count);
+        found(...ids.slice(0, 25));
+        const out = data(await callRaw({ persistent_ids: ids.join(',\n') }));
+        expect(out.crimes.map((crime) => crime.persistent_id)).toEqual(ids.slice(0, 25));
+        expect(out.remaining_ids).toEqual(ids.slice(25));
+        expect(h.upstream.calls).toHaveLength(Math.min(count, 25));
+      },
+    );
+
+    it.each([
+      ['raw duplicates', Array.from({ length: 1001 }, () => A)],
+      ['raw blanks', [A, ...Array.from({ length: 1000 }, () => '')]],
+      ['duplicate tokens', Array.from({ length: 1001 }, () => A).join(',')],
+      ['padded string', A + ' '.repeat(128001 - A.length)],
+      ['aggregate padding', [A, ' '.repeat(128001 - A.length)]],
+      ['invalid remainder', [...persistentIds(25), 'invalid']],
+      ['invalid last id', [...persistentIds(999), 'invalid']],
+    ])('rejects %s before any request', async (_name, input) => {
+      const result = await callRaw({ persistent_ids: input });
+      const error = errorOf(result);
+      expect(error.code).toBe(JsonRpcErrorCode.InvalidParams);
+      expect(error.data.reason).toBe('invalid_arguments');
+      expect(error.data.recovery?.hint).toBeTruthy();
+      expect(text(result)).toContain(error.data.recovery?.hint);
+      expect(h.upstream.calls).toHaveLength(0);
+    });
+
+    it('accepts the exact character and duplicate-token ceilings', async () => {
+      found(A);
+      const out = data(await callRaw({ persistent_ids: A + ' '.repeat(128000 - A.length) }));
+      expect(out.remaining_ids).toEqual([]);
+      expect(out.crimes).toHaveLength(1);
+      expect(
+        data(await callRaw({ persistent_ids: Array.from({ length: 1000 }, () => A) })).crimes,
+      ).toHaveLength(1);
+      expect(h.upstream.calls).toHaveLength(2);
     });
 
     it.each<[string, unknown]>([
@@ -697,6 +793,19 @@ describe('ukcrime_get_crime_outcomes', () => {
   });
 
   describe('request pacing', () => {
+    it('keeps oversized batches at four workers and fails when all processed ids fail', async () => {
+      const ids = persistentIds(30);
+      const tracker = trackInFlight(200, jsonOk({ nope: true }));
+      for (const id of ids.slice(0, 25)) h.upstream.route('GET', pathOf(id), tracker.respond);
+      const result = await call({ persistent_ids: ids });
+      const error = errorOf(result);
+      expect(error.data.reason).toBe('unexpected_response');
+      expect(error.data.retryable).toBe(false);
+      expect(text(result)).toContain(error.message);
+      expect(tracker.peak()).toBeLessThanOrEqual(4);
+      expect(h.upstream.calls).toHaveLength(25);
+      expect(h.upstream.calls.map((request) => request.path)).toEqual(ids.slice(0, 25).map(pathOf));
+    });
     it('sends one request per distinct id, never more than four in flight, and finishes inside the call budget', async () => {
       const ids = persistentIds(25);
       const tracker = trackInFlight(200, (request) => {
@@ -972,6 +1081,7 @@ describe('ukcrime_get_crime_outcomes', () => {
     it('escapes a failed-lookup error so it stays one inert line', async () => {
       const output = {
         crimes: [],
+        remaining_ids: [],
         not_found: [],
         failed: [{ persistent_id: A, error: 'Boom\r\n# Injected [x](https://evil.test)' }],
         guidance: 'Guidance\r\n# Injected too',

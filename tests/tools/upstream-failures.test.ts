@@ -24,6 +24,9 @@ import { searchCrimesTool } from '@/mcp-server/tools/definitions/search-crimes.t
 import { searchOutcomesTool } from '@/mcp-server/tools/definitions/search-outcomes.tool.js';
 import { searchStopsTool } from '@/mcp-server/tools/definitions/search-stops.tool.js';
 import {
+  areaOutcomeRecord,
+  boundaryBody,
+  crimeRecord,
   emptyArrayOk,
   forcesBody,
   hang,
@@ -31,11 +34,14 @@ import {
   locateBody,
   neighbourhoodDetailBody,
   networkError,
+  plainNotFound,
   type Responder,
   rateLimited,
   rateLimitedUntil,
+  STRADDLE_RING,
   sequence,
   status,
+  stopRecord,
 } from '../fixtures/police-api-upstream.js';
 import {
   crimeHistoryBody,
@@ -190,6 +196,243 @@ const CASES: readonly ToolCase[] = [
 
 describe('upstream failures that outlast the retries, on every tool', () => {
   const h = useToolHarness();
+
+  it.each([
+    ['crimes', searchCrimesTool, '/crimes-street/all-crime'],
+    ['outcomes', searchOutcomesTool, '/outcomes-at-location'],
+    ['stops', searchStopsTool, '/stops-street'],
+  ] as const)(
+    '%s discloses unresolved point coverage on both surfaces',
+    async (_name, tool, path) => {
+      h.upstream.route('GET', path, emptyArrayOk);
+      h.upstream.route('GET', '/locate-neighbourhood', rateLimited('60'));
+      const result = await settle(runToolContract(tool, { ...POINT }));
+      expect(result.isError).toBeFalsy();
+      expect(result.structuredContent).toMatchObject({
+        total: 0,
+        notice: expect.stringContaining('Coverage could not be checked'),
+      });
+      expect(text(result)).toContain('Coverage could not be checked');
+      expect(result.structuredContent).not.toHaveProperty('force_published');
+    },
+  );
+
+  describe.each([
+    {
+      name: 'crimes',
+      tool: searchCrimesTool,
+      path: '/crimes-street/all-crime',
+      location: '/crimes-at-location',
+      body: () => crimeRecord(),
+      ranged: true,
+    },
+    {
+      name: 'outcomes',
+      tool: searchOutcomesTool,
+      path: '/outcomes-at-location',
+      location: '/outcomes-at-location',
+      body: () => areaOutcomeRecord(),
+      ranged: false,
+    },
+    {
+      name: 'stops',
+      tool: searchStopsTool,
+      path: '/stops-street',
+      location: '/stops-at-location',
+      body: () => stopRecord(),
+      ranged: true,
+    },
+  ])('$name coverage and canonical neighbourhoods', (c) => {
+    it.each(['point', 'polygon', 'location'] as const)(
+      'retains records for failed %s coverage and both surfaces disclose it',
+      async (area) => {
+        h.upstream.route(
+          area === 'polygon' ? 'POST' : 'GET',
+          area === 'location' ? c.location : c.path,
+          jsonOk([c.body()]),
+        );
+        h.upstream.route('GET', '/locate-neighbourhood', rateLimited('60'));
+        const args =
+          area === 'point'
+            ? { ...POINT }
+            : area === 'polygon'
+              ? { area, polygon: STRADDLE_RING, month: '2026-07' }
+              : { area, location_id: '1000001', month: '2026-07' };
+        const result = await settle(runToolContract(c.tool, args));
+        expect(result.isError).toBeFalsy();
+        expect(result.structuredContent).toMatchObject({
+          total: 1,
+          notice: expect.stringContaining('Coverage could not be checked'),
+        });
+        expect(text(result)).toContain('Coverage could not be checked');
+        expect(result.structuredContent).not.toHaveProperty('force_published');
+      },
+    );
+
+    it.each(['point', 'polygon', 'location'] as const)(
+      'bounds a hanging %s lookup beside fast records',
+      async (area) => {
+        h.upstream.route(
+          area === 'polygon' ? 'POST' : 'GET',
+          area === 'location' ? c.location : c.path,
+          jsonOk([c.body()]),
+        );
+        h.upstream.route('GET', '/locate-neighbourhood', hang);
+        const start = Date.now();
+        const args =
+          area === 'point'
+            ? { ...POINT }
+            : area === 'polygon'
+              ? { area, polygon: STRADDLE_RING, month: '2026-07' }
+              : { area, location_id: '1000001', month: '2026-07' };
+        const result = await settle(runToolContract(c.tool, args));
+        expect(result.isError).toBeFalsy();
+        expect(result.structuredContent).toMatchObject({
+          total: 1,
+          notice: expect.stringContaining('Coverage could not be checked'),
+        });
+        expect(text(result)).toContain('Coverage could not be checked');
+        expect(Date.now() - start).toBeLessThan(11_000);
+        expect(h.upstream.count(area === 'location' ? c.location : c.path)).toBe(1);
+      },
+    );
+
+    if (c.ranged)
+      it.each(['point', 'polygon', 'location'] as const)(
+        'carries failed %s coverage through a two-month range',
+        async (area) => {
+          h.upstream.route(
+            area === 'polygon' ? 'POST' : 'GET',
+            area === 'location' ? c.location : c.path,
+            jsonOk([c.body()]),
+          );
+          h.upstream.route('GET', '/locate-neighbourhood', hang);
+          const args =
+            area === 'point'
+              ? { ...POINT }
+              : area === 'polygon'
+                ? { area, polygon: STRADDLE_RING, month: '2026-07' }
+                : { area, location_id: '1000001', month: '2026-07' };
+          const result = await settle(runToolContract(c.tool, { ...args, month_from: '2026-06' }));
+          expect(result.isError).toBeFalsy();
+          expect(result.structuredContent).toMatchObject({
+            total: 2,
+            by_month: [{ total: 1 }, { total: 1 }],
+            notice: expect.stringContaining('Coverage could not be checked'),
+          });
+          expect(text(result)).toContain('Coverage could not be checked');
+          expect(JSON.stringify(result.structuredContent)).not.toContain('"force_published":true');
+          expect(h.upstream.count(area === 'location' ? c.location : c.path)).toBe(2);
+        },
+      );
+
+    it('retries only a uniquely matched canonical boundary and echoes it through paging and ranges', async () => {
+      h.upstream.route('GET', '/leicestershire/nx01/boundary', plainNotFound);
+      h.upstream.route(
+        'GET',
+        '/leicestershire/neighbourhoods',
+        jsonOk([{ id: 'NX01', name: 'Example Central' }]),
+      );
+      h.upstream.route('GET', '/leicestershire/NX01/boundary', jsonOk(boundaryBody()));
+      h.upstream.route('POST', c.path, jsonOk([c.body()]));
+      const args = {
+        area: 'neighbourhood' as const,
+        force: 'leicestershire',
+        neighbourhood_id: 'nx01',
+        month: '2026-07',
+        ...(c.ranged ? { month_from: '2026-06' } : {}),
+      };
+      for (const offset of [0, 100]) {
+        const result = await settle(runToolContract(c.tool, { ...args, offset }));
+        expect(result.isError).toBeFalsy();
+        expect(result.structuredContent).toMatchObject({ area: { neighbourhood_id: 'NX01' } });
+        expect(text(result)).toContain('neighbourhood_id NX01');
+      }
+      expect(h.upstream.count('/leicestershire/nx01/boundary')).toBe(1);
+      expect(h.upstream.count('/leicestershire/NX01/boundary')).toBe(1);
+      expect(h.upstream.count('/leicestershire/neighbourhoods')).toBe(1);
+      expect(h.upstream.count(c.path)).toBe(c.ranged ? 2 : 1);
+    });
+
+    it('rejects a folded collision without retrying a boundary or sending an area query', async () => {
+      h.upstream.route('GET', '/leicestershire/Nx01/boundary', plainNotFound);
+      h.upstream.route(
+        'GET',
+        '/leicestershire/neighbourhoods',
+        jsonOk([
+          { id: 'NX01', name: 'A' },
+          { id: 'nx01', name: 'B' },
+        ]),
+      );
+      const result = await settle(
+        runToolContract(c.tool, {
+          area: 'neighbourhood',
+          force: 'leicestershire',
+          neighbourhood_id: 'Nx01',
+          month: '2026-07',
+        }),
+      );
+      expect(errorOf(result)).toMatchObject({
+        code: JsonRpcErrorCode.ValidationError,
+        data: {
+          reason: 'ambiguous_neighbourhood',
+          recovery: { hint: expect.stringContaining("'NX01', 'nx01'") },
+        },
+      });
+      expect(text(result)).toContain('ambiguous_neighbourhood');
+      expect(text(result)).toContain("'NX01', 'nx01'");
+      expect(h.upstream.count(c.path)).toBe(0);
+      expect(h.upstream.calls.filter((call) => call.path.endsWith('/boundary'))).toHaveLength(1);
+    });
+
+    it.each([
+      'no match',
+      'list miss',
+      'retry miss',
+      'initial failure',
+      'list failure',
+      'retry failure',
+    ] as const)('keeps boundary %s semantics', async (scenario) => {
+      h.upstream.route(
+        'GET',
+        '/leicestershire/nx01/boundary',
+        scenario === 'initial failure' ? status(500) : plainNotFound,
+      );
+      h.upstream.route(
+        'GET',
+        '/leicestershire/neighbourhoods',
+        scenario === 'list miss'
+          ? plainNotFound
+          : scenario === 'list failure'
+            ? status(500)
+            : jsonOk(scenario === 'no match' ? [] : [{ id: 'NX01', name: 'Example' }]),
+      );
+      h.upstream.route(
+        'GET',
+        '/leicestershire/NX01/boundary',
+        scenario === 'retry failure' ? status(500) : plainNotFound,
+      );
+      const result = await settle(
+        runToolContract(c.tool, {
+          area: 'neighbourhood',
+          force: 'leicestershire',
+          neighbourhood_id: 'nx01',
+          month: '2026-07',
+        }),
+      );
+      const isFailure = scenario.endsWith('failure');
+      expect(errorOf(result)).toMatchObject({
+        code: isFailure ? JsonRpcErrorCode.ServiceUnavailable : JsonRpcErrorCode.NotFound,
+        data: { reason: isFailure ? 'upstream_unavailable' : 'unknown_neighbourhood' },
+      });
+      expect(text(result)).toContain(isFailure ? 'upstream_unavailable' : 'unknown_neighbourhood');
+      expect(text(result)).toContain('Recovery:');
+      expect(h.upstream.count(c.path)).toBe(0);
+      expect(h.upstream.count('/leicestershire/neighbourhoods')).toBe(
+        scenario === 'initial failure' ? 0 : scenario === 'list failure' ? 3 : 1,
+      );
+    });
+  });
 
   describe.each(CASES)('$name', (c) => {
     /** Routes what the call needs, with `respond` on the route it cannot get past. */

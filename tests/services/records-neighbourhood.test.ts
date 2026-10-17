@@ -49,6 +49,18 @@ const hood = (overrides: Record<string, unknown> = {}) =>
 const priorities = (...records: unknown[]) => normalizePriorities(RawPriorities.parse(records));
 const events = (...records: unknown[]) => normalizeEvents(RawEvents.parse(records));
 
+it('normalizes separated table cells in each neighbourhood HTML field', () => {
+  const html = '<tr><td>Tuesday</td><td><em>18:00</em></td></tr>';
+  expect(hood({ description: html }).description).toBe('Tuesday 18:00');
+  expect(priorities({ issue: html, action: html })[0]).toMatchObject({
+    issue: 'Tuesday 18:00',
+    action: 'Tuesday 18:00',
+  });
+  expect(events({ title: 'Example event', description: html })[0]?.description).toBe(
+    'Tuesday 18:00',
+  );
+});
+
 describe('normalizeCrimeHistory', () => {
   it('writes the crime in wire shape without a latest outcome, and every outcome as { code, name, month }', () => {
     const result = history({

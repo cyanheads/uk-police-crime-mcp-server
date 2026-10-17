@@ -1,7 +1,7 @@
 /**
  * @fileoverview Converts the HTML fields data.police.uk serves (neighbourhood
  * descriptions, priority issues and actions, event descriptions) to plain text:
- * tags dropped, block ends to newlines, entities decoded, invisible characters
+ * tags dropped, cell boundaries to spaces, block ends to newlines, entities decoded, invisible characters
  * removed, blank-line runs collapsed, in time linear in the input. The result is
  * what `structuredContent` carries.
  * @module services/police-api/html-to-text
@@ -125,9 +125,14 @@ function closeOf(html: string, open: RegExpExecArray): number {
  * it, so none starts after the last one; leaving that tail unscanned keeps a run
  * of `<` with no `>` after it from costing a scan to the end for each `<`.
  */
-function replaceTags(text: string, tags: RegExp, replacement: string): string {
+function replaceTags(
+  text: string,
+  tags: RegExp,
+  replacement: string | ((tag: string) => string),
+): string {
   const end = text.lastIndexOf('>') + 1;
-  return text.slice(0, end).replace(tags, replacement) + text.slice(end);
+  const replace = typeof replacement === 'string' ? () => replacement : replacement;
+  return text.slice(0, end).replace(tags, replace) + text.slice(end);
 }
 
 /**
@@ -136,7 +141,9 @@ function replaceTags(text: string, tags: RegExp, replacement: string): string {
  */
 export function htmlToText(html: string | null | undefined): string | undefined {
   if (html == null) return;
-  const text = replaceTags(replaceTags(dropNonText(html), BREAK_TAGS, '\n'), TAGS, '')
+  const text = replaceTags(replaceTags(dropNonText(html), BREAK_TAGS, '\n'), TAGS, (tag) =>
+    /^<\/?t[dh](?=[\s/>])/i.test(tag) ? ' ' : '',
+  )
     .replace(ENTITIES, decodeEntity)
     .replace(/\r\n?|\u{85}/gu, '\n')
     .split('\n')

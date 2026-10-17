@@ -20,10 +20,11 @@ import {
   type MockContextLogger,
   runToolContract,
 } from '@cyanheads/mcp-ts-core/testing';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import type { z } from 'zod';
 import { findNeighbourhoodTool } from '@/mcp-server/tools/definitions/find-neighbourhood.tool.js';
 import { ATTRIBUTION, polygonInput } from '@/mcp-server/tools/shared-schemas.js';
+import { resolveTarget } from '@/services/police-api/area.js';
 import { forceGaps } from '@/services/police-api/known-gaps.js';
 import {
   boundaryBody,
@@ -103,6 +104,253 @@ describe('ukcrime_find_neighbourhood', () => {
     people === undefined
       ? neighbourhoodRoutes(h.upstream)
       : neighbourhoodRoutes(h.upstream, undefined, people);
+
+  it('characterizes exact success without a neighbourhood list dependency', async () => {
+    routes();
+    h.upstream.route('GET', '/leicestershire/neighbourhoods', status(500));
+    const result = await call({ ...BY_ID, include: [] });
+    expect(data(result).found).toBe(true);
+    expect(h.upstream.count('/leicestershire/neighbourhoods')).toBe(0);
+  });
+
+  it('recovers a unique case-folded id after its exact miss, echoing canonical spelling', async () => {
+    routes();
+    h.upstream.route('GET', '/leicestershire/nx01', plainNotFound);
+    h.upstream.route(
+      'GET',
+      '/leicestershire/neighbourhoods',
+      jsonOk([{ id: 'NX01', name: 'Example Central' }]),
+    );
+    const result = await call({
+      ...BY_ID,
+      neighbourhood_id: 'nx01',
+      include: ['priorities', 'team', 'events', 'boundary'],
+    });
+    expect(data(result)).toMatchObject({ found: true, neighbourhood: { id: 'NX01' } });
+    expect(text(result)).toContain('**Neighbourhood id:** NX01');
+    for (const path of SECTION_PATHS) expect(h.upstream.count(path)).toBe(1);
+    expect(h.upstream.count('/leicestershire/neighbourhoods')).toBe(1);
+  });
+
+  it('an exact success wins despite a folded collision in the unused list', async () => {
+    routes();
+    h.upstream.route(
+      'GET',
+      '/leicestershire/neighbourhoods',
+      jsonOk([
+        { id: 'NX01', name: 'A' },
+        { id: 'nx01', name: 'B' },
+      ]),
+    );
+    expect(data(await call({ ...BY_ID, include: [] })).found).toBe(true);
+    expect(h.upstream.count('/leicestershire/neighbourhoods')).toBe(0);
+  });
+
+  it('reports escaped collision candidates before any section or canonical retry', async () => {
+    routes();
+    h.upstream.route('GET', '/leicestershire/%5Bnx%5D', plainNotFound);
+    h.upstream.route(
+      'GET',
+      '/leicestershire/neighbourhoods',
+      jsonOk([
+        { id: '[NX]', name: 'A' },
+        { id: '[Nx]', name: 'B' },
+      ]),
+    );
+    const result = await call({ ...BY_ID, neighbourhood_id: '[nx]' });
+    const error = errorOf(result);
+    expect(error).toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      data: {
+        reason: 'ambiguous_neighbourhood',
+        recovery: { hint: "Send one of these exact neighbourhood ids: '\\[NX\\]', '\\[Nx\\]'." },
+      },
+    });
+    expect(text(result)).toContain("'\\[NX\\]', '\\[Nx\\]'");
+    expect(
+      h.upstream.calls
+        .filter(
+          (sent) =>
+            sent.path.startsWith('/leicestershire/') &&
+            sent.path !== '/leicestershire/neighbourhoods',
+        )
+        .map((sent) => sent.path),
+    ).toEqual(['/leicestershire/%5Bnx%5D']);
+  });
+
+  it.each(['no match', 'list miss', 'canonical miss', 'exact listed id'] as const)(
+    'keeps the original miss for %s',
+    async (scenario) => {
+      routes();
+      h.upstream.route('GET', '/leicestershire/nx01', plainNotFound);
+      h.upstream.route(
+        'GET',
+        '/leicestershire/neighbourhoods',
+        scenario === 'list miss'
+          ? plainNotFound
+          : jsonOk(
+              scenario === 'no match'
+                ? []
+                : [{ id: scenario === 'exact listed id' ? 'nx01' : 'NX01', name: 'Example' }],
+            ),
+      );
+      h.upstream.route('GET', P, plainNotFound);
+      const result = await call({ ...BY_ID, neighbourhood_id: 'nx01' });
+      expect(data(result)).toMatchObject({
+        found: false,
+        guidance: expect.stringContaining("No neighbourhood 'nx01'"),
+      });
+      expect(text(result)).toContain("No neighbourhood 'nx01'");
+      for (const path of SECTION_PATHS) expect(h.upstream.count(path)).toBe(0);
+      expect(h.upstream.count('/leicestershire/nx01')).toBe(1);
+      expect(h.upstream.count(P)).toBe(scenario === 'canonical miss' ? 1 : 0);
+    },
+  );
+
+  it.each(['initial', 'list', 'retry'] as const)(
+    'preserves a %s non-404 failure as an upstream failure',
+    async (where) => {
+      routes();
+      h.upstream.route(
+        'GET',
+        '/leicestershire/nx01',
+        where === 'initial' ? status(500) : plainNotFound,
+      );
+      h.upstream.route(
+        'GET',
+        '/leicestershire/neighbourhoods',
+        where === 'list' ? status(500) : jsonOk([{ id: 'NX01', name: 'Example' }]),
+      );
+      h.upstream.route('GET', P, status(500));
+      const result = await call({ ...BY_ID, neighbourhood_id: 'nx01' });
+      expect(errorOf(result)).toMatchObject({
+        code: JsonRpcErrorCode.ServiceUnavailable,
+        data: { reason: 'upstream_unavailable' },
+      });
+      expect(text(result)).toContain('upstream_unavailable');
+      expect(text(result)).toContain('Recovery:');
+      expect(h.upstream.count('/leicestershire/neighbourhoods')).toBe(
+        where === 'initial' ? 0 : where === 'list' ? 3 : 1,
+      );
+      for (const path of SECTION_PATHS) expect(h.upstream.count(path)).toBe(0);
+    },
+  );
+
+  it('reuses the cached neighbourhood list across a canonical lookup and an area boundary', async () => {
+    routes();
+    h.upstream.route('GET', '/leicestershire/nx01', plainNotFound);
+    h.upstream.route(
+      'GET',
+      '/leicestershire/neighbourhoods',
+      jsonOk([{ id: 'NX01', name: 'Example' }]),
+    );
+    expect(data(await call({ ...BY_ID, neighbourhood_id: 'nx01', include: [] })).found).toBe(true);
+    expect(data(await call({ ...BY_ID, neighbourhood_id: 'nx01', include: [] })).found).toBe(true);
+    h.upstream.route('GET', '/leicestershire/nx01/boundary', plainNotFound);
+    const target = await settle(
+      resolveTarget(
+        { kind: 'neighbourhood', force: 'leicestershire', neighbourhoodId: 'nx01' },
+        h.service,
+        createMockContext(),
+        h.service.openBudget(),
+      ),
+    );
+    expect(target).toMatchObject({ kind: 'found', neighbourhoodId: 'NX01' });
+    expect(h.upstream.count('/leicestershire/neighbourhoods')).toBe(1);
+    expect(h.upstream.count('/leicestershire/nx01')).toBe(2);
+    expect(h.upstream.count(P)).toBe(2);
+  });
+
+  it.each(['list', 'retry'] as const)(
+    'cancels during the %s without starting sections',
+    async (where) => {
+      routes();
+      h.upstream.route('GET', '/leicestershire/nx01', plainNotFound);
+      h.upstream.route(
+        'GET',
+        '/leicestershire/neighbourhoods',
+        where === 'list' ? hang : jsonOk([{ id: 'NX01', name: 'Example' }]),
+      );
+      h.upstream.route('GET', P, hang);
+      const controller = new AbortController();
+      const pending = runToolContract(
+        findNeighbourhoodTool,
+        { ...BY_ID, neighbourhood_id: 'nx01' },
+        { context: { signal: controller.signal } },
+      );
+      setTimeout(() => controller.abort(), 1000);
+      const result = await settle(pending);
+      expect(errorOf(result).code).toBe(JsonRpcErrorCode.RequestCancelled);
+      expect(text(result)).toContain('aborted');
+      for (const path of SECTION_PATHS) expect(h.upstream.count(path)).toBe(0);
+    },
+  );
+
+  it('keeps fallback and canonical retry inside the original call budget', async () => {
+    routes();
+    h.upstream.route('GET', '/leicestershire/nx01', delayed(20_000, plainNotFound));
+    h.upstream.route(
+      'GET',
+      '/leicestershire/neighbourhoods',
+      delayed(20_000, jsonOk([{ id: 'NX01', name: 'Example' }])),
+    );
+    h.upstream.route('GET', P, hang);
+    const start = Date.now();
+    const result = await call({ ...BY_ID, neighbourhood_id: 'nx01' });
+    expect(errorOf(result)).toMatchObject({
+      code: JsonRpcErrorCode.Timeout,
+      data: { reason: 'retry_deadline_exceeded' },
+    });
+    expect(text(result)).toContain('retry_deadline_exceeded');
+    expect(Date.now() - start).toBeLessThanOrEqual(50_500);
+    for (const path of SECTION_PATHS) expect(h.upstream.count(path)).toBe(0);
+  });
+
+  it('does not turn cancellation after a cached no-match catalog read into found false', async () => {
+    routes();
+    h.upstream.route('GET', '/leicestershire/nx01', plainNotFound);
+    h.upstream.route('GET', '/leicestershire/neighbourhoods', jsonOk([]));
+    await settle(
+      h.service.getNeighbourhoods('leicestershire', createMockContext(), h.service.openBudget()),
+    );
+    const controller = new AbortController();
+    const read = h.service.getNeighbourhoods.bind(h.service);
+    vi.spyOn(h.service, 'getNeighbourhoods').mockImplementation(async (...args) => {
+      const listed = await read(...args);
+      controller.abort();
+      return listed;
+    });
+    const result = await settle(
+      runToolContract(
+        findNeighbourhoodTool,
+        { ...BY_ID, neighbourhood_id: 'nx01' },
+        { context: { signal: controller.signal } },
+      ),
+    );
+    expect(errorOf(result).code).toBe(JsonRpcErrorCode.RequestCancelled);
+    expect(text(result)).toContain('aborted');
+    expect(h.upstream.count('/leicestershire/neighbourhoods')).toBe(1);
+    for (const path of SECTION_PATHS) expect(h.upstream.count(path)).toBe(0);
+  });
+
+  it('preserves table cells through descriptions, priorities and events on both surfaces', async () => {
+    routes();
+    const html =
+      '<table><tr><th>Day</th><th>Time</th></tr><tr><td><b>Tuesday</b></td><td>18:00</td></tr></table>';
+    h.upstream.route('GET', P, jsonOk(neighbourhoodDetailBody({ description: html })));
+    h.upstream.route('GET', `${P}/priorities`, jsonOk([{ issue: html, action: html }]));
+    h.upstream.route('GET', `${P}/events`, jsonOk([{ title: 'Example event', description: html }]));
+    const result = await call(BY_ID);
+    const out = data(result);
+    expect(out.neighbourhood?.description).toBe('Day Time\nTuesday 18:00');
+    expect(out.priorities?.[0]).toMatchObject({
+      issue: 'Day Time\nTuesday 18:00',
+      action: 'Day Time\nTuesday 18:00',
+    });
+    expect(out.events?.[0]?.description).toBe('Day Time\nTuesday 18:00');
+    expect(text(result).match(/Day Time/g)).toHaveLength(4);
+    expect(text(result).match(/Tuesday 18:00/g)).toHaveLength(4);
+  });
 
   describe('point lookup', () => {
     it('locates the point, loads the profile, force detail and the default sections, and not the boundary', async () => {
@@ -216,7 +464,7 @@ describe('ukcrime_find_neighbourhood', () => {
       const out = data(await call({ ...POINT }));
       expect(out.found).toBe(false);
       expect(out.guidance).toBe(
-        "No neighbourhood 'NX01' in force 'leicestershire'. Ids are case-sensitive; call ukcrime_list_reference with topic 'neighbourhoods' and force 'leicestershire' to find it by name.",
+        "No neighbourhood 'NX01' in force 'leicestershire'. Call ukcrime_list_reference with topic 'neighbourhoods' and force 'leicestershire' to find it by name.",
       );
       expect(out.located_from).toEqual({ lat: LAT, lng: LNG });
       expect(out).not.toHaveProperty('force');
@@ -285,6 +533,7 @@ describe('ukcrime_find_neighbourhood', () => {
     });
 
     it('answers found false without located_from for an unknown id (404), with no notice even though the sections 404 too', async () => {
+      h.upstream.route('GET', '/leicestershire/neighbourhoods', jsonOk([]));
       routes();
       for (const path of [P, ...SECTION_PATHS]) h.upstream.route('GET', path, plainNotFound);
       const out = data(await call({ ...BY_ID, neighbourhood_id: 'NX01' }));
@@ -295,6 +544,7 @@ describe('ukcrime_find_neighbourhood', () => {
     });
 
     it('treats a wrongly cased id as a miss (ids are case-sensitive upstream)', async () => {
+      h.upstream.route('GET', '/leicestershire/neighbourhoods', jsonOk([]));
       routes();
       h.upstream.route('GET', '/leicestershire/nx01', plainNotFound);
       for (const section of ['priorities', 'people', 'events']) {
@@ -347,6 +597,7 @@ describe('ukcrime_find_neighbourhood', () => {
     });
 
     it('names the matched id in the guidance when a display name finds no such neighbourhood', async () => {
+      h.upstream.route('GET', '/leicestershire/neighbourhoods', jsonOk([]));
       routes();
       for (const path of [P, ...SECTION_PATHS]) h.upstream.route('GET', path, plainNotFound);
       const out = data(await call({ force: 'LEICESTERSHIRE POLICE', neighbourhood_id: 'NX01' }));

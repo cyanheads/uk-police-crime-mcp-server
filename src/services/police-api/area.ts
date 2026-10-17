@@ -153,17 +153,37 @@ export async function resolveTarget(
   service: PoliceApiService,
   ctx: Context,
   budget: CallBudget,
-): Promise<{ readonly kind: 'found'; readonly value: AreaTarget } | UnknownNeighbourhood> {
+): Promise<
+  | { readonly kind: 'found'; readonly value: AreaTarget; readonly neighbourhoodId?: string }
+  | UnknownNeighbourhood
+> {
   switch (spec.kind) {
     case 'neighbourhood': {
-      const boundary = await service.getBoundary(spec.force, spec.neighbourhoodId, ctx, budget);
+      let neighbourhoodId = spec.neighbourhoodId;
+      let boundary = await service.getBoundary(spec.force, neighbourhoodId, ctx, budget);
+      if (boundary.kind === 'miss') {
+        const matched = await service.matchNeighbourhoodAfterMiss(
+          spec.force,
+          neighbourhoodId,
+          ctx,
+          budget,
+        );
+        if (matched !== undefined && matched !== neighbourhoodId) {
+          neighbourhoodId = matched;
+          boundary = await service.getBoundary(spec.force, neighbourhoodId, ctx, budget);
+        }
+      }
       return boundary.kind === 'miss'
         ? {
             kind: 'unknown_neighbourhood',
             force: spec.force,
             neighbourhoodId: spec.neighbourhoodId,
           }
-        : { kind: 'found', value: { kind: 'polygon', vertices: boundary.value } };
+        : {
+            kind: 'found',
+            value: { kind: 'polygon', vertices: boundary.value },
+            ...(neighbourhoodId !== spec.neighbourhoodId ? { neighbourhoodId } : {}),
+          };
     }
     case 'force_unplaced':
     case 'force':

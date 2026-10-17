@@ -750,13 +750,17 @@ describe('runAreaQuery', () => {
     });
 
     it('returns unknown_neighbourhood on a boundary 404, without sending the area query', async () => {
+      h.upstream.route('GET', '/leicestershire/neighbourhoods', jsonOk([]));
       h.upstream.route('GET', '/leicestershire/NX01/boundary', plainNotFound);
       expect(await crimes(NEIGHBOURHOOD)).toEqual({
         kind: 'unknown_neighbourhood',
         force: 'leicestershire',
         neighbourhoodId: 'NX01',
       });
-      expect(h.upstream.calls.map((c) => c.path)).toEqual(['/leicestershire/NX01/boundary']);
+      expect(h.upstream.calls.map((c) => c.path)).toEqual([
+        '/leicestershire/NX01/boundary',
+        '/leicestershire/neighbourhoods',
+      ]);
     });
 
     it('does not turn a boundary 500 into a miss', async () => {
@@ -1225,13 +1229,19 @@ describe('notice fragments', () => {
 
     it.each<[string, AreaForces]>([
       ['every lookup answered', { forces: ['cheshire'], samples: [CHESHIRE, MISS] }],
-      ['every lookup failed', { forces: [], samples: [undefined, undefined] }],
-      ['the rest answered 404', { forces: [], samples: [MISS, undefined] }],
       ['no sample was sent', { forces: [], samples: [] }],
       ['a point whose locate failed', { forces: [] }],
       ['a named arm', { forces: ['leicestershire'] }],
     ])('says nothing when %s', (_name, run) => {
       expect(partialLocateNote(run)).toBeUndefined();
+    });
+
+    it.each<AreaForces>([
+      { forces: [], samples: [undefined, undefined] },
+      { forces: [], samples: [MISS, undefined] },
+      { forces: [], coverageLookupIncomplete: true },
+    ])('discloses unresolved coverage without a resolved force: %j', (run) => {
+      expect(partialLocateNote(run)).toContain('Coverage could not be checked');
     });
   });
 

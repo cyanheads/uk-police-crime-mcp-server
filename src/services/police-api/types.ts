@@ -67,7 +67,7 @@ export interface ForceDetail {
 
 /** One entry of `/{force}/neighbourhoods`. */
 export interface Neighbourhood {
-  /** Case-sensitive neighbourhood id (Northern Ireland ids are place names with spaces). */
+  /** Canonical neighbourhood id (Northern Ireland ids can be place names with spaces). */
   readonly id: string;
   /** Upstream text. */
   readonly name: string;

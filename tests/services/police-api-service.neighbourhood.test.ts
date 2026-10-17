@@ -94,6 +94,69 @@ const READS: readonly { call: Method; name: string; path: string; ok: unknown }[
 describe('PoliceApiService neighbourhood and crime-history reads', () => {
   const h = useServiceHarness();
 
+  describe('after-miss neighbourhood matching', () => {
+    it('honors cancellation after a cached catalog answer before returning a match or miss', async () => {
+      h.upstream.route('GET', `/${FORCE}/neighbourhoods`, jsonOk([]));
+      await settle(h.service.getNeighbourhoods(FORCE, h.ctx, h.budget()));
+      const controller = new AbortController();
+      const read = h.service.getNeighbourhoods.bind(h.service);
+      vi.spyOn(h.service, 'getNeighbourhoods').mockImplementation(async (...args) => {
+        const listed = await read(...args);
+        controller.abort();
+        return listed;
+      });
+      await expect(
+        settle(
+          h.service.matchNeighbourhoodAfterMiss(
+            FORCE,
+            'nx01',
+            h.ctxWith(controller.signal),
+            h.budget(),
+          ),
+        ),
+      ).rejects.toThrow('aborted');
+      expect(h.upstream.count(`/${FORCE}/neighbourhoods`)).toBe(1);
+    });
+
+    it('gives exact listed ids priority over folded collisions and reuses the cached list', async () => {
+      h.upstream.route(
+        'GET',
+        `/${FORCE}/neighbourhoods`,
+        jsonOk([
+          { id: 'NX01', name: 'A' },
+          { id: 'nx01', name: 'B' },
+        ]),
+      );
+      for (const id of ['NX01', 'nx01']) {
+        expect(
+          await settle(h.service.matchNeighbourhoodAfterMiss(FORCE, id, h.ctx, h.budget())),
+        ).toBe(id);
+      }
+      const error = await failure(
+        h.service.matchNeighbourhoodAfterMiss(FORCE, 'Nx01', h.ctx, h.budget()),
+      );
+      expect(error).toMatchObject({
+        code: JsonRpcErrorCode.ValidationError,
+        data: { reason: 'ambiguous_neighbourhood' },
+      });
+      expect(h.upstream.count(`/${FORCE}/neighbourhoods`)).toBe(1);
+    });
+
+    it('treats repeated copies of the same catalog id as one match', async () => {
+      h.upstream.route(
+        'GET',
+        `/${FORCE}/neighbourhoods`,
+        jsonOk([
+          { id: 'NX01', name: 'A' },
+          { id: 'NX01', name: 'B' },
+        ]),
+      );
+      expect(
+        await settle(h.service.matchNeighbourhoodAfterMiss(FORCE, 'nx01', h.ctx, h.budget())),
+      ).toBe('NX01');
+    });
+  });
+
   describe.each(READS)('$name: request and failure classes', ({ call, path, ok }) => {
     it('sends one GET to the route with the JSON accept header and no query', async () => {
       h.upstream.route('GET', path, jsonOk(ok));

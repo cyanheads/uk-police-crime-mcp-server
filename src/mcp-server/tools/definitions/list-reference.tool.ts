@@ -95,7 +95,11 @@ const OutputSchema = z.object({
     .array(
       z
         .object({
-          id: z.string().describe('Id the other tools take as neighbourhood_id; case-sensitive.'),
+          id: z
+            .string()
+            .describe(
+              'Canonical id the other tools take as neighbourhood_id; exact spelling avoids a fallback lookup.',
+            ),
           name: z.string().describe('Neighbourhood name as published.'),
         })
         .describe('One neighbourhood.'),

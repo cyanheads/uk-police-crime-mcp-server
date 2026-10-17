@@ -28,6 +28,22 @@ describe('htmlToText', () => {
   });
 
   describe('structure', () => {
+    it.each(['td', 'th'])('separates valid %s cells whose optional end tags are omitted', (tag) => {
+      expect(htmlToText(`<tr><${tag}>A<${tag} class="next">B</tr>`)).toBe('A B');
+    });
+    it('characterizes row breaks and inline text before cell separation', () => {
+      expect(htmlToText('<tr><td><b>Day</b></td></tr><tr><td>Tuesday</td></tr>')).toBe(
+        'Day\nTuesday',
+      );
+    });
+
+    it('separates table cells with attributes, mixed case and inline markup', () => {
+      expect(
+        htmlToText(
+          '<table><tr><TH scope="col">Day</TH><th>Time</th></tr><tr><Td><b>Tuesday</b></Td><td class="time">18:00</td></tr></table>',
+        ),
+      ).toBe('Day Time\nTuesday 18:00');
+    });
     it('passes plain text through', () => {
       expect(htmlToText('No markup here.')).toBe('No markup here.');
     });
@@ -142,6 +158,39 @@ describe('htmlToText', () => {
   });
 
   describe('time stays linear in the input', () => {
+    it('bounds table-cell scanning across adversarial shapes and a 64-fold span', () => {
+      const measure = (input: string) => {
+        const started = process.threadCpuUsage();
+        htmlToText(input);
+        const spent = process.threadCpuUsage(started);
+        return (spent.user + spent.system) / 1000;
+      };
+      const shapes = [
+        (size: number) => '<td'.repeat(Math.ceil(size / 3)).slice(0, size),
+        (size: number) => '<td><th'.repeat(Math.ceil(size / 7)).slice(0, size),
+        (size: number) => '</td\n'.repeat(Math.ceil(size / 5)).slice(0, size),
+        (size: number) => `<td>${'\n'.repeat(size - 9)}</td>`,
+        (size: number) => `<td>${'1'.repeat(size - 9)}</td>`,
+      ];
+      for (const shape of shapes)
+        for (const size of [5000, 20000, 80000]) {
+          const input = shape(size);
+          expect(measure(input), `first pass at ${size}`).toBeLessThan(150);
+          expect(
+            Math.min(...Array.from({ length: 3 }, () => measure(input))),
+            `table scan at ${size}`,
+          ).toBeLessThan(150);
+        }
+      const measurements: number[] = [];
+      for (let size = 5000; size <= 320000; size *= 2) {
+        const input = `<td>${'1'.repeat(size - 9)}</td>`;
+        expect(measure(input), `first digit pass at ${size}`).toBeLessThan(150);
+        const fastest = Math.min(...Array.from({ length: 5 }, () => measure(input)));
+        expect(fastest, `digit pass at ${size}`).toBeLessThan(150);
+        measurements.push(fastest);
+      }
+      expect((measurements.at(-1) ?? Infinity) / (measurements[0] ?? 0)).toBeLessThan(256);
+    }, 30000);
     /**
      * Each input is converted at two sizes 16 times apart and timed in this
      * thread's CPU time, which other load on the machine barely moves, keeping

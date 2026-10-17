@@ -507,11 +507,11 @@ describe('limitInput', () => {
     expect(accepted(limitInput(25), undefined)).toBe(25);
   });
 
-  it.each([1, 50, 200])('accepts %d', (n) => {
+  it.each([1, 50, 200, 201, 10_000])('accepts %d', (n) => {
     expect(accepted(limit, n)).toBe(n);
   });
 
-  it.each([0, -1, 201, 1.5, Number.NaN])('rejects %d', (n) => {
+  it.each([0, -1, 10_001, 1.5, Number.NaN])('rejects %d', (n) => {
     rejected(limit, n);
   });
 

@@ -334,13 +334,12 @@ describe('ukcrime_search_outcomes', () => {
     });
 
     it('fails unknown_neighbourhood (NotFound) when the boundary answers 404, naming the case-sensitive id', async () => {
+      h.upstream.route('GET', '/leicestershire/neighbourhoods', jsonOk([]));
       h.upstream.route('GET', '/leicestershire/nx01/boundary', plainNotFound);
       const error = errorOf(await call({ ...HOOD, neighbourhood_id: 'nx01', month: '2026-07' }));
       expect(error.code).toBe(JsonRpcErrorCode.NotFound);
       expect(error.data.reason).toBe('unknown_neighbourhood');
-      expect(error.message).toBe(
-        "Force 'leicestershire' has no neighbourhood 'nx01'; ids are case-sensitive.",
-      );
+      expect(error.message).toBe("Force 'leicestershire' has no neighbourhood 'nx01'.");
       expect(error.data.recovery?.hint).toContain("topic 'neighbourhoods'");
       expect(h.upstream.count('/outcomes-at-location')).toBe(0);
     });
@@ -394,13 +393,12 @@ describe('ukcrime_search_outcomes', () => {
     });
 
     it('names the matched id when a display name finds no such neighbourhood', async () => {
+      h.upstream.route('GET', '/leicestershire/neighbourhoods', jsonOk([]));
       h.upstream.route('GET', '/leicestershire/nx01/boundary', plainNotFound);
       const error = errorOf(
         await call({ ...HOOD, force: 'LEICESTERSHIRE POLICE', neighbourhood_id: 'nx01' }),
       );
-      expect(error.message).toBe(
-        "Force 'leicestershire' has no neighbourhood 'nx01'; ids are case-sensitive.",
-      );
+      expect(error.message).toBe("Force 'leicestershire' has no neighbourhood 'nx01'.");
     });
 
     it('refuses British Transport Police with the no-neighbourhoods message', async () => {
@@ -423,6 +421,55 @@ describe('ukcrime_search_outcomes', () => {
   });
 
   describe('breakdowns', () => {
+    it.each([undefined, 'drugs', 'robbery'])(
+      'keeps category counts independent of page and filtered for %s',
+      async (category) => {
+        pointRoutes(manyOutcomes(8));
+        const result = await call({ ...POINT, month: '2026-07', category, offset: 99, limit: 1 });
+        const out = data(result);
+        expect(out.by_category.reduce((sum, row) => sum + row.count, 0)).toBe(out.total);
+        expect(out.by_category).toEqual(
+          category === 'robbery'
+            ? []
+            : category === 'drugs'
+              ? [{ value: 'drugs', count: 4 }]
+              : [
+                  { value: 'burglary', count: 4 },
+                  { value: 'drugs', count: 4 },
+                ],
+        );
+        expect(out.outcomes).toEqual([]);
+        for (const row of out.by_category)
+          expect(text(result)).toContain(`| ${row.value} | ${row.count} |`);
+        expect(h.upstream.count('/outcomes-at-location')).toBe(1);
+      },
+    );
+    it('characterizes whole-match totals past the last page without another request', async () => {
+      pointRoutes(manyOutcomes(3));
+      const out = data(await call({ ...POINT, month: '2026-07', offset: 10, limit: 1 }));
+      expect(out.total).toBe(3);
+      expect(out.outcomes).toEqual([]);
+      expect(out.by_outcome.reduce((n, row) => n + row.count, 0)).toBe(3);
+      expect(h.upstream.count('/outcomes-at-location')).toBe(1);
+    });
+
+    it('counts categories across the full match with code-unit ties and renders both surfaces', async () => {
+      pointRoutes(
+        ['alpha', 'Zeta', 'beta', 'alpha', 'Zeta', 'beta', 'beta'].map((category, id) =>
+          areaOutcomeRecord({ crime: crimeRecord({ id: id + 1, category }) }),
+        ),
+      );
+      const result = await call({ ...POINT, month: '2026-07', offset: 10, limit: 1 });
+      expect(data(result).by_category).toEqual([
+        { value: 'beta', count: 3 },
+        { value: 'Zeta', count: 2 },
+        { value: 'alpha', count: 2 },
+      ]);
+      expect(data(result).outcomes).toEqual([]);
+      expect(text(result)).toContain('### By crime category');
+      expect(text(result)).toContain('| beta | 3 |');
+      expect(h.upstream.count('/outcomes-at-location')).toBe(1);
+    });
     it('sorts by_outcome by count descending, then code, and takes the name from the first record seen', async () => {
       // Sorted page order is crime month desc then crime id, so id 1 is seen first.
       pointRoutes([
@@ -687,30 +734,33 @@ describe('ukcrime_search_outcomes', () => {
       expect(out.notice).toBe('Showing 5–8 of 15; call again with offset 8 for more.');
     });
 
-    it('walks 250 outcomes in pages of 200 and 50 and returns each exactly once, in the sorted order', async () => {
-      pointRoutes(manyOutcomes(250));
-      const first = data(await call({ ...POINT, month: '2026-07', limit: 200 }));
-      expect(first.outcomes).toHaveLength(200);
-      expect(first.next_offset).toBe(200);
-      expect(first.shown).toBe(200);
-      expect(first.cap).toBe(200);
-      const second = data(
-        await call({ ...POINT, month: '2026-07', limit: 200, offset: first.next_offset }),
-      );
-      expect(second.outcomes).toHaveLength(50);
-      expect(second).not.toHaveProperty('next_offset');
-      const ids = [...first.outcomes, ...second.outcomes].map((o) => o.crime.id);
-      expect(new Set(ids).size).toBe(250);
-      const keys = [...first.outcomes, ...second.outcomes].map(
-        (o) => `${o.crime.month}|${o.crime.id.padStart(12, '0')}`,
-      );
-      const expected = [...keys].sort((a, b) => {
-        const [am = '', ai = ''] = a.split('|');
-        const [bm = '', bi = ''] = b.split('|');
-        return am < bm ? 1 : am > bm ? -1 : ai < bi ? -1 : ai > bi ? 1 : 0;
-      });
-      expect(keys).toEqual(expected);
-    });
+    it.each([200, 201, 10000])(
+      'walks 250 outcomes with requested limit %d in applied pages of 200 and 50',
+      async (limit) => {
+        pointRoutes(manyOutcomes(250));
+        const first = data(await call({ ...POINT, month: '2026-07', limit }));
+        expect(first.outcomes).toHaveLength(200);
+        expect(first.next_offset).toBe(200);
+        expect(first.shown).toBe(200);
+        expect(first.cap).toBe(200);
+        const second = data(
+          await call({ ...POINT, month: '2026-07', limit, offset: first.next_offset }),
+        );
+        expect(second.outcomes).toHaveLength(50);
+        expect(second).not.toHaveProperty('next_offset');
+        const ids = [...first.outcomes, ...second.outcomes].map((o) => o.crime.id);
+        expect(new Set(ids).size).toBe(250);
+        const keys = [...first.outcomes, ...second.outcomes].map(
+          (o) => `${o.crime.month}|${o.crime.id.padStart(12, '0')}`,
+        );
+        const expected = [...keys].sort((a, b) => {
+          const [am = '', ai = ''] = a.split('|');
+          const [bm = '', bi = ''] = b.split('|');
+          return am < bm ? 1 : am > bm ? -1 : ai < bi ? -1 : ai > bi ? 1 : 0;
+        });
+        expect(keys).toEqual(expected);
+      },
+    );
 
     it('reads the cache for later pages instead of the upstream', async () => {
       pointRoutes(manyOutcomes(10));
@@ -728,9 +778,9 @@ describe('ukcrime_search_outcomes', () => {
 
     it.each<[string, unknown]>([
       ['limit 0', { limit: 0 }],
-      ['limit 201', { limit: 201 }],
+      ['limit 10001', { limit: 10001 }],
       ['a fractional limit', { limit: 2.5 }],
-      ['a string limit', { limit: '5' }],
+      ['a non-numeric string limit', { limit: 'five' }],
       ['a negative offset', { offset: -1 }],
       ['a fractional offset', { offset: 1.5 }],
     ])('rejects %s as InvalidParams', async (_name, extra) => {
@@ -738,6 +788,14 @@ describe('ukcrime_search_outcomes', () => {
       expect(error.code).toBe(JsonRpcErrorCode.InvalidParams);
       expect(h.upstream.calls).toHaveLength(0);
     });
+  });
+
+  it('repairs a numeric string limit before paging', async () => {
+    pointRoutes(manyOutcomes(10));
+    const out = data(await callRaw({ ...POINT, month: '2026-07', limit: '5' }));
+    expect(out.outcomes).toHaveLength(5);
+    expect(out.cap).toBe(5);
+    expect(out.next_offset).toBe(5);
   });
 
   describe('zero-hit notices', () => {
@@ -869,9 +927,10 @@ describe('ukcrime_search_outcomes', () => {
       h.upstream.route('GET', '/outcomes-at-location', jsonOk([]));
       h.upstream.route('GET', '/locate-neighbourhood', status(500));
       const out = data(await call({ ...POINT, month: '2026-07' }));
-      expect(out.notice).toBe(
+      expect(out.notice).toContain(
         'No outcomes recorded here in 2026-07; try another month or a wider area.',
       );
+      expect(out.notice).toContain('Coverage could not be checked');
     });
   });
 
@@ -1658,7 +1717,7 @@ describe('ukcrime_search_outcomes', () => {
       const out = data(await call({ ...POINT, month: '2026-07' }));
       expect(out.total).toBe(3);
       expect(out.area).toEqual({ type: 'point', lat: LAT, lng: LNG });
-      expect(out.notice).toBeUndefined();
+      expect(out.notice).toContain('Coverage could not be checked');
     });
 
     it('caches the locate across searches of the same point', async () => {
@@ -1723,7 +1782,7 @@ describe('ukcrime_search_outcomes', () => {
       expect(rendered).toContain('**Crime category:** Burglary (burglary)');
       expect(rendered).toContain('**Next offset:** 1');
       const empty = text(await call({ ...POINT, month: '2026-07', category: 'robbery' }));
-      expect(empty.match(/_None\._/g)).toHaveLength(3);
+      expect(empty.match(/_None\._/g)).toHaveLength(4);
       expect(empty).toContain('### Outcomes on this page (0)');
       expect(empty).not.toContain('**Next offset:**');
     });

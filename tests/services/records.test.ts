@@ -339,6 +339,12 @@ describe('normalizeOutcomes', () => {
 });
 
 describe('normalizeStops', () => {
+  it('normalizes literal false outcome without changing the find flag', () => {
+    expect(
+      stops(stopRecord({ outcome: false, outcome_linked_to_object_of_search: true }))[0],
+    ).toMatchObject({ outcome: 'Nothing found', outcome_linked_to_object_of_search: true });
+    expect(RawStops.safeParse([stopRecord({ outcome: true })]).success).toBe(false);
+  });
   it('writes the wire shape for a fully populated stop; outcome_object and operation are dropped', () => {
     const [stop] = stops(stopRecord());
     expect(stop).toEqual({

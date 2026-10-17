@@ -243,7 +243,7 @@ export const findNeighbourhoodTool = tool('ukcrime_find_neighbourhood', {
       "Force id such as 'leicestershire', or its name such as 'Leicestershire Police' (ukcrime_list_reference topic 'forces' lists both), to look up by id (with neighbourhood_id); case-insensitive, spaces, underscores and hyphens match each other, '&' matches 'and', and a trailing 'Police', 'Police Service' or 'Constabulary' is optional.",
     ),
     neighbourhood_id: neighbourhoodIdInput.describe(
-      "Neighbourhood id from ukcrime_list_reference topic 'neighbourhoods', to look up by id (with force). Case-sensitive; only trimmed.",
+      "Neighbourhood id from ukcrime_list_reference topic 'neighbourhoods', to look up by id (with force). Exact spelling first; after a miss, a unique case-insensitive catalog match is retried.",
     ),
     include: z
       .preprocess(
@@ -276,6 +276,14 @@ export const findNeighbourhoodTool = tool('ukcrime_find_neighbourhood', {
     data_note: { label: 'Data note' },
   },
   errors: [
+    {
+      reason: 'ambiguous_neighbourhood',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'an exact neighbourhood request misses and more than one catalog id matches without case',
+      recovery: 'Send one of the exact candidate ids named in the error.',
+      severity: 'notice',
+      thrownBy: 'service',
+    },
     {
       reason: 'invalid_lookup',
       code: JsonRpcErrorCode.ValidationError,
@@ -356,7 +364,32 @@ export const findNeighbourhoodTool = tool('ukcrime_find_neighbourhood', {
       neighbourhoodId = lookup.neighbourhoodId;
     }
 
-    // The profile decides the result; the force name, force detail and sections degrade.
+    let profile = service.getNeighbourhood(forceId, neighbourhoodId, ctx, budget);
+    if (lookup.kind === 'id') {
+      let resolved = await profile;
+      if (resolved.kind === 'miss') {
+        const matched = await service.matchNeighbourhoodAfterMiss(
+          forceId,
+          neighbourhoodId,
+          ctx,
+          budget,
+        );
+        if (matched !== undefined && matched !== neighbourhoodId) {
+          neighbourhoodId = matched;
+          resolved = await service.getNeighbourhood(forceId, neighbourhoodId, ctx, budget);
+        }
+      }
+      profile = Promise.resolve(resolved);
+      ctx.signal.throwIfAborted();
+      if (resolved.kind === 'miss') {
+        return {
+          found: false,
+          guidance: `No neighbourhood '${lookup.neighbourhoodId}' in force '${forceId}'. Call ukcrime_list_reference with topic 'neighbourhoods' and force '${forceId}' to find it by name.`,
+        };
+      }
+    }
+
+    // Resolve a supplied id before sections; point-derived ids retain their parallel reads.
     const optional = Promise.allSettled([
       service.findForce(forceId, ctx, budget, { allowBtp: false }),
       service.getForceDetail(forceId, ctx, budget),
@@ -369,16 +402,13 @@ export const findNeighbourhoodTool = tool('ukcrime_find_neighbourhood', {
         ? service.getBoundary(forceId, neighbourhoodId, ctx, budget)
         : undefined,
     ]);
-    const [detail, settled] = await Promise.all([
-      service.getNeighbourhood(forceId, neighbourhoodId, ctx, budget),
-      optional,
-    ]);
+    const [detail, settled] = await Promise.all([profile, optional]);
     ctx.signal.throwIfAborted();
 
     if (detail.kind === 'miss') {
       return {
         found: false,
-        guidance: `No neighbourhood '${neighbourhoodId}' in force '${forceId}'. Ids are case-sensitive; call ukcrime_list_reference with topic 'neighbourhoods' and force '${forceId}' to find it by name.`,
+        guidance: `No neighbourhood '${neighbourhoodId}' in force '${forceId}'. Call ukcrime_list_reference with topic 'neighbourhoods' and force '${forceId}' to find it by name.`,
         ...locatedFrom,
       };
     }

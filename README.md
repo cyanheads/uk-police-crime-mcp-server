@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.1.2-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/uk-police-crime-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.1.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/uk-police-crime-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/uk-police-crime-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.2-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.1.2-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/uk-police-crime-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.3.1-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/uk-police-crime-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/uk-police-crime-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.3-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -29,7 +29,7 @@
 
 ## Overview
 
-Monthly street-level crime, police outcomes, and stop and search records from [data.police.uk](https://data.police.uk/), plus the neighbourhood policing teams behind them. Covers the 43 territorial forces of England and Wales, the Police Service of Northern Ireland, and British Transport Police, whose station records are the only coverage of Scotland. Search by point, polygon, map point, neighbourhood, or whole force; follow a crime's outcome history; find who polices a place. Runs as a stdio process, a local Streamable HTTP server, or the public hosted endpoint above.
+Street-level crime, police outcomes, and stop and search records from [data.police.uk](https://data.police.uk/) for England, Wales, and Northern Ireland. Search by point, area, neighbourhood, or force, follow a crime's outcome history, and find which team polices a place.
 
 ### Tools
 
@@ -55,7 +55,7 @@ Monthly street-level crime, police outcomes, and stop and search records from [d
 ### `ukcrime_search_crimes` <sub>tool</sub>
 
 - `area`: `point` (`lat`, `lng`; a 1-mile radius), `polygon` (3–2,500 vertices), `location` (`location_id`), `neighbourhood` (`force` + `neighbourhood_id`), or `force_unplaced` (`force`: the crimes it could not place); optional `month` (default: latest published), `month_from` (a range of up to 12 months ending at `month`), and `category` (default: every category)
-- Returns `total`, `by_category`, `by_outcome`, up to 10 `top_locations`, and a page of `crimes` with the `persistent_id` that `ukcrime_get_crime_outcomes` takes; `limit` defaults to 25 (max 200), `next_offset` continues
+- Returns `total`, `by_category`, `by_outcome`, up to 10 `top_locations`, and a page of `crimes` with the `persistent_id` that `ukcrime_get_crime_outcomes` takes; `limit` defaults to 25, accepts 1–10,000 and applies at most 200, echoed as `cap`; `next_offset` continues
 - With `month_from`, the totals, breakdowns and `top_locations` cover the range, `by_month` gives each month's total, and rows page across it, oldest month first
 - Failures carry a typed `reason`, such as `month_not_published`, `unknown_category`, or `area_too_large`; a range that cannot be fetched whole in one call fails `range_incomplete` (call again: fetched months stay cached) or `range_too_large`
 
@@ -64,31 +64,34 @@ Monthly street-level crime, police outcomes, and stop and search records from [d
 ### `ukcrime_search_outcomes` <sub>tool</sub>
 
 - Same areas as `ukcrime_search_crimes` except `force_unplaced`; `month` is when the outcome was recorded, and `category` counts only outcomes for crimes in that category
-- Returns `total`, `unfiltered_total`, `by_outcome` (code, name, count), `by_crime_month`, and a page of `outcomes`, each with its crime; `limit` defaults to 20 (max 200)
+- Returns `total`, `unfiltered_total`, `by_category` (crime category and count), `by_outcome` (code, name, count), `by_crime_month`, and a page of `outcomes`, each with its crime; `limit` defaults to 20, accepts 1–10,000 and applies at most 200, echoed as `cap`
 - Police outcomes only: court results are not published, and the result says when a force publishes no outcomes
 
 ---
 
 ### `ukcrime_get_crime_outcomes` <sub>tool</sub>
 
-- `persistent_ids`: 1–25 64-character ids from `ukcrime_search_crimes` or `ukcrime_search_outcomes`; anti-social behaviour records carry none
+- `persistent_ids`: 64-character ids from `ukcrime_search_crimes` or `ukcrime_search_outcomes`, as an array or comma/whitespace-separated string; at most 1,000 raw array elements, 1,000 nonblank tokens before deduplication and 128,000 aggregate UTF-16 code units; anti-social behaviour records carry none
+- Every id is validated before querying; the first 25 unique ids are processed, with ordered `remaining_ids` to send as `persistent_ids` on the next call (an empty array when exhausted)
 - Each crime comes back with every outcome, oldest first; `history_available: false` marks a crime with no published history
-- Unknown ids land in `not_found` and failed lookups in `failed`, so one bad id never fails the batch
+- Unknown ids land in `not_found` and failed lookups in `failed`; a call whose processed lookups all fail still fails
 
 ---
 
 ### `ukcrime_search_stops` <sub>tool</sub>
 
 - `area`: `point`, `polygon`, `location`, `neighbourhood`, or `force` (every stop the force published, placed or not); optional `month` and `month_from`, as on `ukcrime_search_crimes`; up to 8 `filters` on `type`, `self_defined_ethnicity`, `officer_defined_ethnicity`, `outcome`, `object_of_search`, `legislation`, `age_range`, `gender`, `outcome_linked_to_object_of_search`, or `removal_of_more_than_outer_clothing` (the last two take `'true'`, `'false'` or `'(not recorded)'`; a JSON boolean also works)
-- Returns `total`, `unfiltered_total`, `unplaced`, `force_published` (whether every force found for the area — the one it names, or those located at a point, a polygon's centre and outermost vertices, or a location's map point — published stop and search that month, or every month of a range), a breakdown per filterable field, and a page of `stops`; `limit` defaults to 15 (max 200)
+- Returns `total`, `unfiltered_total`, `unplaced`, `force_published` (whether every force found for the area — the one it names, or those located at a point, a polygon's centre and outermost vertices, or a location's map point — published stop and search that month, or every month of a range), a breakdown per filterable field, and a page of `stops`; `limit` defaults to 15, accepts 1–10,000 and applies at most 200, echoed as `cap`
 - With `month_from`, `by_month` gives each month's total and its own `force_published`, so a month a force skipped reads as a gap, not a drop; the notice lists the months each force skipped
 - Filters narrow breakdowns and page together, in every month of a range: filter one field and read another's breakdown for a cross-tab
+- A published `outcome: false` is `Nothing found`; blank, null or absent outcomes remain `(not recorded)`, independently of the find-rate flag
 
 ---
 
 ### `ukcrime_find_neighbourhood` <sub>tool</sub>
 
 - Look up by `lat` + `lng` or by `force` + `neighbourhood_id`; `include` picks `priorities`, `team`, `events` (the default three) and `boundary`
+- Neighbourhood lookups and searches try the exact id first, then retry a unique case-insensitive match from the cached force list after a miss. Ambiguous matches fail with the candidate ids; results echo the canonical spelling.
 - Returns the force, the team's description, contact channels and stations, current priorities, every upcoming event the force published (soonest first), and the boundary as a polygon string the search tools accept
 - Team entries carry only rank and name; biographies and personal contact details are not returned. A point outside coverage returns `found: false` with `guidance`
 
@@ -101,6 +104,7 @@ data.police.uk-specific:
 - Every location is an anonymised map point covering at least eight addresses, never the place a crime or stop happened; outputs label it that way
 - Validates locally what the upstream would silently widen: unknown categories, months outside the window, forces matching no id or name (`Leicestershire Police` works as well as `leicestershire`), and area fields the chosen area does not use
 - Omitting `month` searches the latest published month and echoes it; per-force coverage gaps are dated and named in each result's `notice`
+- Failed or timed-out coverage lookups retain search records and disclose that coverage could not be checked, even when no force resolves; unknown coverage never reports `force_published: true`
 - A 12-month trend of crimes or stop and search is one call for most areas: `month_from` fetches the months two at a time and caches each for 15 minutes, so paging and a repeat send no area request; a large area that runs short of time fails `range_incomplete`, and the repeat fetches only the months still missing
 - Requests are paced process-wide under data.police.uk's rate limit, with retries and in-process caches
 

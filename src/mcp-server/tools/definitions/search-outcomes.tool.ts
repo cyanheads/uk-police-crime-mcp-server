@@ -2,7 +2,7 @@
  * @fileoverview ukcrime_search_outcomes — police outcomes recorded in one month
  * inside an area (a point's 1-mile radius, a polygon, a snapped location_id, a
  * police neighbourhood), for crimes recorded that month or earlier: the total,
- * counts by outcome and by crime month, and a page of outcomes with their crimes.
+ * counts by crime category, outcome and crime month, and a page with their crimes.
  * @module mcp-server/tools/definitions/search-outcomes.tool
  */
 
@@ -11,6 +11,7 @@ import { internalError, JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import {
   AREA_INPUT_ALIASES,
   areaEcho,
+  breakdown,
   checkNamedForce,
   latField,
   lngField,
@@ -31,8 +32,10 @@ import {
 import { cell, inline, quote } from '@/mcp-server/tools/format-helpers.js';
 import {
   AreaEchoSchema,
+  breakdownSchema,
   LocationSchema,
   renderArea,
+  renderBreakdown,
   renderLocation,
   SEARCH_ENRICHMENT,
   SEARCH_ENRICHMENT_TRAILER,
@@ -95,6 +98,9 @@ const OutputSchema = z.object({
       "The crime category counted; absent when every category was (no category, or 'all-crime').",
     ),
   total: z.number().describe('Outcomes matched, after the category filter.'),
+  by_category: breakdownSchema(
+    'Matched outcomes by crime category, most first, then category in code-unit order.',
+  ),
   unfiltered_total: z
     .number()
     .describe('Outcomes recorded in the area and month before the category filter.'),
@@ -157,7 +163,7 @@ function crimeMonthCounts(outcomes: readonly OutcomeRecord[]): OutcomesOutput['b
 export const searchOutcomesTool = tool('ukcrime_search_outcomes', {
   title: 'Search UK Police Outcomes',
   description:
-    'List the police outcomes recorded in one month inside an area — a point with a 1-mile radius, a polygon, a location_id, or a neighbourhood — for crimes recorded that month or any earlier one. Returns the total, counts by outcome and by the month each crime was recorded, and a page of outcomes, each with its crime and persistent_id. Use it for what police resolved in a month; ukcrime_search_crimes gives the latest outcome of the crimes recorded in a month instead. Court results are not published; the result says when a force publishes no outcomes.',
+    'List the police outcomes recorded in one month inside an area — a point with a 1-mile radius, a polygon, a location_id, or a neighbourhood — for crimes recorded that month or any earlier one. Returns the total, counts by crime category, outcome and the month each crime was recorded, and a page of outcomes, each with its crime and persistent_id. Use it for what police resolved in a month; ukcrime_search_crimes gives the latest outcome of the crimes recorded in a month instead. Court results are not published; the result says when a force publishes no outcomes.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
     area: z
@@ -177,7 +183,9 @@ export const searchOutcomesTool = tool('ukcrime_search_outcomes', {
     category: categoryInput.describe(
       "Count only outcomes for crimes in this category: a slug such as 'burglary' or a display name such as 'Violence and sexual offences'; case-insensitive, and spaces, underscores and hyphens match each other ('vehicle_crime' finds 'vehicle-crime'). Omitted or 'all-crime': every category. ukcrime_list_reference topic 'categories' lists them.",
     ),
-    limit: limitInput(20).describe('Outcomes on this page, 1–200. Default 20.'),
+    limit: limitInput(20).describe(
+      'Requested outcomes on this page, 1–10,000; applied cap is at most 200. Default 20.',
+    ),
     offset: offsetField,
   }),
   inputAliases: AREA_INPUT_ALIASES,
@@ -185,6 +193,14 @@ export const searchOutcomesTool = tool('ukcrime_search_outcomes', {
   enrichment: SEARCH_ENRICHMENT,
   enrichmentTrailer: SEARCH_ENRICHMENT_TRAILER,
   errors: [
+    {
+      reason: 'ambiguous_neighbourhood',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'an exact neighbourhood request misses and more than one catalog id matches without case',
+      recovery: 'Send one of the exact candidate ids named in the error.',
+      severity: 'notice',
+      thrownBy: 'service',
+    },
     {
       reason: 'invalid_area',
       code: JsonRpcErrorCode.ValidationError,
@@ -228,7 +244,7 @@ export const searchOutcomesTool = tool('ukcrime_search_outcomes', {
     {
       reason: 'unknown_neighbourhood',
       code: JsonRpcErrorCode.NotFound,
-      when: 'the force has no neighbourhood with this id (ids are case-sensitive)',
+      when: 'the exact neighbourhood request and any unique case-insensitive catalog match miss',
       recovery:
         "Call ukcrime_list_reference with topic 'neighbourhoods' and this force for valid ids, or ukcrime_find_neighbourhood with lat and lng.",
       severity: 'notice',
@@ -288,12 +304,13 @@ export const searchOutcomesTool = tool('ukcrime_search_outcomes', {
   ],
 
   async handler(input, ctx) {
+    const cap = Math.min(input.limit, 200);
     ctx.enrich({
       attribution: ATTRIBUTION,
       data_note: DATA_NOTE,
       truncated: false,
       shown: 0,
-      cap: input.limit,
+      cap,
     });
     const parsed = parseArea(input.area, input);
     if (!parsed.ok) throw ctx.fail('invalid_area', parsed.message);
@@ -350,7 +367,7 @@ export const searchOutcomesTool = tool('ukcrime_search_outcomes', {
       ? run.records.filter((outcome) => outcome.crime.category === filter.slug)
       : run.records;
     const total = matched.length;
-    const page = pageOf(matched, input.offset, input.limit);
+    const page = pageOf(matched, input.offset, cap);
     ctx.enrich({ truncated: page.nextOffset !== undefined, shown: page.rows.length });
 
     const notes: string[] = [];
@@ -380,6 +397,7 @@ export const searchOutcomesTool = tool('ukcrime_search_outcomes', {
       area: areaEcho(spec, run),
       ...(filter ? { category: { slug: filter.slug, name: filter.name } } : {}),
       total,
+      by_category: breakdown(matched, (outcome) => outcome.crime.category),
       unfiltered_total: run.records.length,
       by_outcome: outcomeCounts(matched),
       by_crime_month: crimeMonthCounts(matched),
@@ -399,6 +417,7 @@ export const searchOutcomesTool = tool('ukcrime_search_outcomes', {
       `**Outcomes matched:** ${result.total} of ${result.unfiltered_total} recorded this month`,
     );
 
+    lines.push(...renderBreakdown('By crime category', result.by_category));
     lines.push('', '### By outcome');
     if (result.by_outcome.length === 0) lines.push('', '_None._');
     else {

@@ -177,7 +177,7 @@ export function normalizeStops(raw: z.output<typeof RawStops>): readonly StopRec
       const officerDefined = present(entry.officer_defined_ethnicity);
       const legislation = present(entry.legislation);
       const objectOfSearch = present(entry.object_of_search);
-      const outcome = present(entry.outcome);
+      const outcome = entry.outcome === false ? 'Nothing found' : present(entry.outcome);
       const operationName = present(entry.operation_name);
       return {
         datetime: entry.datetime,

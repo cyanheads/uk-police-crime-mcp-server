@@ -120,6 +120,34 @@ const BY_MONTH_HEADER = '| Month | Stops | Every force found for the area publis
 describe('ukcrime_search_stops over a month range', () => {
   const h = useToolHarness();
 
+  it('retains capped and past-end range pages while disclosing failed coverage on both surfaces', async () => {
+    h.upstream.route(
+      'GET',
+      STREET,
+      perMonth({
+        '2026-06': jsonOk(stopsIn('2026-06', 200)),
+        '2026-07': jsonOk(stopsIn('2026-07', 200)),
+      }),
+    );
+    h.upstream.route('GET', '/locate-neighbourhood', jsonOk({ force: 1 }));
+    for (const offset of [0, 200, 400, 1000]) {
+      const result = await call({
+        ...POINT,
+        month_from: '2026-06',
+        month: '2026-07',
+        limit: 10_000,
+        offset,
+      });
+      const out = data(result);
+      expect(out.total).toBe(400);
+      expect(out.stops).toHaveLength(offset < 400 ? 200 : 0);
+      expect(out.notice).toContain('Coverage could not be checked');
+      expect(text(result)).toContain('Coverage could not be checked');
+      expect(JSON.stringify(out)).not.toContain('"force_published":true');
+    }
+    expect(h.upstream.count(STREET)).toBe(2);
+  });
+
   const requests = () =>
     h.upstream.calls.map(({ method, path, query }) => `${method} ${path} ${query}`).sort();
 

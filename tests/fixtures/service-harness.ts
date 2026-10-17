@@ -73,13 +73,6 @@ export function createUpstream(): Upstream {
   const routes = new Map<string, Responder>();
   const calls: UpstreamCall[] = [];
   const unhandled: string[] = [];
-  /**
-   * Requests whose responder has not settled, held as a real fetch holds a
-   * request in flight. A `Request` follows its caller's signal through a weak
-   * link, so once nothing else holds it a garbage collection cuts the abort
-   * path and a responder waiting on `request.signal` never ends.
-   */
-  const inFlight = new Set<Request>();
   const keyOf = (method: string, path: string) => `${method.toUpperCase()} ${path}`;
   const pathOf = (url: string) => new URL(url).pathname.slice(new URL(API_BASE).pathname.length);
 
@@ -90,10 +83,7 @@ export function createUpstream(): Upstream {
         respond: (request) => {
           const respond = routes.get(keyOf(request.method, pathOf(request.url)));
           if (!respond) throw new Error('route vanished');
-          const answer = respond(request);
-          if (!(answer instanceof Promise)) return answer;
-          inFlight.add(request);
-          return answer.finally(() => inFlight.delete(request));
+          return respond(request);
         },
       },
     ],

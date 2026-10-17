@@ -166,7 +166,12 @@ const StopSchema = z
       .describe('Ethnicity as the officer perceived it.'),
     legislation: z.string().optional().describe('Power the search was made under.'),
     object_of_search: z.string().optional().describe('What the officer was searching for.'),
-    outcome: z.string().optional().describe('Outcome.'),
+    outcome: z
+      .string()
+      .optional()
+      .describe(
+        'Outcome; a published false means Nothing found, while blank, null or absent is unrecorded.',
+      ),
     outcome_linked_to_object_of_search: z
       .boolean()
       .optional()
@@ -344,7 +349,9 @@ export const searchStopsTool = tool('ukcrime_search_stops', {
       .describe(
         'Up to 8 filters, all of which a stop must match; they narrow the counts and the page together. Fields: type, self_defined_ethnicity, officer_defined_ethnicity, outcome, object_of_search, legislation, age_range, gender, outcome_linked_to_object_of_search, removal_of_more_than_outer_clothing.',
       ),
-    limit: limitInput(15).describe('Stops on this page, 1–200. Default 15.'),
+    limit: limitInput(15).describe(
+      'Requested stops on this page, 1–10,000; applied cap is at most 200. Default 15.',
+    ),
     offset: offsetField,
   }),
   inputAliases: AREA_INPUT_ALIASES,
@@ -352,6 +359,14 @@ export const searchStopsTool = tool('ukcrime_search_stops', {
   enrichment: SEARCH_ENRICHMENT,
   enrichmentTrailer: SEARCH_ENRICHMENT_TRAILER,
   errors: [
+    {
+      reason: 'ambiguous_neighbourhood',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'an exact neighbourhood request misses and more than one catalog id matches without case',
+      recovery: 'Send one of the exact candidate ids named in the error.',
+      severity: 'notice',
+      thrownBy: 'service',
+    },
     {
       reason: 'invalid_area',
       code: JsonRpcErrorCode.ValidationError,
@@ -395,7 +410,7 @@ export const searchStopsTool = tool('ukcrime_search_stops', {
     {
       reason: 'unknown_neighbourhood',
       code: JsonRpcErrorCode.NotFound,
-      when: 'the force has no neighbourhood with this id (ids are case-sensitive)',
+      when: 'the exact neighbourhood request and any unique case-insensitive catalog match miss',
       recovery:
         "Call ukcrime_list_reference with topic 'neighbourhoods' and this force for valid ids, or ukcrime_find_neighbourhood with lat and lng.",
       severity: 'notice',
@@ -463,12 +478,13 @@ export const searchStopsTool = tool('ukcrime_search_stops', {
   ],
 
   async handler(input, ctx) {
+    const cap = Math.min(input.limit, 200);
     ctx.enrich({
       attribution: ATTRIBUTION,
       data_note: DATA_NOTE,
       truncated: false,
       shown: 0,
-      cap: input.limit,
+      cap,
     });
     const parsed = parseArea(input.area, input);
     if (!parsed.ok) throw ctx.fail('invalid_area', parsed.message);
@@ -520,7 +536,7 @@ export const searchStopsTool = tool('ukcrime_search_stops', {
     const records = run.months.flatMap((entry) => entry.records);
     const matched = byMonth.flatMap((entry) => entry.matched);
     const total = matched.length;
-    const page = pageOf(matched, input.offset, input.limit);
+    const page = pageOf(matched, input.offset, cap);
     ctx.enrich({ truncated: page.nextOffset !== undefined, shown: page.rows.length });
 
     const flags = byMonth.map((entry) => entry.published);

@@ -15,6 +15,8 @@ import { callAgainAfter, getPoliceApiService } from '@/services/police-api/polic
 import type { CrimeHistory, Lookup } from '@/services/police-api/types.js';
 
 const MAX_IDS = 25;
+const MAX_INPUT_IDS = 1000;
+const MAX_INPUT_CHARACTERS = 128_000;
 /** Lookups one call keeps queued or in flight, so it never holds more than this many of the shared pacer's entries. */
 const LOOKUPS_IN_FLIGHT = 4;
 
@@ -24,29 +26,42 @@ const DATA_NOTE =
 /**
  * Accepts one string or a list: every string is split on commas and
  * whitespace, lower-cased (upstream ids are lower-case hex, and an upper-cased
- * id 404s), blanks and repeats dropped in first-seen order, and the list cut to
- * max + 1 so an over-long list yields one issue. Non-string items pass through
- * for the schema to reject.
+ * id 404s), blanks and repeats dropped in first-seen order. Raw size and token
+ * bounds apply before deduplication; every normalized id is validated before work.
  */
-function preparePersistentIds(value: unknown): unknown {
+function preparePersistentIds(value: string | string[], ctx: z.core.$RefinementCtx): string[] {
   const items = typeof value === 'string' ? [value] : value;
-  if (!Array.isArray(items)) return value;
-  const seen = new Set<string>();
-  const ids: unknown[] = [];
+  let characters = 0;
+  let tokens = 0;
   for (const item of items) {
-    if (ids.length > MAX_IDS) break;
-    if (typeof item !== 'string') {
-      ids.push(item);
-      continue;
+    characters += item.length;
+    if (characters > MAX_INPUT_CHARACTERS) {
+      ctx.addIssue({
+        code: 'custom',
+        message: 'Send at most 128,000 aggregate UTF-16 code units.',
+      });
+      return z.NEVER;
     }
+  }
+  const seen = new Set<string>();
+  const ids: string[] = [];
+  for (const item of items) {
     for (const part of item.split(/[\s,]+/)) {
       const id = part.toLowerCase();
-      if (id === '' || seen.has(id)) continue;
+      if (id === '') continue;
+      if (++tokens > MAX_INPUT_IDS) {
+        ctx.addIssue({
+          code: 'custom',
+          message: 'Send at most 1,000 nonblank tokens before deduplication.',
+        });
+        return z.NEVER;
+      }
+      if (seen.has(id)) continue;
       seen.add(id);
       ids.push(id);
     }
   }
-  return ids.slice(0, MAX_IDS + 1);
+  return ids;
 }
 
 /** Server-written failure text for the service's `ServiceUnavailable` reasons. */
@@ -120,6 +135,11 @@ function allFailed(error: unknown, at: number): McpError {
 }
 
 const OutputSchema = z.object({
+  remaining_ids: z
+    .array(z.string().describe('A validated persistent id.'))
+    .describe(
+      'Unprocessed ids in first-seen order; send these as persistent_ids on the next call. Empty when exhausted.',
+    ),
   crimes: z
     .array(
       z
@@ -168,7 +188,9 @@ const OutputSchema = z.object({
   guidance: z
     .string()
     .optional()
-    .describe('What to do about ids in not_found or failed; absent when every id resolved.'),
+    .describe(
+      'What to do about remaining_ids, not_found or failed; absent when every id resolved.',
+    ),
 });
 
 type CrimeOutcomesOutput = z.infer<typeof OutputSchema>;
@@ -181,12 +203,24 @@ type LookupResult =
 export const getCrimeOutcomesTool = tool('ukcrime_get_crime_outcomes', {
   title: 'Get UK Crime Outcome Histories',
   description:
-    'Fetch the full police outcome history of up to 25 crimes by persistent_id — the 64-character id on crimes from ukcrime_search_crimes and ukcrime_search_outcomes. Returns each crime with every outcome, oldest first, and lists the ids data.police.uk does not hold. Anti-social behaviour records carry no persistent id.',
+    'Fetch the full police outcome history of up to 25 crimes per call by persistent_id — the 64-character id on crimes from ukcrime_search_crimes and ukcrime_search_outcomes. Accepts up to 1,000 raw elements or nonblank delimited tokens and 128,000 aggregate UTF-16 code units; remaining_ids carries unprocessed unique ids for the next call. Returns each crime with every outcome, oldest first, and lists the ids data.police.uk does not hold. Anti-social behaviour records carry no persistent id.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
     persistent_ids: z
-      .preprocess(
-        preparePersistentIds,
+      .union([
+        z
+          .string()
+          .max(MAX_INPUT_CHARACTERS)
+          .describe(
+            'Comma- or whitespace-separated persistent ids, at most 1,000 nonblank tokens.',
+          ),
+        z
+          .array(z.string().describe('One or more comma/whitespace-separated persistent ids.'))
+          .max(MAX_INPUT_IDS)
+          .describe('At most 1,000 raw elements and 128,000 aggregate UTF-16 code units.'),
+      ])
+      .transform(preparePersistentIds)
+      .pipe(
         z
           .array(
             z
@@ -198,10 +232,10 @@ export const getCrimeOutcomesTool = tool('ukcrime_get_crime_outcomes', {
               .describe('A 64-character hexadecimal persistent id.'),
           )
           .min(1)
-          .max(MAX_IDS),
+          .max(MAX_INPUT_IDS),
       )
       .describe(
-        '1–25 persistent ids from the persistent_id field of ukcrime_search_crimes or ukcrime_search_outcomes results. A comma- or space-separated string is also accepted; ids are lower-cased and repeats dropped.',
+        'Persistent ids from ukcrime_search_crimes or ukcrime_search_outcomes: at most 1,000 raw array elements, 1,000 nonblank comma/whitespace-separated tokens before deduplication, and 128,000 aggregate UTF-16 code units. Ids are lower-cased, blanks and repeats dropped; every id is validated, the first 25 unique ids processed and the rest returned as remaining_ids.',
       ),
   }),
   inputAliases: { persistent_id: 'persistent_ids' },
@@ -258,7 +292,8 @@ export const getCrimeOutcomesTool = tool('ukcrime_get_crime_outcomes', {
     const budget = service.openBudget();
     // Per-id isolation: one failed lookup must not discard the others. Four
     // workers share one iterator and write each result at its id's index.
-    const pending = input.persistent_ids.entries();
+    const remainingIds = input.persistent_ids.slice(MAX_IDS);
+    const pending = input.persistent_ids.slice(0, MAX_IDS).entries();
     const results: LookupResult[] = [];
     const worker = async () => {
       for (const [index, id] of pending) {
@@ -306,6 +341,10 @@ export const getCrimeOutcomesTool = tool('ukcrime_get_crime_outcomes', {
     }
 
     const guidance: string[] = [];
+    if (remainingIds.length > 0)
+      guidance.push(
+        `${remainingIds.length} ids remain unprocessed; call ukcrime_get_crime_outcomes again with remaining_ids as persistent_ids.`,
+      );
     if (notFound.length > 0) {
       guidance.push(
         `data.police.uk holds no crime for ${notFound.length} of these ids. Take persistent ids from the persistent_id field of ukcrime_search_crimes or ukcrime_search_outcomes results; anti-social behaviour records carry none.`,
@@ -318,6 +357,7 @@ export const getCrimeOutcomesTool = tool('ukcrime_get_crime_outcomes', {
     }
     return {
       crimes,
+      remaining_ids: remainingIds,
       not_found: notFound,
       failed,
       ...(guidance.length > 0 ? { guidance: guidance.join(' ') } : {}),
@@ -360,6 +400,13 @@ export const getCrimeOutcomesTool = tool('ukcrime_get_crime_outcomes', {
         ...result.failed.map((entry) => `- ${inline(entry.persistent_id)}: ${inline(entry.error)}`),
       );
     }
+    if (result.remaining_ids.length > 0)
+      lines.push(
+        '',
+        '### Unprocessed remaining_ids',
+        '',
+        ...result.remaining_ids.map((id) => `- ${inline(id)}`),
+      );
     if (result.guidance) lines.push('', `**Guidance:** ${inline(result.guidance)}`);
     return [{ type: 'text', text: lines.join('\n') }];
   },

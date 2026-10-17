@@ -171,7 +171,7 @@ export const RawStops = z.array(
     officer_defined_ethnicity: z.string().nullish(),
     legislation: z.string().nullish(),
     object_of_search: z.string().nullish(),
-    outcome: z.string().nullish(),
+    outcome: z.union([z.string(), z.literal(false)]).nullish(),
     outcome_linked_to_object_of_search: z.boolean().nullish(),
     removal_of_more_than_outer_clothing: z.boolean().nullish(),
     operation_name: z.string().nullish(),

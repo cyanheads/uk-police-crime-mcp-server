@@ -297,6 +297,7 @@ describe('resolveTarget', () => {
   });
 
   it('names the force and id of an unknown or wrongly cased neighbourhood (404), and caches the miss', async () => {
+    h.upstream.route('GET', '/leicestershire/neighbourhoods', jsonOk([]));
     h.upstream.route('GET', '/leicestershire/nx01/boundary', plainNotFound);
     const spec = {
       kind: 'neighbourhood',

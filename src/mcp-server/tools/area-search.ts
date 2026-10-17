@@ -59,7 +59,7 @@ export const locationIdField = locationIdInput.describe(
 );
 
 export const neighbourhoodIdField = neighbourhoodIdInput.describe(
-  "For area 'neighbourhood', with force: a neighbourhood id from ukcrime_list_reference topic 'neighbourhoods', or from ukcrime_find_neighbourhood for a point. Case-sensitive; only trimmed.",
+  "For area 'neighbourhood', with force: a neighbourhood id from ukcrime_list_reference topic 'neighbourhoods', or from ukcrime_find_neighbourhood for a point. Exact spelling first; after a miss, a unique case-insensitive catalog match is retried.",
 );
 
 export const monthField = monthInput.describe(
@@ -257,6 +257,8 @@ type Located = Lookup<LocatedNeighbourhood>;
 
 /** The lookups an area run made: one for a point or a location's map point, one per sample point for a polygon. */
 interface AreaLookups {
+  /** A requested lookup failed or was skipped when its supplemental budget ran out. */
+  readonly coverageLookupIncomplete?: true;
   /**
    * The lookup of a point, or of a location's map point. Absent for other arms,
    * when the lookup failed, and for a location with no record carrying a map point.
@@ -277,6 +279,8 @@ export interface AreaForces extends AreaLookups {
    * every force a lookup found. Empty when no force is known.
    */
   readonly forces: readonly string[];
+  /** Canonical id used for a neighbourhood boundary, after any miss recovery. */
+  readonly neighbourhoodId?: string;
 }
 
 /** An area query's outcome. The two misses map to the tools' declared reasons. */
@@ -388,10 +392,14 @@ async function locateBeside(
       ctx,
       budget,
     );
-    return located ? { located } : {};
+    return located ? { located } : { coverageLookupIncomplete: true };
   }
   if (spec.kind === 'polygon') {
-    return { samples: await locateSamples(samplePoints(spec.vertices), service, ctx, budget) };
+    const samples = await locateSamples(samplePoints(spec.vertices), service, ctx, budget);
+    return {
+      samples,
+      ...(samples.includes(undefined) ? { coverageLookupIncomplete: true as const } : {}),
+    };
   }
   return {};
 }
@@ -416,7 +424,7 @@ async function locateRecords<T>(
       ctx,
       service.narrowBudget(budget, LOCATE_BUDGET_MS),
     );
-    return located ? { located } : {};
+    return located ? { located } : { coverageLookupIncomplete: true };
   }
   return {};
 }
@@ -462,6 +470,7 @@ export async function runAreaQuery<T>(
     kind: 'ok',
     records: result.value,
     target: target.value,
+    ...(target.neighbourhoodId !== undefined ? { neighbourhoodId: target.neighbourhoodId } : {}),
     forces: forcesOf(spec, lookups),
     ...lookups,
   };
@@ -614,6 +623,7 @@ async function runAreaRange<T>(
     kind: 'ok',
     months: fetched.months,
     target: target.value,
+    ...(target.neighbourhoodId !== undefined ? { neighbourhoodId: target.neighbourhoodId } : {}),
     forces: forcesOf(spec, lookups),
     ...lookups,
   };
@@ -675,7 +685,7 @@ export function unknownNeighbourhoodMessage({
   force,
   neighbourhoodId,
 }: UnknownNeighbourhood): string {
-  return `Force '${force}' has no neighbourhood '${neighbourhoodId}'; ids are case-sensitive.`;
+  return `Force '${force}' has no neighbourhood '${neighbourhoodId}'.`;
 }
 
 /** The area echo: the arm's own fields, the polygon size searched, and the forces the lookups found. */
@@ -705,7 +715,7 @@ export function areaEcho(
       return {
         type: spec.kind,
         force: spec.force,
-        neighbourhood_id: spec.neighbourhoodId,
+        neighbourhood_id: run.neighbourhoodId ?? spec.neighbourhoodId,
         ...(run.target.kind === 'polygon' ? { vertex_count: run.target.vertices.length } : {}),
       };
     case 'force_unplaced':
@@ -772,14 +782,17 @@ export function outsideCoverageNote(spec: AreaSpec, run: AreaLookups): string | 
 }
 
 /**
- * For a polygon some of whose sample lookups failed while others found a force:
- * its forces may be short of every force it falls in, so no notice or flag may
- * speak for all of them. Absent when every lookup answered, or none found a force.
+ * Failed or budget-skipped supplemental coverage lookups never erase records.
+ * A partial polygon retains its specific warning; an unresolved area says that
+ * coverage could not be checked, separately from a genuine coverage miss.
  */
 export function partialLocateNote(run: AreaForces): string | undefined {
   const samples = run.samples ?? [];
   const failed = samples.filter((lookup) => lookup === undefined).length;
-  if (failed === 0 || run.forces.length === 0) return;
+  if (failed === 0 && !run.coverageLookupIncomplete) return;
+  if (run.forces.length === 0 || samples.length === 0) {
+    return 'Coverage could not be checked because the force lookup failed or ran out of time; records are retained, but coverage gaps may be missing. Search again to retry the lookup.';
+  }
   return `The force at ${failed} of this polygon's ${samples.length} sample points could not be looked up, so the forces named here may not be all it falls in; search again to retry the lookup.`;
 }
 

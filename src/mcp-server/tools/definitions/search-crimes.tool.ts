@@ -200,7 +200,9 @@ export const searchCrimesTool = tool('ukcrime_search_crimes', {
     category: categoryInput.describe(
       "Crime category slug such as 'burglary', or its display name such as 'Violence and sexual offences'; case-insensitive, and spaces, underscores and hyphens match each other ('vehicle_crime' finds 'vehicle-crime'). Omitted: every category (all-crime). ukcrime_list_reference topic 'categories' lists them.",
     ),
-    limit: limitInput(25).describe('Crimes on this page, 1–200. Default 25.'),
+    limit: limitInput(25).describe(
+      'Requested crimes on this page, 1–10,000; applied cap is at most 200. Default 25.',
+    ),
     offset: offsetField,
   }),
   inputAliases: AREA_INPUT_ALIASES,
@@ -208,6 +210,14 @@ export const searchCrimesTool = tool('ukcrime_search_crimes', {
   enrichment: SEARCH_ENRICHMENT,
   enrichmentTrailer: SEARCH_ENRICHMENT_TRAILER,
   errors: [
+    {
+      reason: 'ambiguous_neighbourhood',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'an exact neighbourhood request misses and more than one catalog id matches without case',
+      recovery: 'Send one of the exact candidate ids named in the error.',
+      severity: 'notice',
+      thrownBy: 'service',
+    },
     {
       reason: 'invalid_area',
       code: JsonRpcErrorCode.ValidationError,
@@ -259,7 +269,7 @@ export const searchCrimesTool = tool('ukcrime_search_crimes', {
     {
       reason: 'unknown_neighbourhood',
       code: JsonRpcErrorCode.NotFound,
-      when: 'the force has no neighbourhood with this id (ids are case-sensitive)',
+      when: 'the exact neighbourhood request and any unique case-insensitive catalog match miss',
       recovery:
         "Call ukcrime_list_reference with topic 'neighbourhoods' and this force for valid ids, or ukcrime_find_neighbourhood with lat and lng.",
       severity: 'notice',
@@ -335,12 +345,13 @@ export const searchCrimesTool = tool('ukcrime_search_crimes', {
   ],
 
   async handler(input, ctx) {
+    const cap = Math.min(input.limit, 200);
     ctx.enrich({
       attribution: ATTRIBUTION,
       data_note: DATA_NOTE,
       truncated: false,
       shown: 0,
-      cap: input.limit,
+      cap,
     });
     const parsed = parseArea(input.area, input);
     if (!parsed.ok) throw ctx.fail('invalid_area', parsed.message);
@@ -392,7 +403,7 @@ export const searchCrimesTool = tool('ukcrime_search_crimes', {
     }));
     const matched = byMonth.flatMap((entry) => entry.matched);
     const total = matched.length;
-    const page = pageOf(matched, input.offset, input.limit);
+    const page = pageOf(matched, input.offset, cap);
     ctx.enrich({ truncated: page.nextOffset !== undefined, shown: page.rows.length });
 
     const notes: string[] = [];
