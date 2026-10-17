@@ -1,6 +1,6 @@
 # uk-police-crime-mcp-server - Directory Structure
 
-Generated on: 2026-10-02 15:36:52
+Generated on: 2026-10-17 21:59:13
 
 ```text
 uk-police-crime-mcp-server/
@@ -130,6 +130,7 @@ uk-police-crime-mcp-server/
 │   ├── lint-mcp.ts
 │   ├── lint-packaging.ts
 │   ├── list-skills.ts
+│   ├── prune-musl-packages.ts
 │   ├── release-github.ts
 │   └── tree.ts
 ├── src/

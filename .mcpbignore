@@ -15,3 +15,8 @@
 /coverage/
 /tests/
 /scripts/
+/.cache/
+/src/
+/docs/
+/.github/
+/.vscode/
