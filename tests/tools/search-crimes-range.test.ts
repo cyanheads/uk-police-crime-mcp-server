@@ -761,25 +761,28 @@ describe('ukcrime_search_crimes over a month range', () => {
       }
       const short = (fetched: number, first: string) =>
         `This call ran short of time after fetching ${fetched} of the 12 months of 2025-09–2026-08; ${first} and later did not start. The months fetched stay cached for 15 minutes, so a repeat call fetches only the rest.`;
-      // The second range's 2025-11 reached an area slot at 34 s, with 16 s left: never sent.
-      expect(results.map((result) => errorOf(result).message)).toEqual([
-        short(4, '2026-01'),
-        short(2, '2025-11'),
+      /**
+       * Native cache-key digests can finish in either order; area slots belong
+       * to whichever range reaches them first, not a fixed latitude or month.
+       */
+      const sent = h.upstream.callsTo(STREET);
+      expect(sent.map((request) => request.at - start).sort((a, b) => a - b)).toEqual([
+        0, 0, 0, 17000, 17000, 17000,
       ]);
-      // Each month went out with at least 30 s of its call's 50 s budget left; sorted, since months sent at the same instant can go in either order.
-      expect(
-        h.upstream
-          .callsTo(STREET)
-          .map((sent) => `${sent.query.get('lat')} ${sent.query.get('date')} ${sent.at - start}`)
-          .sort(),
-      ).toEqual([
-        '52.610000 2025-09 0',
-        '52.610000 2025-10 0',
-        '52.610000 2025-11 17000',
-        '52.610000 2025-12 17000',
-        '52.620000 2025-09 0',
-        '52.620000 2025-10 17000',
-      ]);
+      const months = ['2025-09', '2025-10', '2025-11', '2025-12', '2026-01'];
+      for (const [index, result] of results.entries()) {
+        const lat = index === 0 ? '52.610000' : '52.620000';
+        const requested = sent
+          .filter((request) => request.query.get('lat') === lat)
+          .map((request) => request.query.get('date'))
+          .sort();
+        expect(requested.length).toBeGreaterThanOrEqual(2);
+        expect(requested.length).toBeLessThanOrEqual(4);
+        expect(requested).toEqual(months.slice(0, requested.length));
+        expect(errorOf(result).message).toBe(
+          short(requested.length, months[requested.length] ?? ''),
+        );
+      }
     });
 
     it('fails range_too_large naming the month whose landing took the total past 32 MiB of weight, when months outweigh the projection', async () => {
