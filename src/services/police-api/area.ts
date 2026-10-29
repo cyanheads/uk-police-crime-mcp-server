@@ -266,7 +266,7 @@ const OUTCOMES_DEADLINE_HINT =
   "data.police.uk is still preparing this month's outcomes, which can take longer than one call allows when the month has not been asked for recently; run the same search again shortly and it usually succeeds.";
 
 /**
- * Police outcomes recorded in one month at a place (`/outcomes-at-location`,
+ * Police outcomes data.police.uk published for one month at a place (`/outcomes-at-location`,
  * every arm). The route answered months it had not served recently in 30–53 s
  * (2026-10-01) and keeps preparing one after a client gives up, so each attempt
  * runs to the retry deadline rather than being cut at 30 s and resent, and a

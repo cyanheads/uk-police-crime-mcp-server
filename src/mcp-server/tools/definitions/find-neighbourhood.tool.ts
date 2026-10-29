@@ -34,11 +34,16 @@ const DATA_NOTE =
 const OUTSIDE_COVERAGE =
   'This point is outside data.police.uk coverage (England, Wales and Northern Ireland; Scotland only through British Transport Police); check that lat and lng are not swapped.';
 
-/** A blank is unset; a list is cut to one past the section count, then de-duplicated. */
+/**
+ * A blank is unset; a list is de-duplicated, then cut to one past the section
+ * count. A de-duplicated list longer than the sections always holds an unknown
+ * value, so the kept extra entry fails `z.enum` and the cut bounds validation
+ * without hiding a requested section or an invalid one.
+ */
 function prepareInclude(value: unknown): unknown {
   if (value === null || (typeof value === 'string' && value.trim() === '')) return;
   if (!Array.isArray(value)) return value;
-  return [...new Set(value.slice(0, SECTIONS.length + 1))];
+  return [...new Set(value)].slice(0, SECTIONS.length + 1);
 }
 
 /** The lookup the inputs ask for, or why they ask for none or both. */

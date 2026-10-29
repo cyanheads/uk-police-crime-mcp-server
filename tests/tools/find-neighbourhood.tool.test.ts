@@ -2,7 +2,7 @@
  * @fileoverview ukcrime_find_neighbourhood through `runToolContract` (the
  * production parse of output extended with enrichment): point and id lookups,
  * the three invalid_lookup messages, unknown_force, `found: false` for a locate
- * or profile miss, section loading by `include` (cut to 5, then de-duplicated;
+ * or profile miss, section loading by `include` (de-duplicated, then cut to 5;
  * `[]` loads none; blank is the default), the single degraded-sections notice,
  * every published event (no cap) and `events_total`, the boundary string,
  * known-gap and force-name fallbacks, the proof that a biography and
@@ -163,10 +163,12 @@ describe('ukcrime_find_neighbourhood', () => {
       code: JsonRpcErrorCode.ValidationError,
       data: {
         reason: 'ambiguous_neighbourhood',
-        recovery: { hint: "Send one of these exact neighbourhood ids: '\\[NX\\]', '\\[Nx\\]'." },
+        recovery: { hint: "Send one of these exact neighbourhood ids: '[NX]', '[Nx]'." },
       },
     });
+    // The ids travel as written; the framework escapes them once in content[].
     expect(text(result)).toContain("'\\[NX\\]', '\\[Nx\\]'");
+    expect(text(result)).not.toContain('\\\\[');
     expect(
       h.upstream.calls
         .filter(
@@ -729,13 +731,36 @@ describe('ukcrime_find_neighbourhood', () => {
       expect(h.upstream.count(`${P}/people`)).toBe(1);
     });
 
-    it('cuts the list to five entries before de-duplicating, so a bad entry past the cut is never seen', async () => {
+    it('de-duplicates before cutting, so a section after five repeats still loads on both surfaces', async () => {
       routes();
-      const out = data(
-        await callRaw({ ...BY_ID, include: ['team', 'team', 'team', 'team', 'team', 'bogus'] }),
-      );
+      const result = await callRaw({
+        ...BY_ID,
+        include: ['team', 'team', 'team', 'team', 'team', 'boundary'],
+      });
+      const out = data(result);
       expect(out.team).toHaveLength(2);
-      expect(requested()).toEqual(['people']);
+      expect(out.boundary).toEqual({ vertex_count: 5, polygon: BOUNDARY_STRING });
+      expect(out.notice).toBeUndefined();
+      expect(requested()).toEqual(['people', 'boundary']);
+      const rendered = text(result);
+      expect(rendered).toContain('### Team (2)');
+      expect(rendered).toContain('### Boundary (5 vertices)');
+      expect(rendered).toContain(BOUNDARY_STRING);
+    });
+
+    it.each<[string, unknown]>([
+      [
+        'an unknown section after five repeats',
+        ['team', 'team', 'team', 'team', 'team', 'invalid'],
+      ],
+      [
+        'two unknown sections after the four sections',
+        ['priorities', 'team', 'events', 'boundary', 'bogus1', 'bogus2'],
+      ],
+    ])('rejects %s as InvalidParams', async (_name, include) => {
+      const error = errorOf(await callRaw({ ...BY_ID, include }));
+      expect(error.code).toBe(JsonRpcErrorCode.InvalidParams);
+      expect(h.upstream.calls).toHaveLength(0);
     });
 
     it('accepts a long list of repeats that de-duplicates to the four sections', async () => {
@@ -1230,7 +1255,8 @@ describe('ukcrime_find_neighbourhood', () => {
       expect(out.attribution).toBe(ATTRIBUTION);
       expect(out.data_note).toBe(DATA_NOTE);
       expect(out.notice).toBeUndefined();
-      expect(text(result)).toContain(`**Attribution:** ${ATTRIBUTION}`);
+      // The framework trailer renders a string value as a code span.
+      expect(text(result)).toContain(`**Attribution:** \`${ATTRIBUTION}\``);
     });
 
     it('degraded page: attribution, data_note and the notice', async () => {
@@ -1443,6 +1469,23 @@ describe('ukcrime_find_neighbourhood', () => {
       for (const heading of ['### Priorities', '### Team', '### Upcoming events', '### Boundary']) {
         expect(rendered).not.toContain(heading);
       }
+    });
+
+    it('decodes named character references case-sensitively on both surfaces', async () => {
+      routes();
+      h.upstream.route(
+        'GET',
+        P,
+        jsonOk(
+          neighbourhoodDetailBody({
+            description: '<p>&Eacute;cole &ndash; caf&eacute; &ouml;</p>',
+          }),
+        ),
+      );
+      const result = await call({ ...BY_ID, include: [] });
+      expect(data(result).neighbourhood?.description).toBe('École – café ö');
+      expect(text(result)).toContain('> École – café ö');
+      expect(text(result)).not.toContain('&ouml;');
     });
 
     it('keeps upstream text verbatim in structuredContent and inert in the markdown', async () => {

@@ -101,7 +101,7 @@ const HOOD = {
   neighbourhood_id: 'NX01',
 } as const;
 const MONTH_NOTE = 'No month given; searched 2026-08, the latest published month.';
-const ZERO_GENERIC = 'No outcomes recorded here in 2026-08; try another month or a wider area.';
+const ZERO_GENERIC = 'No outcomes published here for 2026-08; try another month or a wider area.';
 const OUTSIDE_POINT =
   'This point is outside data.police.uk coverage (England, Wales and Northern Ireland; Scotland only through British Transport Police); check that lat and lng are not swapped.';
 const POINT_TOO_LARGE =
@@ -807,7 +807,7 @@ describe('ukcrime_search_outcomes', () => {
     it('with a month given, the generic fragment alone', async () => {
       pointRoutes([]);
       expect(data(await call({ ...POINT, month: '2026-07' })).notice).toBe(
-        'No outcomes recorded here in 2026-07; try another month or a wider area.',
+        'No outcomes published here for 2026-07; try another month or a wider area.',
       );
     });
 
@@ -841,7 +841,7 @@ describe('ukcrime_search_outcomes', () => {
       const out = data(await call({ area: 'polygon', polygon: RING, month: '2026-07' }));
       expect(out.area.located_forces).toEqual(['leicestershire']);
       expect(out.notice).toBe(
-        'No outcomes recorded here in 2026-07; try another month or a wider area.',
+        'No outcomes published here for 2026-07; try another month or a wider area.',
       );
     });
 
@@ -875,11 +875,11 @@ describe('ukcrime_search_outcomes', () => {
       expect(out.total).toBe(0);
       expect(out.unfiltered_total).toBe(0);
       expect(out.notice).toBe(
-        'No outcomes recorded here in 2026-07; try another month or a wider area.',
+        'No outcomes published here for 2026-07; try another month or a wider area.',
       );
       const all = data(await call({ ...POINT, month: '2026-07', category: 'all-crime' }));
       expect(all.notice).toBe(
-        'No outcomes recorded here in 2026-07; try another month or a wider area.',
+        'No outcomes published here for 2026-07; try another month or a wider area.',
       );
     });
 
@@ -928,7 +928,7 @@ describe('ukcrime_search_outcomes', () => {
       h.upstream.route('GET', '/locate-neighbourhood', status(500));
       const out = data(await call({ ...POINT, month: '2026-07' }));
       expect(out.notice).toContain(
-        'No outcomes recorded here in 2026-07; try another month or a wider area.',
+        'No outcomes published here for 2026-07; try another month or a wider area.',
       );
       expect(out.notice).toContain('Coverage could not be checked');
     });
@@ -995,7 +995,8 @@ describe('ukcrime_search_outcomes', () => {
     const every = (samples: readonly string[], force: string) =>
       Object.fromEntries(samples.map((q) => [q, force]));
     const NI_NOTE = coverageNotes('northern-ireland', ['outcomes']);
-    const JULY_GENERIC = 'No outcomes recorded here in 2026-07; try another month or a wider area.';
+    const JULY_GENERIC =
+      'No outcomes published here for 2026-07; try another month or a wider area.';
 
     it('locates a polygon and lets the coverage note alone explain a zero where no located force publishes outcomes', async () => {
       h.upstream.route('POST', '/outcomes-at-location', jsonOk([]));
@@ -1172,7 +1173,7 @@ describe('ukcrime_search_outcomes', () => {
       const out = data(result);
       expect(out.attribution).toBe(ATTRIBUTION);
       expect(out.data_note).toBe(
-        "An outcome's month is when police recorded it; the crime's own month can be years earlier. Police outcomes only — court results are not published. Locations are anonymised map points, not crime sites.",
+        "The month searched selects data.police.uk's outcome data published for that month: an outcome's own month, when police recorded it, can differ from the month searched, and its crime's month can be years earlier; ukcrime_get_crime_outcomes gives a crime's full sequence of steps. Police outcomes only — court results are not published. Locations are anonymised map points, not crime sites.",
       );
       expect(out.truncated).toBe(false);
       expect(out.shown).toBe(0);
@@ -1745,7 +1746,7 @@ describe('ukcrime_search_outcomes', () => {
       expect(rendered).toContain(
         '**Area:** point · lat 52.63 · lng -1.13 · located force leicestershire · located neighbourhood NX01',
       );
-      expect(rendered).toContain('**Outcomes matched:** 3 of 3 recorded this month');
+      expect(rendered).toContain('**Outcomes matched:** 3 of 3 published for this month');
       for (const row of out.by_outcome) {
         expect(rendered).toContain(`| ${row.name} | ${row.code} | ${row.count} |`);
       }

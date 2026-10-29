@@ -1,13 +1,14 @@
 /**
  * @fileoverview htmlToText: the plain text `structuredContent` carries for the
  * HTML fields data.police.uk serves — tags dropped, block ends to newlines,
- * entities decoded once (never to an invisible or control character), invisible
- * characters removed, blank-line runs collapsed, empty to undefined, in time
- * linear in the input.
+ * entities decoded once from the full WHATWG table, case-sensitively (never to
+ * an invisible or control character), invisible characters removed, blank-line
+ * runs collapsed, empty to undefined, in time linear in the input.
  * @module tests/services/html-to-text.test
  */
 
 import { describe, expect, it } from 'vitest';
+import { NAMED_ENTITIES } from '@/services/police-api/html-entities.js';
 import { htmlToText } from '@/services/police-api/html-to-text.js';
 
 describe('htmlToText', () => {
@@ -264,6 +265,42 @@ describe('htmlToText', () => {
       ['&AMP;', '&'],
     ])('decodes %s', (entity, expected) => {
       expect(htmlToText(`a${entity}b`)).toBe(`a${expected}b`);
+    });
+
+    it('holds the 2,125 semicolon-terminated names of the WHATWG list', () => {
+      expect(NAMED_ENTITIES.size).toBe(2125);
+    });
+
+    it.each([
+      ['&Eacute;', 'É'],
+      ['&ouml;', 'ö'],
+      ['&Ouml;', 'Ö'],
+      ['&rarr;', '→'],
+      ['&fjlig;', 'fj'],
+    ])('decodes %s from the full table, keeping its case', (entity, expected) => {
+      expect(htmlToText(`a${entity}b`)).toBe(`a${expected}b`);
+    });
+
+    it.each(['&EACUTE;', '&OUML;', '&Amp;'])(
+      'looks names up case-sensitively, so %s stays as written',
+      (entity) => {
+        expect(htmlToText(`a${entity}b`)).toBe(`a${entity}b`);
+      },
+    );
+
+    it.each(['&ZeroWidthSpace;', '&shy;', '&Tab;', '&lrm;', '&NoBreak;'])(
+      'leaves the named entity %s, which names an invisible or control character, as written',
+      (entity) => {
+        expect(htmlToText(`a${entity}b`)).toBe(`a${entity}b`);
+      },
+    );
+
+    it('turns &NewLine; into a line break, like &#10;', () => {
+      expect(htmlToText('a&NewLine;b')).toBe('a\nb');
+    });
+
+    it('decodes the controlled description to the same text a browser shows', () => {
+      expect(htmlToText('<p>&Eacute;cole &ndash; caf&eacute; &ouml;</p>')).toBe('École – café ö');
     });
 
     it('decodes decimal and hexadecimal numeric entities', () => {

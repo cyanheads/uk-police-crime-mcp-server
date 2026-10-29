@@ -7,34 +7,7 @@
  * @module services/police-api/html-to-text
  */
 
-const NAMED_ENTITIES: ReadonlyMap<string, string> = new Map(
-  Object.entries({
-    amp: '&',
-    apos: "'",
-    bull: '•',
-    copy: '©',
-    deg: '°',
-    eacute: 'é',
-    euro: '€',
-    gt: '>',
-    hellip: '…',
-    laquo: '«',
-    ldquo: '“',
-    lsquo: '‘',
-    lt: '<',
-    mdash: '—',
-    middot: '·',
-    nbsp: ' ',
-    ndash: '–',
-    pound: '£',
-    quot: '"',
-    raquo: '»',
-    rdquo: '”',
-    reg: '®',
-    rsquo: '’',
-    trade: '™',
-  }),
-);
+import { NAMED_ENTITIES } from './html-entities.js';
 
 /** A comment, or the opening of an element whose content is never text. */
 const NON_TEXT_OPENER = /<!--|<(script|style|template)\b/gi;
@@ -60,9 +33,9 @@ const TAGS = new RegExp(String.raw`<\/?[a-z!]${TAG_REST}`, 'gi');
 const ENTITIES = /&(#x[0-9a-f]+|#\d+|[a-z][a-z0-9]*);/gi;
 
 /**
- * Code points a numeric entity is never decoded to: controls other than LF,
- * format characters other than the zero-width non-joiner and joiner, surrogates
- * and noncharacters. Such an entity stays as written, visible.
+ * Code points an entity is never decoded to: controls other than LF, format
+ * characters other than the zero-width non-joiner and joiner, surrogates and
+ * noncharacters. An entity whose result holds one stays as written, visible.
  */
 const UNDECODED = /^[[\p{Cc}\p{Cf}\p{Cs}\p{Noncharacter_Code_Point}]--[\n\u{200C}\u{200D}]]$/v;
 
@@ -74,15 +47,20 @@ const UNDECODED = /^[[\p{Cc}\p{Cf}\p{Cs}\p{Noncharacter_Code_Point}]--[\n\u{200C
  */
 const INVISIBLE = /[[\p{Cc}\p{Cf}]--[\t\v\f\u{200C}\u{200D}]]/gv;
 
+/** `chars`, or the entity as written when any of its code points is {@link UNDECODED}. */
+const decodedOr = (chars: string, match: string): string =>
+  [...chars].some((char) => UNDECODED.test(char)) ? match : chars;
+
+/** A numeric entity, or a named one looked up case-sensitively; an unknown name stays as written. */
 function decodeEntity(match: string, body: string): string {
   if (body.startsWith('#')) {
     const hex = body[1] === 'x' || body[1] === 'X';
     const codePoint = Number.parseInt(body.slice(hex ? 2 : 1), hex ? 16 : 10);
     if (codePoint > 0x10ffff) return match;
-    const char = String.fromCodePoint(codePoint);
-    return UNDECODED.test(char) ? match : char;
+    return decodedOr(String.fromCodePoint(codePoint), match);
   }
-  return NAMED_ENTITIES.get(body.toLowerCase()) ?? match;
+  const named = NAMED_ENTITIES.get(body);
+  return named === undefined ? match : decodedOr(named, match);
 }
 
 /**

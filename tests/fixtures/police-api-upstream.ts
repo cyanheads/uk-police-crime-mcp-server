@@ -380,7 +380,7 @@ export const unplacedCrimesBody = () => [
   }),
 ];
 
-/** `GET /outcomes-at-location` — three outcomes recorded in one month for crimes of earlier months, in upstream order. */
+/** `GET /outcomes-at-location` — three outcomes published for one month for crimes of earlier months, in upstream order. */
 export const outcomesBody = () => [
   areaOutcomeRecord({
     crime: crimeRecord({ id: 100_000_081, month: '2026-05', outcome_status: null }),

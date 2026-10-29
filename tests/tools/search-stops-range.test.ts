@@ -915,7 +915,7 @@ describe('ukcrime_search_stops over a month range', () => {
       expect(error.code).toBe(JsonRpcErrorCode.Timeout);
       expect(error.data).toMatchObject({ reason: 'range_incomplete', retryable: true });
       expect(error.message).toBe(
-        'This call ran short of time after fetching 6 of the 12 months of 2025-09–2026-08; 2026-03 and later did not start. The months fetched stay cached for 15 minutes, so a repeat call fetches only the rest.',
+        'This call ran short of time after fetching 6 of the 12 months of 2025-09–2026-08; 2026-03 is the earliest month it did not fetch. The months fetched stay cached for 15 minutes, so a repeat call fetches only the rest.',
       );
       expect(error.data.recovery?.hint).toContain('shorten the range');
       expect(text(result)).toContain('(reason range_incomplete · retryable');

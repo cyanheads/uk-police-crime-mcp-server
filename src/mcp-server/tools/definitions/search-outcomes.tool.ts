@@ -1,8 +1,10 @@
 /**
- * @fileoverview ukcrime_search_outcomes — police outcomes recorded in one month
- * inside an area (a point's 1-mile radius, a polygon, a snapped location_id, a
- * police neighbourhood), for crimes recorded that month or earlier: the total,
- * counts by crime category, outcome and crime month, and a page with their crimes.
+ * @fileoverview ukcrime_search_outcomes — the police outcomes data.police.uk
+ * published for one month inside an area (a point's 1-mile radius, a polygon, a
+ * snapped location_id, a police neighbourhood), for crimes recorded that month
+ * or earlier: the total, counts by crime category, outcome and crime month, and
+ * a page with their crimes. An outcome's own month can differ from the month
+ * searched, and a crime's earlier steps can be missing from it.
  * @module mcp-server/tools/definitions/search-outcomes.tool
  */
 
@@ -57,7 +59,7 @@ const OUTCOME_AREAS = ['point', 'polygon', 'location', 'neighbourhood'] as const
 const ALL_CRIME = 'all-crime';
 
 const DATA_NOTE =
-  "An outcome's month is when police recorded it; the crime's own month can be years earlier. Police outcomes only — court results are not published. Locations are anonymised map points, not crime sites.";
+  "The month searched selects data.police.uk's outcome data published for that month: an outcome's own month, when police recorded it, can differ from the month searched, and its crime's month can be years earlier; ukcrime_get_crime_outcomes gives a crime's full sequence of steps. Police outcomes only — court results are not published. Locations are anonymised map points, not crime sites.";
 
 const POINT_TOO_LARGE =
   "A 1-mile circle here holds more than 10,000 outcomes; search area 'polygon' with a smaller ring around the point.";
@@ -66,7 +68,9 @@ const OutcomeSchema = z
   .object({
     code: z.string().describe('Outcome code, such as under-investigation or unable-to-prosecute.'),
     name: z.string().describe('Outcome as published.'),
-    month: z.string().describe('Month recorded, YYYY-MM.'),
+    month: z
+      .string()
+      .describe('Month police recorded this outcome, YYYY-MM; can differ from the month searched.'),
     crime: z
       .object({
         id: z.string().describe('data.police.uk crime id.'),
@@ -86,7 +90,11 @@ const OutcomeSchema = z
   .describe('One police outcome and its crime.');
 
 const OutputSchema = z.object({
-  month: z.string().describe('The month searched — when the outcomes were recorded — YYYY-MM.'),
+  month: z
+    .string()
+    .describe(
+      "The month searched, YYYY-MM; it selects data.police.uk's outcome data published for that month, and each outcome carries its own month.",
+    ),
   area: AreaEchoSchema,
   category: z
     .object({
@@ -103,7 +111,7 @@ const OutputSchema = z.object({
   ),
   unfiltered_total: z
     .number()
-    .describe('Outcomes recorded in the area and month before the category filter.'),
+    .describe('Outcomes in the area for the month searched, before the category filter.'),
   by_outcome: z
     .array(
       z
@@ -163,7 +171,7 @@ function crimeMonthCounts(outcomes: readonly OutcomeRecord[]): OutcomesOutput['b
 export const searchOutcomesTool = tool('ukcrime_search_outcomes', {
   title: 'Search UK Police Outcomes',
   description:
-    'List the police outcomes recorded in one month inside an area — a point with a 1-mile radius, a polygon, a location_id, or a neighbourhood — for crimes recorded that month or any earlier one. Returns the total, counts by crime category, outcome and the month each crime was recorded, and a page of outcomes, each with its crime and persistent_id. Use it for what police resolved in a month; ukcrime_search_crimes gives the latest outcome of the crimes recorded in a month instead. Court results are not published; the result says when a force publishes no outcomes.',
+    "List the police outcomes data.police.uk published for one month inside an area — a point with a 1-mile radius, a polygon, a location_id, or a neighbourhood — for crimes recorded that month or any earlier one. Returns the total, counts by crime category, outcome and the month each crime was recorded, and a page of outcomes, each with its crime and persistent_id. An outcome's own month can differ from the month searched, and a crime's earlier steps can be missing here: ukcrime_get_crime_outcomes gives one crime's full sequence, and ukcrime_search_crimes the latest outcome of the crimes recorded in a month. Court results are not published; the result says when a force publishes no outcomes.",
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
     area: z
@@ -385,7 +393,7 @@ export const searchOutcomesTool = tool('ukcrime_search_outcomes', {
           `Only outcomes for ${inline(filter.name)} crimes were counted; omit category for all.`,
         );
       } else if (!zeroExplained) {
-        notes.push(`No outcomes recorded here in ${month}; try another month or a wider area.`);
+        notes.push(`No outcomes published here for ${month}; try another month or a wider area.`);
       }
     }
     const paging = pagingNote('outcomes', input.offset, page, total);
@@ -414,7 +422,7 @@ export const searchOutcomesTool = tool('ukcrime_search_outcomes', {
       );
     }
     lines.push(
-      `**Outcomes matched:** ${result.total} of ${result.unfiltered_total} recorded this month`,
+      `**Outcomes matched:** ${result.total} of ${result.unfiltered_total} published for this month`,
     );
 
     lines.push(...renderBreakdown('By crime category', result.by_category));

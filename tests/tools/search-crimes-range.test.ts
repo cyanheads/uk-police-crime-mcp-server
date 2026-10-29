@@ -696,7 +696,7 @@ describe('ukcrime_search_crimes over a month range', () => {
       expect(error.code).toBe(JsonRpcErrorCode.Timeout);
       expect(error.data).toMatchObject({ reason: 'range_incomplete', retryable: true });
       expect(error.message).toBe(
-        'This call ran short of time after fetching 6 of the 12 months of 2025-09–2026-08; 2026-03 and later did not start. The months fetched stay cached for 15 minutes, so a repeat call fetches only the rest.',
+        'This call ran short of time after fetching 6 of the 12 months of 2025-09–2026-08; 2026-03 is the earliest month it did not fetch. The months fetched stay cached for 15 minutes, so a repeat call fetches only the rest.',
       );
       expect(error.data.recovery?.hint).toContain('shorten the range');
       expect(text(result)).toContain('(reason range_incomplete · retryable');
@@ -730,7 +730,7 @@ describe('ukcrime_search_crimes over a month range', () => {
       const error = errorOf(await call({ ...POINT, month_from: '2026-03', month: '2026-08' }));
       expect(error.data.reason).toBe('range_incomplete');
       expect(error.message).toBe(
-        'This call ran short of time after fetching 2 of the 6 months of 2026-03–2026-08; 2026-05 and later did not start. The months fetched stay cached for 15 minutes, so a repeat call fetches only the rest.',
+        'This call ran short of time after fetching 2 of the 6 months of 2026-03–2026-08; 2026-05 is the earliest month it did not fetch. The months fetched stay cached for 15 minutes, so a repeat call fetches only the rest.',
       );
       expect(asked().slice(0, 4)).toEqual(['2026-05', '2026-06', '2026-07', '2026-08']);
       expect([...asked().slice(4)].sort()).toEqual(['2026-03', '2026-04']);
@@ -760,28 +760,41 @@ describe('ukcrime_search_crimes over a month range', () => {
         expect(text(result)).toContain('(reason range_incomplete · retryable');
       }
       const short = (fetched: number, first: string) =>
-        `This call ran short of time after fetching ${fetched} of the 12 months of 2025-09–2026-08; ${first} and later did not start. The months fetched stay cached for 15 minutes, so a repeat call fetches only the rest.`;
+        `This call ran short of time after fetching ${fetched} of the 12 months of 2025-09–2026-08; ${first} is the earliest month it did not fetch. The months fetched stay cached for 15 minutes, so a repeat call fetches only the rest.`;
       /**
-       * Native cache-key digests can finish in either order; area slots belong
-       * to whichever range reaches them first, not a fixed latitude or month.
+       * Three area slots, 17 s a month, a 50 s budget: three months go out at 0 s
+       * and the fourth waits. At 17 s it goes out with 33 s left, beside two of the
+       * three months the landed ones start; the third reaches a slot at 34 s with
+       * 16 s left, short of one 30 s attempt, and is never sent.
        */
       const sent = h.upstream.callsTo(STREET);
       expect(sent.map((request) => request.at - start).sort((a, b) => a - b)).toEqual([
         0, 0, 0, 17000, 17000, 17000,
       ]);
+      /**
+       * Which months get those slots is not fixed: months queued at one instant
+       * take them in the order their native cache-key digests finish, so either
+       * range's months can wait, and a range's later month can be sent while its
+       * earlier one is the month left unsent. What holds in every order: each range
+       * sends its first two months, the months the landed ones start are the
+       * waiting range's third and the other's third and fourth, two of those go
+       * out, and each error counts the months fetched and names the earliest month
+       * its range did not fetch.
+       */
+      const sentMonths = sent.map((request) => request.query.get('date')).sort();
+      expect([
+        ['2025-09', '2025-09', '2025-10', '2025-10', '2025-11', '2025-11'],
+        ['2025-09', '2025-09', '2025-10', '2025-10', '2025-11', '2025-12'],
+      ]).toContainEqual(sentMonths);
       const months = ['2025-09', '2025-10', '2025-11', '2025-12', '2026-01'];
       for (const [index, result] of results.entries()) {
         const lat = index === 0 ? '52.610000' : '52.620000';
         const requested = sent
           .filter((request) => request.query.get('lat') === lat)
-          .map((request) => request.query.get('date'))
-          .sort();
-        expect(requested.length).toBeGreaterThanOrEqual(2);
-        expect(requested.length).toBeLessThanOrEqual(4);
-        expect(requested).toEqual(months.slice(0, requested.length));
-        expect(errorOf(result).message).toBe(
-          short(requested.length, months[requested.length] ?? ''),
-        );
+          .map((request) => request.query.get('date'));
+        expect(requested).toEqual(expect.arrayContaining(['2025-09', '2025-10']));
+        const unfetched = months.find((month) => !requested.includes(month));
+        expect(errorOf(result).message).toBe(short(requested.length, unfetched ?? ''));
       }
     });
 

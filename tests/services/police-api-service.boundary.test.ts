@@ -1510,8 +1510,13 @@ describe('PoliceApiService request boundary', () => {
       expect(doneAt).toBe(start);
     });
 
-    /** V8's collector, reached without `--expose-gc` on the command line. */
+    /**
+     * The runtime's collector: `Bun.gc` under Bun, whose JavaScriptCore has no
+     * `--expose-gc`; V8's otherwise, reached without the flag on the command line.
+     */
     const collectGarbage = (() => {
+      const bun = (globalThis as { Bun?: { gc(force: boolean): void } }).Bun;
+      if (bun) return () => bun.gc(true);
       setFlagsFromString('--expose-gc');
       return runInNewContext('gc') as () => void;
     })();

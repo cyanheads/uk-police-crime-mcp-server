@@ -677,7 +677,7 @@ export function rangeStopMessage(stop: RangeStop, window: MonthWindow): string {
   if (stop.fetched === 0) {
     return `This call ran short of time before it could fetch ${count === 1 ? span : `any of the ${count} months of ${span}`}.`;
   }
-  return `This call ran short of time after fetching ${stop.fetched} of the ${count} months of ${span}; ${stop.month} and later did not start. The months fetched stay cached for 15 minutes, so a repeat call fetches only the rest.`;
+  return `This call ran short of time after fetching ${stop.fetched} of the ${count} months of ${span}; ${stop.month} is the earliest month it did not fetch. The months fetched stay cached for 15 minutes, so a repeat call fetches only the rest.`;
 }
 
 /** The message for a neighbourhood id the force does not have. */

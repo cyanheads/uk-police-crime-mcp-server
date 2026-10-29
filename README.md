@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.2.0-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/uk-police-crime-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.3.1-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/uk-police-crime-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/uk-police-crime-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.3-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.2.0-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/uk-police-crime-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.4.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/uk-police-crime-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/uk-police-crime-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.4-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -37,7 +37,7 @@ Street-level crime, police outcomes, and stop and search records from [data.poli
 |:---|:---|
 | `ukcrime_list_reference` | Decode force ids, crime categories, a force's neighbourhood ids, and which months and forces are published |
 | `ukcrime_search_crimes` | Search the street-level crimes recorded in one month, or a range of up to 12, inside an area, with counts by category and latest outcome |
-| `ukcrime_search_outcomes` | List the police outcomes recorded in one month inside an area, for crimes from that month or earlier |
+| `ukcrime_search_outcomes` | List the police outcomes data.police.uk published for one month inside an area, for crimes from that month or earlier |
 | `ukcrime_get_crime_outcomes` | Fetch the full outcome history of up to 25 crimes by `persistent_id` |
 | `ukcrime_search_stops` | Search stop and search records for one month, or a range of up to 12, inside an area or across a whole force, with breakdowns and filters |
 | `ukcrime_find_neighbourhood` | Find the force and neighbourhood policing team for a point, or look one up by id |
@@ -63,7 +63,8 @@ Street-level crime, police outcomes, and stop and search records from [data.poli
 
 ### `ukcrime_search_outcomes` <sub>tool</sub>
 
-- Same areas as `ukcrime_search_crimes` except `force_unplaced`; `month` is when the outcome was recorded, and `category` counts only outcomes for crimes in that category
+- Same areas as `ukcrime_search_crimes` except `force_unplaced`; `month` selects the outcome data published for that month, and `category` counts only outcomes for crimes in that category
+- Each outcome keeps its own `month`, which can differ from the month searched, and a crime's earlier steps can be missing from the search; `ukcrime_get_crime_outcomes` gives one crime's full sequence
 - Returns `total`, `unfiltered_total`, `by_category` (crime category and count), `by_outcome` (code, name, count), `by_crime_month`, and a page of `outcomes`, each with its crime; `limit` defaults to 20, accepts 1–10,000 and applies at most 200, echoed as `cap`
 - Police outcomes only: court results are not published, and the result says when a force publishes no outcomes
 
@@ -113,6 +114,7 @@ Agent-friendly output:
 - Every response carries the Open Government Licence attribution; all tools except `ukcrime_list_reference` add a `data_note` on what the records can and cannot say
 - Totals and breakdowns cover every matched record; `limit` / `offset` / `next_offset` page the rows
 - Typed failure reasons with a recovery hint, and a `notice` that separates "no data published" from "nothing happened"
+- The `uk-police-crime-guide` skill carries the gates for coverage gaps, month ranges, outcome stages, stop and search breakdowns, and comparing areas; MCP clients read it as the resource `skill://uk-police-crime-guide/SKILL.md`, and it ships in the npm package under `skills/`
 
 ## Known limitations
 
@@ -271,6 +273,7 @@ See [`.env.example`](./.env.example) for the common framework overrides.
 |:---|:---|
 | `src/mcp-server/tools` | Tool definitions (`*.tool.ts`) plus the area handling, input vocabulary, and output shapes the search tools share. |
 | `src/services/police-api` | data.police.uk client: request pacer, retries, caches, upstream schemas, record normalization, dated coverage-gaps table. |
+| `skills/` | The published `uk-police-crime-guide` skill for agents that call the tools, served over MCP and shipped in the npm package. |
 | `tests/` | Unit and integration tests. |
 
 ## Development guide

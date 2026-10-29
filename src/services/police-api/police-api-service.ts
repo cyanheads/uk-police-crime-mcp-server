@@ -25,7 +25,6 @@ import {
   type Pacer,
   withRetry,
 } from '@cyanheads/mcp-ts-core/utils';
-import { inline } from '@/mcp-server/tools/format-helpers.js';
 import { LruCache } from './lru-cache.js';
 import {
   RawBoundary,
@@ -666,9 +665,9 @@ export class PoliceApiService {
       ),
     ];
     if (candidates.length > 1) {
-      const hint = `Send one of these exact neighbourhood ids: ${candidates.map((candidate) => `'${inline(candidate)}'`).join(', ')}.`;
+      const hint = `Send one of these exact neighbourhood ids: ${candidates.map((candidate) => `'${candidate}'`).join(', ')}.`;
       throw validationError(
-        `Neighbourhood '${inline(id)}' matches more than one id in force '${inline(force)}'. ${hint}`,
+        `Neighbourhood '${id}' matches more than one id in force '${force}'. ${hint}`,
         {
           reason: 'ambiguous_neighbourhood',
           recovery: { hint },

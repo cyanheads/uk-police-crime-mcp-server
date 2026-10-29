@@ -909,7 +909,8 @@ describe('ukcrime_get_crime_outcomes', () => {
       expect(out.attribution).toBe(ATTRIBUTION);
       expect(out.data_note).toBe(DATA_NOTE);
       expect(out.crimes).toHaveLength(3);
-      expect(text(result)).toContain(`**Attribution:** ${ATTRIBUTION}`);
+      // The framework trailer renders a string value as a code span.
+      expect(text(result)).toContain(`**Attribution:** \`${ATTRIBUTION}\``);
     });
 
     it('partial-failure page: both required fields still present', async () => {
