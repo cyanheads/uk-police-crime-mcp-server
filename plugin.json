@@ -1,0 +1,33 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "uk-police-crime-mcp-server",
+  "version": "0.2.0",
+  "description": "Search UK street-level crime, police outcomes, stop and search, and neighbourhood teams from data.police.uk: England, Wales and Northern Ireland forces, plus British Transport Police (Scotland's only coverage), via MCP. STDIO or Streamable HTTP.",
+  "author": {
+    "name": "Casey Hand",
+    "email": "casey@caseyjhand.com",
+    "url": "https://caseyjhand.com"
+  },
+  "homepage": "https://github.com/cyanheads/uk-police-crime-mcp-server#readme",
+  "repository": "https://github.com/cyanheads/uk-police-crime-mcp-server",
+  "license": "Apache-2.0",
+  "keywords": [
+    "mcp",
+    "mcp-server",
+    "model-context-protocol",
+    "typescript",
+    "bun",
+    "stdio",
+    "streamable-http",
+    "uk",
+    "police",
+    "crime",
+    "crime-data",
+    "data-police-uk",
+    "stop-and-search",
+    "police-outcomes",
+    "neighbourhood-policing",
+    "open-data",
+    "geospatial"
+  ]
+}
