@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.3.0](changelog/0.3.x/0.3.0.md) — 2026-10-29
+
+Agent skill served over MCP, include de-duplication before the cut to five, and case-sensitive named character reference decoding
+
 ## [0.2.0](changelog/0.2.x/0.2.0.md) — 2026-10-17 · ⚠️ Breaking
 
 Bounded reads and reliable crime search results

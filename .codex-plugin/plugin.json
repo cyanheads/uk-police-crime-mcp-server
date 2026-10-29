@@ -1,6 +1,6 @@
 {
   "name": "uk-police-crime-mcp-server",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Search UK street crime, outcomes, stop and search, and neighbourhood teams (Scotland: BTP only).",
   "author": {
     "name": "cyanheads",

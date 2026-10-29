@@ -1,6 +1,6 @@
 # uk-police-crime-mcp-server - Directory Structure
 
-Generated on: 2026-10-17 22:46:40
+Generated on: 2026-10-29 18:31:27
 
 ```text
 uk-police-crime-mcp-server/
@@ -26,6 +26,7 @@ uk-police-crime-mcp-server/
 ├── changelog/
 │   ├── 0.1.x/
 │   ├── 0.2.x/
+│   ├── 0.3.x/
 │   └── template.md
 ├── docs/
 │   └── design.md
@@ -37,6 +38,8 @@ uk-police-crime-mcp-server/
 │   ├── add-resource/
 │   │   └── SKILL.md
 │   ├── add-service/
+│   │   └── SKILL.md
+│   ├── add-skill/
 │   │   └── SKILL.md
 │   ├── add-test/
 │   │   └── SKILL.md
@@ -134,6 +137,9 @@ uk-police-crime-mcp-server/
 │   ├── prune-musl-packages.ts
 │   ├── release-github.ts
 │   └── tree.ts
+├── skills/
+│   └── uk-police-crime-guide/
+│       └── SKILL.md
 ├── src/
 │   ├── mcp-server/
 │   │   └── tools/
@@ -152,6 +158,7 @@ uk-police-crime-mcp-server/
 │   ├── services/
 │   │   └── police-api/
 │   │       ├── area.ts
+│   │       ├── html-entities.ts
 │   │       ├── html-to-text.ts
 │   │       ├── known-gaps.ts
 │   │       ├── lru-cache.ts
@@ -166,6 +173,8 @@ uk-police-crime-mcp-server/
 │   │   ├── police-api-upstream.ts
 │   │   ├── quote-run-ons.ts
 │   │   └── service-harness.ts
+│   ├── scripts/
+│   │   └── agent-doc-entry.test.ts
 │   ├── services/
 │   │   ├── area.test.ts
 │   │   ├── html-to-text.test.ts
@@ -208,7 +217,9 @@ uk-police-crime-mcp-server/
 ├── Dockerfile
 ├── LICENSE
 ├── manifest.json
+├── mcp.json
 ├── package.json
+├── plugin.json
 ├── README.md
 ├── server.json
 ├── tsconfig.build.json
