@@ -1,0 +1,25 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: uk-police-crime-mcp-server
+abstract: "Search UK street-level crime, police outcomes, stop and search, and neighbourhood teams from data.police.uk: England, Wales and Northern Ireland forces, plus British Transport Police (Scotland's only coverage), via MCP. STDIO or Streamable HTTP."
+type: software
+authors:
+  - family-names: Hand
+    given-names: Casey
+    orcid: "https://orcid.org/0009-0009-3726-568X"
+repository-code: "https://github.com/cyanheads/uk-police-crime-mcp-server"
+license: Apache-2.0
+doi: 10.5281/zenodo.24193521
+keywords:
+  - mcp
+  - model-context-protocol
+  - uk
+  - police
+  - crime
+  - crime-data
+  - data-police-uk
+  - stop-and-search
+  - police-outcomes
+  - neighbourhood-policing
+  - open-data
+  - geospatial
