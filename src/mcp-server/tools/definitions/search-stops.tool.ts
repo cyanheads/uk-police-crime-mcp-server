@@ -4,8 +4,8 @@
  * polygon, a snapped location_id, a police neighbourhood) or across a whole
  * force: counts by type, both ethnicity fields, outcome, object of search,
  * legislation, age range, gender, and the find and strip-search flags, each
- * month's total and publication for a range, and a page of stops. Filters
- * narrow the counts and the page together.
+ * month's total and publication for a range, and a page of stops. Filters and
+ * the street-name filter narrow the counts and the page together.
  * @module mcp-server/tools/definitions/search-stops.tool
  */
 
@@ -20,21 +20,28 @@ import {
   latField,
   lngField,
   locationIdField,
+  matchedStreetsNote,
   monthDefaultedNote,
   monthFromField,
   monthSpanLabel,
   NOT_RECORDED,
   neighbourhoodIdField,
+  noFilterMatchNote,
   offsetField,
   outsideCoverageNote,
   pageOf,
   pagingNote,
+  parseSearchArea,
   partialLocateNote,
   polygonField,
+  presentValuesClause,
   rangeEndMonthField,
   rangeStopMessage,
   resolveMonthWindow,
   runAreaWindow,
+  streetNameContainsField,
+  streetNamesPresentClause,
+  streetPredicate,
   unknownNeighbourhoodMessage,
 } from '@/mcp-server/tools/area-search.js';
 import { inline } from '@/mcp-server/tools/format-helpers.js';
@@ -52,7 +59,7 @@ import {
   SEARCH_ENRICHMENT_TRAILER,
 } from '@/mcp-server/tools/search-output.js';
 import { ATTRIBUTION, forceInput, limitInput } from '@/mcp-server/tools/shared-schemas.js';
-import { type AreaTarget, parseArea, stopsQuery } from '@/services/police-api/area.js';
+import { type AreaTarget, stopsQuery } from '@/services/police-api/area.js';
 import {
   getPoliceApiService,
   type PoliceApiService,
@@ -93,17 +100,23 @@ const stopValue = (stop: StopRecord, field: StopField): string | undefined => {
   return value === undefined ? undefined : String(value);
 };
 
-/** The stops matching every filter, case-insensitively; `(not recorded)` matches an unrecorded value. */
+/**
+ * The stops on the street `onStreet` tests, when given, that match every
+ * filter, case-insensitively; `(not recorded)` matches an unrecorded value.
+ */
 function matchStops(
   stops: readonly StopRecord[],
   filters: readonly StopFilter[],
+  onStreet: ((location: StopRecord['location']) => boolean) | undefined,
 ): readonly StopRecord[] {
-  if (filters.length === 0) return stops;
-  return stops.filter((stop) =>
-    filters.every(
-      ({ field, value }) =>
-        (stopValue(stop, field) ?? NOT_RECORDED).toLowerCase() === value.toLowerCase(),
-    ),
+  if (filters.length === 0 && !onStreet) return stops;
+  return stops.filter(
+    (stop) =>
+      (!onStreet || onStreet(stop.location)) &&
+      filters.every(
+        ({ field, value }) =>
+          (stopValue(stop, field) ?? NOT_RECORDED).toLowerCase() === value.toLowerCase(),
+      ),
   );
 }
 
@@ -126,9 +139,6 @@ function stopBreakdowns(stops: readonly StopRecord[]) {
 
 /** Most filters a call takes. */
 const MAX_FILTERS = 8;
-
-/** Most present values the zero-hit notice lists per filtered field. */
-const MAX_PRESENT_VALUES = 12;
 
 const DATA_NOTE =
   "Locations are anonymised map points, not where stops happened. datetime is UTC while months follow UK local time, so a stop just after midnight on the 1st can show the previous day's UTC date. Ethnicity is recorded twice: as the person defined it and as the officer perceived it. An outcome the force left blank counts as (not recorded).";
@@ -204,13 +214,23 @@ const OutputSchema = z.object({
         .describe('One applied filter.'),
     )
     .describe('Filters applied, case-insensitively; empty when none.'),
-  total: z.number().describe('Stops matched after filters, over the month or range.'),
+  street_name_contains: z
+    .string()
+    .optional()
+    .describe('The street_name_contains value as sent; present only when it was given.'),
+  total: z
+    .number()
+    .describe('Stops matched after filters and street_name_contains, over the month or range.'),
   unfiltered_total: z
     .number()
-    .describe('Stops in the area over the month or range, before filters.'),
+    .describe(
+      'Stops in the area over the month or range, before filters and street_name_contains.',
+    ),
   unplaced: z
     .number()
-    .describe("Matched stops with no location — the force's unplaced stops, for area 'force'."),
+    .describe(
+      "Matched stops with no location — the force's unplaced stops, for area 'force'; 0 under street_name_contains, which a stop with no location never matches.",
+    ),
   force_published: z
     .boolean()
     .optional()
@@ -318,7 +338,7 @@ async function forceNames(
 export const searchStopsTool = tool('ukcrime_search_stops', {
   title: 'Search UK Police Stop and Search',
   description:
-    "Search police stop and search records for one month, or with month_from a range of up to 12 months, inside an area — a point with a 1-mile radius, a polygon, a location_id from an earlier result, or a police neighbourhood — or across a whole force with area 'force', which includes stops the force could not place. Returns the total and counts by search type, self-defined and officer-defined ethnicity, outcome, object of search, legislation, age range, gender, whether the outcome was linked to the object of search, and whether more than outer clothing was removed, each month's total for a range, and a page of stops. filters narrow the counts and the page together, so filtering one field and reading another's breakdown gives a cross-tab. Forces skip months and some publish none; the result names each force it finds for the area that did not publish, with the months it skipped.",
+    "Search police stop and search records for one month, or with month_from a range of up to 12 months, inside an area — a point with a 1-mile radius, a polygon, a location_id from an earlier result, or a police neighbourhood — or across a whole force with area 'force', which includes stops the force could not place. Returns the total and counts by search type, self-defined and officer-defined ethnicity, outcome, object of search, legislation, age range, gender, whether the outcome was linked to the object of search, and whether more than outer clothing was removed, each month's total for a range, and a page of stops. filters and street_name_contains narrow the counts and the page together, so filtering one field and reading another's breakdown gives a cross-tab. Forces skip months and some publish none; the result names each force it finds for the area that did not publish, with the months it skipped.",
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
     area: z
@@ -349,6 +369,7 @@ export const searchStopsTool = tool('ukcrime_search_stops', {
       .describe(
         'Up to 8 filters, all of which a stop must match; they narrow the counts and the page together. Fields: type, self_defined_ethnicity, officer_defined_ethnicity, outcome, object_of_search, legislation, age_range, gender, outcome_linked_to_object_of_search, removal_of_more_than_outer_clothing.',
       ),
+    street_name_contains: streetNameContainsField,
     limit: limitInput(15).describe(
       'Requested stops on this page, 1–10,000; applied cap is at most 200. Default 15.',
     ),
@@ -486,7 +507,7 @@ export const searchStopsTool = tool('ukcrime_search_stops', {
       shown: 0,
       cap,
     });
-    const parsed = parseArea(input.area, input);
+    const parsed = parseSearchArea(input.area, input);
     if (!parsed.ok) throw ctx.fail('invalid_area', parsed.message);
 
     const service = getPoliceApiService();
@@ -522,11 +543,13 @@ export const searchStopsTool = tool('ukcrime_search_stops', {
       field,
       value: String(value),
     }));
+    const street = input.street_name_contains;
+    const onStreet = street === undefined ? undefined : streetPredicate(street);
     // A range locates once, so one partial located set withholds `true` from every month.
     const partial = partialLocateNote(run);
     const byMonth = run.months.map(({ month: searched, records }) => ({
       month: searched,
-      matched: matchStops(records, filters),
+      matched: matchStops(records, filters, onStreet),
       ...publication(
         run.forces,
         window.availability.months.find((row) => row.month === searched)?.stopSearchForces,
@@ -566,21 +589,15 @@ export const searchStopsTool = tool('ukcrime_search_stops', {
     }
     if (partial) notes.push(partial);
     if (total === 0) {
-      if (filters.length > 0 && records.length > 0) {
-        const fields = [...new Set(filters.map(({ field }) => field))];
-        const present = fields.map((field) => {
-          const values = breakdown(records, (stop) => stopValue(stop, field));
-          const listed = values
-            .slice(0, MAX_PRESENT_VALUES)
-            .map(({ value }) => `"${inline(value)}"`)
-            .join(', ');
-          const more =
-            values.length > MAX_PRESENT_VALUES
-              ? ` and ${values.length - MAX_PRESENT_VALUES} more`
-              : '';
-          return `values present for ${field}: ${listed}${more}`;
-        });
-        notes.push(`No stops matched the filters; ${present.join('; ')}.`);
+      if ((filters.length > 0 || street !== undefined) && records.length > 0) {
+        // Present values are read from every stop in the area, before any filter.
+        const clauses = [...new Set(filters.map(({ field }) => field))].map((field) =>
+          presentValuesClause(field, records, (stop) => stopValue(stop, field)),
+        );
+        if (street !== undefined) {
+          clauses.push(streetNamesPresentClause(records, (stop) => stop.location));
+        }
+        notes.push(noFilterMatchNote('stops', clauses));
       } else if (spec.kind === 'location') {
         notes.push(
           `No stops at location ${spec.locationId} in ${span}; location ids come from earlier results, so check it or search area 'point'.`,
@@ -600,6 +617,9 @@ export const searchStopsTool = tool('ukcrime_search_stops', {
           );
         }
       }
+    } else if (onStreet) {
+      const several = matchedStreetsNote(matched, (stop) => stop.location);
+      if (several) notes.push(several);
     }
     const paging = pagingNote('stops', input.offset, page, total);
     if (paging) notes.push(paging);
@@ -610,6 +630,7 @@ export const searchStopsTool = tool('ukcrime_search_stops', {
       month,
       area: areaEcho(spec, run),
       filters,
+      ...(street !== undefined ? { street_name_contains: street } : {}),
       total,
       unfiltered_total: records.length,
       unplaced: matched.filter((stop) => !stop.location).length,
@@ -639,6 +660,9 @@ export const searchStopsTool = tool('ukcrime_search_stops', {
       '',
       renderArea(result.area),
       `**Filters:** ${filters}`,
+      ...(result.street_name_contains === undefined
+        ? []
+        : [`**Street name contains:** "${inline(result.street_name_contains)}"`]),
       `**Stops matched:** ${result.total} of ${result.unfiltered_total} · **Without a location:** ${result.unplaced}`,
     ];
     if (result.force_published !== undefined) {

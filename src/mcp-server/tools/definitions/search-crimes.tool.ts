@@ -3,7 +3,8 @@
  * month, or a range of up to 12 months, inside an area (a point's 1-mile
  * radius, a polygon, a snapped location_id, a police neighbourhood) or a
  * force's unplaced crimes: the total, counts by category and latest outcome,
- * the busiest map points, each month's total for a range, and a page.
+ * the busiest map points, each month's total for a range, and a page. The
+ * outcome and street-name filters narrow the counts and the page together.
  * @module mcp-server/tools/definitions/search-crimes.tool
  */
 
@@ -17,20 +18,28 @@ import {
   latField,
   lngField,
   locationIdField,
+  matchedStreetsNote,
   monthDefaultedNote,
   monthFromField,
   monthSpanLabel,
+  NOT_RECORDED,
   neighbourhoodIdField,
+  noFilterMatchNote,
   offsetField,
   outsideCoverageNote,
   pageOf,
   pagingNote,
+  parseSearchArea,
   partialLocateNote,
   polygonField,
+  presentValuesClause,
   rangeEndMonthField,
   rangeStopMessage,
   resolveMonthWindow,
   runAreaWindow,
+  streetNameContainsField,
+  streetNamesPresentClause,
+  streetPredicate,
   unknownNeighbourhoodMessage,
 } from '@/mcp-server/tools/area-search.js';
 import { cell, inline, quote } from '@/mcp-server/tools/format-helpers.js';
@@ -52,10 +61,11 @@ import {
   categoryInput,
   forceInput,
   limitInput,
+  outcomeInput,
 } from '@/mcp-server/tools/shared-schemas.js';
-import { type AreaTarget, crimesQuery, parseArea } from '@/services/police-api/area.js';
+import { type AreaTarget, crimesQuery } from '@/services/police-api/area.js';
 import { coverageNotes, publishesNothing } from '@/services/police-api/known-gaps.js';
-import { getPoliceApiService } from '@/services/police-api/police-api-service.js';
+import { categoryKey, getPoliceApiService } from '@/services/police-api/police-api-service.js';
 import { compareDigits } from '@/services/police-api/records.js';
 import type { CrimeRecord } from '@/services/police-api/types.js';
 
@@ -68,6 +78,13 @@ const DATA_NOTE =
 
 const POINT_TOO_LARGE =
   "A 1-mile circle here holds too many crimes for data.police.uk to answer (it can refuse an area holding more than about 10,000); search area 'polygon' with a smaller ring around the point.";
+
+/** The missing-month caveat every all-crime zero line carries: a month at zero can be a month the force skipped. */
+const MISSING_MONTH =
+  'A force can miss a month the API still lists as published (https://data.police.uk/changelog/)';
+
+/** That caveat as a closing sentence, for the zero lines that suggest no other search. */
+const ZERO_MONTH_CAVEAT = `${MISSING_MONTH}, so a month at zero may be missing data rather than no crime.`;
 
 /** Most map points listed in `top_locations`. */
 const TOP_LOCATIONS = 10;
@@ -112,14 +129,32 @@ const OutputSchema = z.object({
       name: z.string().describe('Category display name.'),
     })
     .describe('The crime category searched.'),
-  total: z.number().describe('Crimes matched in the area over the month or range.'),
+  outcome: z
+    .string()
+    .optional()
+    .describe('The outcome value as sent; present only when it was given.'),
+  street_name_contains: z
+    .string()
+    .optional()
+    .describe('The street_name_contains value as sent; present only when it was given.'),
+  total: z
+    .number()
+    .describe(
+      'Crimes matched in the area over the month or range: of the category searched, then of outcome and street_name_contains when given.',
+    ),
+  unfiltered_total: z
+    .number()
+    .optional()
+    .describe(
+      'Crimes of the category searched in the area over the month or range, before outcome and street_name_contains; present only when either was given.',
+    ),
   by_month: byMonthSchema(
     MonthTotalSchema,
-    'Crimes matched in each month of the range, oldest first; their totals sum to total. Present only when month_from was given.',
+    'Crimes matched in each month of the range, oldest first, after outcome and street_name_contains; their totals sum to total. Present only when month_from was given.',
   ),
   by_category: breakdownSchema('Matched crimes by category slug, most first.'),
   by_outcome: breakdownSchema(
-    "Matched crimes by latest police outcome, most first; anti-social behaviour is always '(not recorded)'.",
+    "Matched crimes by latest police outcome name, most first — the values outcome matches; anti-social behaviour is always '(not recorded)'.",
   ),
   top_locations: z
     .array(
@@ -140,7 +175,7 @@ const OutputSchema = z.object({
     )
     .optional()
     .describe(
-      "Up to 10 map points holding the most matched crimes. Absent for area 'force_unplaced'.",
+      "Up to 10 map points holding the most matched crimes, after outcome and street_name_contains. Absent for area 'force_unplaced'.",
     ),
   crimes: z
     .array(CrimeSchema)
@@ -154,6 +189,28 @@ const OutputSchema = z.object({
 });
 
 type CrimesOutput = z.infer<typeof OutputSchema>;
+
+/** A crime's latest outcome name, as `by_outcome` counts it; undefined when none is published. */
+const latestOutcome = (crime: CrimeRecord): string | undefined => crime.outcome?.name;
+
+/**
+ * The crimes whose latest outcome name — `(not recorded)` for none — folds by
+ * `categoryKey` to `outcomeKey`, and whose location `onStreet` accepts; each
+ * test applies only when given.
+ */
+function matchCrimes(
+  crimes: readonly CrimeRecord[],
+  outcomeKey: string | undefined,
+  onStreet: ((location: CrimeRecord['location']) => boolean) | undefined,
+): readonly CrimeRecord[] {
+  if (outcomeKey === undefined && !onStreet) return crimes;
+  return crimes.filter(
+    (crime) =>
+      (outcomeKey === undefined ||
+        categoryKey(latestOutcome(crime) ?? NOT_RECORDED) === outcomeKey) &&
+      (!onStreet || onStreet(crime.location)),
+  );
+}
 
 /** The map points holding the most crimes, most first, then by location id. */
 function topLocations(crimes: readonly CrimeRecord[]): NonNullable<CrimesOutput['top_locations']> {
@@ -179,13 +236,13 @@ function topLocations(crimes: readonly CrimeRecord[]): NonNullable<CrimesOutput[
 export const searchCrimesTool = tool('ukcrime_search_crimes', {
   title: 'Search UK Street-Level Crimes',
   description:
-    "Search street-level crimes recorded in one month, or with month_from a range of up to 12 months, inside an area — a point with a 1-mile radius, a polygon, a snapped location_id from an earlier result, or a police neighbourhood — or list the crimes a force could not place on the map (area 'force_unplaced'). Returns the total, counts by category and by latest police outcome, the busiest map points, each month's total for a range, and a page of crimes, each with the persistent_id that ukcrime_get_crime_outcomes takes when it has one; for the police outcomes data.police.uk published for a month, whenever the crime was recorded, use ukcrime_search_outcomes. Locations are anonymised map points, not crime sites. data.police.uk can refuse an area holding more than about 10,000 crimes, whatever the category — then search smaller polygons.",
+    "Search street-level crimes recorded in one month, or with month_from a range of up to 12 months, inside an area — a point with a 1-mile radius, a polygon, a snapped location_id from an earlier result, or a police neighbourhood — or list the crimes a force could not place on the map (area 'force_unplaced'). Returns the total, counts by category and by latest police outcome, the busiest map points, each month's total for a range, and a page of crimes, each with the persistent_id that ukcrime_get_crime_outcomes takes when it has one. outcome (a latest police outcome name, as by_outcome shows it) and street_name_contains narrow the counts and the page together. For the police outcomes data.police.uk published for a month, whenever the crime was recorded, use ukcrime_search_outcomes. Locations are anonymised map points, not crime sites. data.police.uk can refuse an area holding more than about 10,000 crimes, whatever the category — then search smaller polygons.",
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
     area: z
       .enum(CRIME_AREAS)
       .describe(
-        "Area to search: 'point' (lat and lng; a 1-mile radius), 'polygon' (polygon), 'location' (location_id), 'neighbourhood' (force and neighbourhood_id), or 'force_unplaced' (force alone: the crimes that force could not place on the map). An area field the chosen area does not use is rejected.",
+        "Area to search: 'point' (lat and lng; a 1-mile radius), 'polygon' (polygon), 'location' (location_id), 'neighbourhood' (force and neighbourhood_id), or 'force_unplaced' (force alone: the crimes that force could not place on the map; they have no location, so street_name_contains is rejected with it). An area field the chosen area does not use is rejected.",
       ),
     lat: latField,
     lng: lngField,
@@ -200,6 +257,10 @@ export const searchCrimesTool = tool('ukcrime_search_crimes', {
     category: categoryInput.describe(
       "Crime category slug such as 'burglary', or its display name such as 'Violence and sexual offences'; case-insensitive, and spaces, underscores and hyphens match each other ('vehicle_crime' finds 'vehicle-crime'). Omitted: every category (all-crime). ukcrime_list_reference topic 'categories' lists them.",
     ),
+    outcome: outcomeInput.describe(
+      "Latest police outcome to keep, matched whole against the names by_outcome shows, such as 'Offender given a caution', or '(not recorded)' for crimes with none (anti-social behaviour never has one) — ignoring case, with runs of spaces, underscores and hyphens read alike. Crime records carry no outcome code, so a code such as 'cautioned' matches nothing; ukcrime_search_outcomes takes codes. Narrows the counts and the page together; a value nothing matches returns zero, and the notice lists the names present.",
+    ),
+    street_name_contains: streetNameContainsField,
     limit: limitInput(25).describe(
       'Requested crimes on this page, 1–10,000; applied cap is at most 200. Default 25.',
     ),
@@ -221,9 +282,9 @@ export const searchCrimesTool = tool('ukcrime_search_crimes', {
     {
       reason: 'invalid_area',
       code: JsonRpcErrorCode.ValidationError,
-      when: "the area's required fields are missing, or a field it does not use is present",
+      when: "the area's required fields are missing, a field it does not use is present, or street_name_contains is sent with area 'force_unplaced'",
       recovery:
-        "Send lat and lng for area 'point', polygon for 'polygon', location_id for 'location', force and neighbourhood_id for 'neighbourhood', or force alone for 'force_unplaced'.",
+        "Send lat and lng for area 'point', polygon for 'polygon', location_id for 'location', force and neighbourhood_id for 'neighbourhood', or force alone for 'force_unplaced', whose crimes have no location, so street_name_contains cannot apply.",
       severity: 'notice',
     },
     {
@@ -353,7 +414,7 @@ export const searchCrimesTool = tool('ukcrime_search_crimes', {
       shown: 0,
       cap,
     });
-    const parsed = parseArea(input.area, input);
+    const parsed = parseSearchArea(input.area, input);
     if (!parsed.ok) throw ctx.fail('invalid_area', parsed.message);
 
     const service = getPoliceApiService();
@@ -393,14 +454,23 @@ export const searchCrimesTool = tool('ukcrime_search_crimes', {
     }
 
     const narrowed = category.slug !== ALL_CRIME;
-    // The location route takes no category, so a narrowed search filters locally.
-    const byMonth = run.months.map(({ month: recorded, records }) => ({
-      month: recorded,
-      matched:
+    const outcomeKey = input.outcome === undefined ? undefined : categoryKey(input.outcome);
+    const street = input.street_name_contains;
+    const onStreet = street === undefined ? undefined : streetPredicate(street);
+    const filtered = outcomeKey !== undefined || onStreet !== undefined;
+    const byMonth = run.months.map(({ month: recorded, records }) => {
+      // The location route takes no category, so a narrowed search filters locally.
+      const inCategory =
         spec.kind === 'location' && narrowed
           ? records.filter((crime) => crime.category === category.slug)
-          : records,
-    }));
+          : records;
+      return {
+        month: recorded,
+        inCategory,
+        matched: matchCrimes(inCategory, outcomeKey, onStreet),
+      };
+    });
+    const inCategory = byMonth.flatMap((entry) => entry.inCategory);
     const matched = byMonth.flatMap((entry) => entry.matched);
     const total = matched.length;
     const page = pageOf(matched, input.offset, cap);
@@ -412,30 +482,47 @@ export const searchCrimesTool = tool('ukcrime_search_crimes', {
       spec.kind === 'force_unplaced'
         ? (['crime', 'asb'] as const)
         : (['crime', 'locations', 'asb'] as const);
-    for (const force of run.forces) notes.push(...coverageNotes(force, aspects));
+    for (const force of run.forces) notes.push(...coverageNotes(force, aspects, window.months));
     const partial = partialLocateNote(run);
     if (partial) notes.push(partial);
-    // A range's month at zero can be a month the force skipped; under a narrowed category real zeros are common, so it goes unflagged.
+    /**
+     * A range's month at zero can be a month the force skipped. Under a narrowed category real
+     * zeros are common, so they go unflagged; outcome and street_name_contains filter locally, so a
+     * month is flagged only when the area itself returned nothing for it, never for a filter's zero.
+     */
     const zeroMonths =
-      total > 0 && !narrowed
-        ? byMonth.filter((entry) => entry.matched.length === 0).map((entry) => entry.month)
+      !narrowed && inCategory.length > 0
+        ? byMonth.filter((entry) => entry.inCategory.length === 0).map((entry) => entry.month)
         : [];
     if (zeroMonths.length > 0) {
       const months = zeroMonths.join(', ');
       notes.push(
-        `${spec.kind === 'force_unplaced' ? `This force recorded no crimes without a location in ${months}.` : `Nothing recorded here in ${months}.`} A force can miss a month the API still lists as published (https://data.police.uk/changelog/), so a month at zero may be missing data rather than no crime.`,
+        `${spec.kind === 'force_unplaced' ? `This force recorded no crimes without a location in ${months}.` : `Nothing recorded here in ${months}.`} ${ZERO_MONTH_CAVEAT}`,
       );
     }
-    // Where every force the area falls in publishes no crime data, its coverage note alone explains the zero.
-    if (total === 0 && (narrowed || partial || !publishesNothing(run.forces, 'crime'))) {
-      notes.push(
-        outsideCoverageNote(spec, run) ??
-          (narrowed
-            ? `Only ${inline(category.name)} was searched; omit category to search all crime.`
-            : spec.kind === 'force_unplaced'
-              ? `This force recorded no crimes without a location in ${span}; the other areas cover the crimes it placed.`
-              : `Nothing recorded here in ${span}. A force can miss a month the API still lists as published (https://data.police.uk/changelog/); try another month, a wider area, or area 'force_unplaced' for crimes the force could not place.`),
-      );
+    if (total === 0) {
+      if (filtered && inCategory.length > 0) {
+        // Present values are read after category, before outcome and street_name_contains.
+        const clauses: string[] = [];
+        if (outcomeKey !== undefined) {
+          clauses.push(presentValuesClause('outcome', inCategory, latestOutcome));
+        }
+        if (onStreet) clauses.push(streetNamesPresentClause(inCategory, (crime) => crime.location));
+        notes.push(noFilterMatchNote('crimes', clauses));
+      } else if (narrowed || partial || !publishesNothing(run.forces, 'crime', window.months)) {
+        // Where every force the area falls in publishes no crime data in every month searched, its coverage note alone explains the zero.
+        notes.push(
+          outsideCoverageNote(spec, run) ??
+            (narrowed
+              ? `Only ${inline(category.name)} was searched; omit category to search all crime.`
+              : spec.kind === 'force_unplaced'
+                ? `This force recorded no crimes without a location in ${span}; the other areas cover the crimes it placed. ${ZERO_MONTH_CAVEAT}`
+                : `Nothing recorded here in ${span}. ${MISSING_MONTH}; try another month, a wider area, or area 'force_unplaced' for crimes the force could not place.`),
+        );
+      }
+    } else if (onStreet) {
+      const several = matchedStreetsNote(matched, (crime) => crime.location);
+      if (several) notes.push(several);
     }
     const paging = pagingNote('crimes', input.offset, page, total);
     if (paging) notes.push(paging);
@@ -446,14 +533,17 @@ export const searchCrimesTool = tool('ukcrime_search_crimes', {
       month,
       area: areaEcho(spec, run),
       category: { slug: category.slug, name: category.name },
+      ...(input.outcome !== undefined ? { outcome: input.outcome } : {}),
+      ...(street !== undefined ? { street_name_contains: street } : {}),
       total,
+      ...(filtered ? { unfiltered_total: inCategory.length } : {}),
       ...(ranged
         ? {
             by_month: byMonth.map((entry) => ({ month: entry.month, total: entry.matched.length })),
           }
         : {}),
       by_category: breakdown(matched, (crime) => crime.category),
-      by_outcome: breakdown(matched, (crime) => crime.outcome?.name),
+      by_outcome: breakdown(matched, latestOutcome),
       ...(spec.kind === 'force_unplaced' ? {} : { top_locations: topLocations(matched) }),
       crimes: [...page.rows],
       ...(page.nextOffset !== undefined ? { next_offset: page.nextOffset } : {}),
@@ -467,7 +557,11 @@ export const searchCrimesTool = tool('ukcrime_search_crimes', {
       '',
       renderArea(result.area),
       `**Category:** ${inline(result.category.name)} (${inline(result.category.slug)})`,
-      `**Crimes matched:** ${result.total}`,
+      ...(result.outcome === undefined ? [] : [`**Outcome:** "${inline(result.outcome)}"`]),
+      ...(result.street_name_contains === undefined
+        ? []
+        : [`**Street name contains:** "${inline(result.street_name_contains)}"`]),
+      `**Crimes matched:** ${result.total}${result.unfiltered_total === undefined ? '' : ` of ${result.unfiltered_total}`}`,
       ...(result.by_month ? renderByMonth('Crimes', result.by_month) : []),
       ...renderBreakdown('By category', result.by_category),
       ...renderBreakdown('By latest police outcome', result.by_outcome),

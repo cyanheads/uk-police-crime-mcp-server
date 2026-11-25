@@ -43,6 +43,7 @@ import {
   stopRecord,
   stopsBody,
   streetDatesBody,
+  streetStopsBody,
   wireLocation,
 } from '../fixtures/police-api-upstream.js';
 import { settle, useToolHarness } from '../fixtures/service-harness.js';
@@ -733,6 +734,127 @@ describe('ukcrime_search_stops', () => {
       forceRoute();
       expect(data(await filtered([{ field: 'type', value: 'a'.repeat(200) }])).total).toBe(0);
     });
+  });
+
+  /** The street matching rule is tabled in tests/shared/name-matcher.test.ts; these prove the wiring. */
+  describe('street_name_contains', () => {
+    const onStreet = (street: unknown, extra: Record<string, unknown> = {}) =>
+      callRaw({ ...FORCE, month: '2026-07', street_name_contains: street, ...extra });
+    const PRESENT =
+      'street names present: "Granby Street", "Highcross Street", "Granby Place", "Theatre/concert Hall", "Belgrave-Gate", "Siemen\'S Street", "Highfield Street"';
+
+    it('narrows the total, every breakdown, the unplaced count and the page together; unfiltered_total stays; echoed on both surfaces', async () => {
+      forceRoute(streetStopsBody());
+      const unfiltered = data(await call({ ...FORCE, month: '2026-07' }));
+      expect([unfiltered.total, unfiltered.unplaced]).toEqual([44, 1]);
+      expect(unfiltered).not.toHaveProperty('street_name_contains');
+
+      const result = await onStreet('granby street');
+      const out = data(result);
+      expect(out.street_name_contains).toBe('granby street');
+      expect(out.total).toBe(16);
+      expect(out.unfiltered_total).toBe(44);
+      expect(out.unplaced).toBe(0);
+      expect(out.by_gender).toEqual([
+        { value: 'Female', count: 8 },
+        { value: 'Male', count: 8 },
+      ]);
+      expect(out.by_type).toEqual([{ value: 'Person search', count: 16 }]);
+      expect(out.stops).toHaveLength(15);
+      expect(new Set(out.stops.map((stop) => stop.location?.street_name))).toEqual(
+        new Set(['On or near Granby Street']),
+      );
+      expect([out.next_offset, out.truncated, out.shown]).toEqual([15, true, 15]);
+      expect(out.notice).toBe('Showing 1–15 of 16; call again with offset 15 for more.');
+      const markdown = text(result);
+      expect(markdown).toContain('**Street name contains:** "granby street"');
+      expect(markdown).toContain('**Stops matched:** 16 of 44 · **Without a location:** 0');
+      expect(markdown).toContain('| Female | 8 |');
+    });
+
+    it.each<[string, unknown]>([
+      ['an empty string', ''],
+      ['whitespace', '  \t '],
+      ['null', null],
+    ])(
+      'reads %s as unset: output and notices byte-identical to leaving it out',
+      async (_name, street) => {
+        forceRoute(streetStopsBody());
+        const absent = await call({ ...FORCE, month: '2026-07' });
+        const blank = await onStreet(street);
+        expect(JSON.stringify(blank.structuredContent)).toBe(
+          JSON.stringify(absent.structuredContent),
+        );
+        expect(text(blank)).toBe(text(absent));
+        expect(text(blank)).not.toContain('Street name contains');
+      },
+    );
+
+    it('ANDs with filters, and names each street name matched when there are several', async () => {
+      forceRoute(streetStopsBody());
+      const out = data(await onStreet('granby', { filters: [{ field: 'gender', value: 'Male' }] }));
+      expect(out.total).toBe(10);
+      expect(out.by_gender).toEqual([{ value: 'Male', count: 10 }]);
+      expect(out.notice).toBe(
+        'street_name_contains matched 2 street names: "Granby Street", "Granby Place".',
+      );
+    });
+
+    it('on a zero from a non-empty area, lists the street names present, read before the filter', async () => {
+      forceRoute(streetStopsBody());
+      const result = await onStreet('near');
+      const out = data(result);
+      expect([out.total, out.unfiltered_total, out.unplaced]).toEqual([0, 44, 0]);
+      expect(out.notice).toBe(`No stops matched the filters; ${PRESENT}.`);
+      expect(text(result)).toContain(`> No stops matched the filters; ${PRESENT}.`);
+    });
+
+    it("joins the stop filters' values-present sentence when both are set", async () => {
+      forceRoute(streetStopsBody());
+      const out = data(
+        await onStreet('granby', { filters: [{ field: 'gender', value: 'Nonbinary' }] }),
+      );
+      expect(out.notice).toBe(
+        `No stops matched the filters; values present for gender: "Male", "Female", "(not recorded)"; ${PRESENT}.`,
+      );
+    });
+
+    it('keeps the empty-area notice when there was nothing to filter', async () => {
+      forceRoute([]);
+      expect(data(await onStreet('granby')).notice).toBe(ZERO_FORCE('2026-07'));
+    });
+
+    it('pages the filtered set in its own index space: offset and next_offset count matched stops', async () => {
+      forceRoute(streetStopsBody());
+      const second = data(await onStreet('granby street', { offset: 15 }));
+      expect(second.stops.map((stop) => stop.datetime)).toEqual(['2026-08-14T00:15:00+00:00']);
+      expect(second).not.toHaveProperty('next_offset');
+      expect(second.notice).toBeUndefined();
+      expect(data(await onStreet('granby street', { offset: 16 })).notice).toBe(
+        'offset 16 is past the last of 16 stops; omit offset to start from the first.',
+      );
+      const capped = data(await onStreet('granby street', { limit: 500 }));
+      expect([capped.cap, capped.shown, capped.truncated]).toEqual([200, 16, false]);
+      expect(h.upstream.count('/stops-force')).toBe(1);
+    });
+
+    it.each<[string, unknown, string]>([
+      [
+        'nothing but On or near',
+        'On or near',
+        "Needs a letter or digit besides 'On or near', which every street name starts with and matching drops.",
+      ],
+      ['over 100 characters', 'a'.repeat(101), 'Too big: expected string to have <=100 characters'],
+    ])(
+      'rejects a value of %s as invalid_arguments before any request',
+      async (_name, street, message) => {
+        const error = errorOf(await onStreet(street));
+        expect(error.code).toBe(JsonRpcErrorCode.InvalidParams);
+        expect(error.data.reason).toBe('invalid_arguments');
+        expect(error.data.issues).toMatchObject([{ path: ['street_name_contains'], message }]);
+        expect(h.upstream.calls).toHaveLength(0);
+      },
+    );
   });
 
   describe('the find and strip-search flags', () => {
@@ -2481,6 +2603,42 @@ describe('ukcrime_search_stops', () => {
         blocks?.map((block) => (block.type === 'text' ? block.text : '')).join('') ?? '';
       expect(rendered).toContain('**Stops matched:** 0 of 0');
       expect(rendered).not.toContain('Every force found for the area published');
+    });
+
+    it('format() renders the street echo only when present, caller text kept inert', () => {
+      const render = (extra: Partial<z.output<typeof searchStopsTool.output>>) =>
+        (
+          searchStopsTool.format?.({
+            month: '2026-08',
+            area: { type: 'force', force: 'btp' },
+            filters: [],
+            total: 0,
+            unfiltered_total: 3,
+            unplaced: 0,
+            by_type: [],
+            by_self_defined_ethnicity: [],
+            by_officer_defined_ethnicity: [],
+            by_outcome: [],
+            by_object_of_search: [],
+            by_legislation: [],
+            by_age_range: [],
+            by_gender: [],
+            by_outcome_linked_to_object_of_search: [],
+            by_removal_of_more_than_outer_clothing: [],
+            stops: [],
+            ...extra,
+          }) ?? []
+        )
+          .map((block) => (block.type === 'text' ? block.text : ''))
+          .join('');
+      const bare = render({});
+      expect(bare).toContain(
+        '**Filters:** none\n**Stops matched:** 0 of 3 · **Without a location:** 0\n',
+      );
+      expect(bare).not.toContain('Street name contains');
+      expect(render({ street_name_contains: 'x\\y\r\n[z] <w>' })).toContain(
+        '**Filters:** none\n**Street name contains:** "x\\\\y \\[z\\] \\<w\\>"\n**Stops matched:** 0 of 3 · **Without a location:** 0\n',
+      );
     });
   });
 

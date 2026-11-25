@@ -146,7 +146,7 @@ describe('ukcrime_find_neighbourhood', () => {
     expect(h.upstream.count('/leicestershire/neighbourhoods')).toBe(0);
   });
 
-  it('reports escaped collision candidates before any section or canonical retry', async () => {
+  it('reports the collision candidates as literals before any section or canonical retry', async () => {
     routes();
     h.upstream.route('GET', '/leicestershire/%5Bnx%5D', plainNotFound);
     h.upstream.route(
@@ -166,8 +166,12 @@ describe('ukcrime_find_neighbourhood', () => {
         recovery: { hint: "Send one of these exact neighbourhood ids: '[NX]', '[Nx]'." },
       },
     });
-    // The ids travel as written; the framework escapes them once in content[].
-    expect(text(result)).toContain("'\\[NX\\]', '\\[Nx\\]'");
+    // structuredContent carries the ids as written, quoted; content[] renders each as a code span inside its quotes, never escaped.
+    expect(error.message).toContain("Send one of these exact neighbourhood ids: '[NX]', '[Nx]'.");
+    expect(text(result)).toContain(
+      "Send one of these exact neighbourhood ids: '`[NX]`', '`[Nx]`'.",
+    );
+    expect(text(result)).not.toContain("'\\[NX\\]'");
     expect(text(result)).not.toContain('\\\\[');
     expect(
       h.upstream.calls
@@ -1193,7 +1197,7 @@ describe('ukcrime_find_neighbourhood', () => {
         const result = await call({ force, neighbourhood_id: 'NX01' });
         const out = data(result);
         expect(out.gaps).toBe(forceGaps(force));
-        expect(out.gaps).toContain('verified 2026-10-01');
+        expect(out.gaps).toContain('verified 2026-11-25');
         expect(text(result)).toContain('**Known coverage gaps:**');
       },
     );
@@ -1203,6 +1207,25 @@ describe('ukcrime_find_neighbourhood', () => {
       const result = await call({ ...BY_ID });
       expect(data(result)).not.toHaveProperty('gaps');
       expect(text(result)).not.toContain('Known coverage gaps');
+    });
+
+    it('shows a fact that starts at a month with that month, on both surfaces', async () => {
+      neighbourhoodRoutes(h.upstream, { force: 'gloucestershire', id: 'NX01' });
+      h.upstream.route(
+        'GET',
+        '/forces',
+        jsonOk([{ id: 'gloucestershire', name: 'Gloucestershire Constabulary' }]),
+      );
+      const result = await call({ force: 'gloucestershire', neighbourhood_id: 'NX01' });
+      const out = data(result);
+      expect(out.gaps).toBe(forceGaps('gloucestershire'));
+      expect(out.gaps).toContain(
+        'Gloucestershire Constabulary has sent no crime data to data.police.uk since 2026-02',
+      );
+      expect(out.gaps).toContain(
+        'Gloucestershire Constabulary has sent no outcome data to data.police.uk since 2026-02',
+      );
+      expect(text(result)).toContain('since 2026-02');
     });
   });
 

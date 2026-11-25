@@ -3,8 +3,9 @@
  * published for one month inside an area (a point's 1-mile radius, a polygon, a
  * snapped location_id, a police neighbourhood), for crimes recorded that month
  * or earlier: the total, counts by crime category, outcome and crime month, and
- * a page with their crimes. An outcome's own month can differ from the month
- * searched, and a crime's earlier steps can be missing from it.
+ * a page with their crimes, all narrowed together by the local category,
+ * outcome and street-name filters. An outcome's own month can differ from the
+ * month searched, and a crime's earlier steps can be missing from it.
  * @module mcp-server/tools/definitions/search-outcomes.tool
  */
 
@@ -18,17 +19,23 @@ import {
   latField,
   lngField,
   locationIdField,
+  matchedStreetsNote,
   monthDefaultedNote,
   monthFailureMessage,
   monthField,
   neighbourhoodIdField,
+  noFilterMatchNote,
   offsetField,
   outsideCoverageNote,
   pageOf,
   pagingNote,
   partialLocateNote,
   polygonField,
+  presentValuesClause,
   runAreaQuery,
+  streetNameContainsField,
+  streetNamesPresentClause,
+  streetPredicate,
   unknownNeighbourhoodMessage,
 } from '@/mcp-server/tools/area-search.js';
 import { cell, inline, quote } from '@/mcp-server/tools/format-helpers.js';
@@ -47,10 +54,11 @@ import {
   categoryInput,
   forceInput,
   limitInput,
+  outcomeInput,
 } from '@/mcp-server/tools/shared-schemas.js';
 import { outcomesQuery, parseArea } from '@/services/police-api/area.js';
 import { coverageNotes, publishesNothing } from '@/services/police-api/known-gaps.js';
-import { getPoliceApiService } from '@/services/police-api/police-api-service.js';
+import { categoryKey, getPoliceApiService } from '@/services/police-api/police-api-service.js';
 import { compareText } from '@/services/police-api/records.js';
 import type { OutcomeRecord } from '@/services/police-api/types.js';
 
@@ -105,13 +113,23 @@ const OutputSchema = z.object({
     .describe(
       "The crime category counted; absent when every category was (no category, or 'all-crime').",
     ),
-  total: z.number().describe('Outcomes matched, after the category filter.'),
+  outcome: z
+    .string()
+    .optional()
+    .describe('The outcome value as sent; present only when it was given.'),
+  street_name_contains: z
+    .string()
+    .optional()
+    .describe('The street_name_contains value as sent; present only when it was given.'),
+  total: z.number().describe('Outcomes matched after category, outcome and street_name_contains.'),
   by_category: breakdownSchema(
     'Matched outcomes by crime category, most first, then category in code-unit order.',
   ),
   unfiltered_total: z
     .number()
-    .describe('Outcomes in the area for the month searched, before the category filter.'),
+    .describe(
+      'Outcomes in the area for the month searched, before category, outcome and street_name_contains.',
+    ),
   by_outcome: z
     .array(
       z
@@ -146,6 +164,12 @@ const OutputSchema = z.object({
 
 type OutcomesOutput = z.infer<typeof OutputSchema>;
 
+/** The `outcome` test: the outcome's code or its name equals `value`, each side folded by {@link categoryKey}. */
+function outcomeMatcher(value: string): (outcome: OutcomeRecord) => boolean {
+  const wanted = categoryKey(value);
+  return ({ code, name }) => categoryKey(code) === wanted || categoryKey(name) === wanted;
+}
+
 /** Counts outcomes by code, most first, then by code. */
 function outcomeCounts(outcomes: readonly OutcomeRecord[]): OutcomesOutput['by_outcome'] {
   const counts = new Map<string, OutcomesOutput['by_outcome'][number]>();
@@ -171,7 +195,7 @@ function crimeMonthCounts(outcomes: readonly OutcomeRecord[]): OutcomesOutput['b
 export const searchOutcomesTool = tool('ukcrime_search_outcomes', {
   title: 'Search UK Police Outcomes',
   description:
-    "List the police outcomes data.police.uk published for one month inside an area — a point with a 1-mile radius, a polygon, a location_id, or a neighbourhood — for crimes recorded that month or any earlier one. Returns the total, counts by crime category, outcome and the month each crime was recorded, and a page of outcomes, each with its crime and persistent_id. An outcome's own month can differ from the month searched, and a crime's earlier steps can be missing here: ukcrime_get_crime_outcomes gives one crime's full sequence, and ukcrime_search_crimes the latest outcome of the crimes recorded in a month. Court results are not published; the result says when a force publishes no outcomes.",
+    "List the police outcomes data.police.uk published for one month inside an area — a point with a 1-mile radius, a polygon, a location_id, or a neighbourhood — for crimes recorded that month or any earlier one. Returns the total, counts by crime category, outcome and the month each crime was recorded, and a page of outcomes, each with its crime and persistent_id. category, outcome and street_name_contains narrow the counts and the page together, so filtering one field and reading another's breakdown gives a cross-tab. An outcome's own month can differ from the month searched, and a crime's earlier steps can be missing here: ukcrime_get_crime_outcomes gives one crime's full sequence, and ukcrime_search_crimes the latest outcome of the crimes recorded in a month. Court results are not published; the result says when a force publishes no outcomes.",
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
     area: z
@@ -191,6 +215,10 @@ export const searchOutcomesTool = tool('ukcrime_search_outcomes', {
     category: categoryInput.describe(
       "Count only outcomes for crimes in this category: a slug such as 'burglary' or a display name such as 'Violence and sexual offences'; case-insensitive, and spaces, underscores and hyphens match each other ('vehicle_crime' finds 'vehicle-crime'). Omitted or 'all-crime': every category. ukcrime_list_reference topic 'categories' lists them.",
     ),
+    outcome: outcomeInput.describe(
+      "Police outcome to keep: a code such as 'cautioned' or a name such as 'Offender given a caution', as by_outcome lists them, matched whole, ignoring case, with runs of spaces, underscores and hyphens read alike. Narrows the counts and the page together; a value nothing matches returns zero, and the notice lists the codes present.",
+    ),
+    street_name_contains: streetNameContainsField,
     limit: limitInput(20).describe(
       'Requested outcomes on this page, 1–10,000; applied cap is at most 200. Default 20.',
     ),
@@ -369,32 +397,58 @@ export const searchOutcomesTool = tool('ukcrime_search_outcomes', {
       );
     }
 
-    // The outcomes route takes no category, so a narrowed search filters locally.
+    // The outcomes route takes no filter, so category, outcome and street narrow the records locally.
     const filter = category && category.slug !== ALL_CRIME ? category : undefined;
-    const matched = filter
+    const inCategory = filter
       ? run.records.filter((outcome) => outcome.crime.category === filter.slug)
       : run.records;
+    const street = input.street_name_contains;
+    const isOutcome = input.outcome === undefined ? undefined : outcomeMatcher(input.outcome);
+    const onStreet = street === undefined ? undefined : streetPredicate(street);
+    const matched =
+      isOutcome || onStreet
+        ? inCategory.filter(
+            (outcome) =>
+              (!isOutcome || isOutcome(outcome)) && (!onStreet || onStreet(outcome.crime.location)),
+          )
+        : inCategory;
     const total = matched.length;
     const page = pageOf(matched, input.offset, cap);
     ctx.enrich({ truncated: page.nextOffset !== undefined, shown: page.rows.length });
 
     const notes: string[] = [];
     if (resolution.defaulted) notes.push(monthDefaultedNote(month));
-    for (const force of run.forces) notes.push(...coverageNotes(force, ['outcomes']));
+    // Every outcomes area is placed on the map, so a force's missing coordinates (`locations`) hide outcomes here too.
+    for (const force of run.forces) {
+      notes.push(...coverageNotes(force, ['outcomes', 'locations'], [month]));
+    }
     const partial = partialLocateNote(run);
     if (partial) notes.push(partial);
-    // Where every force the area falls in publishes no outcomes, its coverage note alone explains a zero.
-    const zeroExplained = !partial && publishesNothing(run.forces, 'outcomes');
+    // Where every force the area falls in publishes no outcomes for the month, its coverage note alone explains a zero.
+    const zeroExplained = !partial && publishesNothing(run.forces, 'outcomes', [month]);
     if (total === 0) {
       const outside = outsideCoverageNote(spec, run);
       if (outside) notes.push(outside);
-      else if (filter && run.records.length > 0) {
+      else if (inCategory.length > 0) {
+        // Only outcome or street_name_contains can empty a non-empty category set; the values present are read before them.
+        const clauses: string[] = [];
+        if (input.outcome !== undefined) {
+          clauses.push(presentValuesClause('outcome', inCategory, (outcome) => outcome.code));
+        }
+        if (street !== undefined) {
+          clauses.push(streetNamesPresentClause(inCategory, (outcome) => outcome.crime.location));
+        }
+        notes.push(noFilterMatchNote('outcomes', clauses));
+      } else if (filter && run.records.length > 0) {
         notes.push(
           `Only outcomes for ${inline(filter.name)} crimes were counted; omit category for all.`,
         );
       } else if (!zeroExplained) {
         notes.push(`No outcomes published here for ${month}; try another month or a wider area.`);
       }
+    } else if (onStreet) {
+      const several = matchedStreetsNote(matched, (outcome) => outcome.crime.location);
+      if (several) notes.push(several);
     }
     const paging = pagingNote('outcomes', input.offset, page, total);
     if (paging) notes.push(paging);
@@ -404,6 +458,8 @@ export const searchOutcomesTool = tool('ukcrime_search_outcomes', {
       month,
       area: areaEcho(spec, run),
       ...(filter ? { category: { slug: filter.slug, name: filter.name } } : {}),
+      ...(input.outcome !== undefined ? { outcome: input.outcome } : {}),
+      ...(street !== undefined ? { street_name_contains: street } : {}),
       total,
       by_category: breakdown(matched, (outcome) => outcome.crime.category),
       unfiltered_total: run.records.length,
@@ -420,6 +476,10 @@ export const searchOutcomesTool = tool('ukcrime_search_outcomes', {
       lines.push(
         `**Crime category:** ${inline(result.category.name)} (${inline(result.category.slug)})`,
       );
+    }
+    if (result.outcome !== undefined) lines.push(`**Outcome:** "${inline(result.outcome)}"`);
+    if (result.street_name_contains !== undefined) {
+      lines.push(`**Street name contains:** "${inline(result.street_name_contains)}"`);
     }
     lines.push(
       `**Outcomes matched:** ${result.total} of ${result.unfiltered_total} published for this month`,

@@ -24,6 +24,7 @@ import { getCrimeOutcomesTool } from '@/mcp-server/tools/definitions/get-crime-o
 import { listReferenceTool } from '@/mcp-server/tools/definitions/list-reference.tool.js';
 import { ATTRIBUTION } from '@/mcp-server/tools/shared-schemas.js';
 import {
+  boundaryBody,
   emptyNotFound,
   hang,
   htmlBadRequest,
@@ -85,7 +86,9 @@ const pathOf = (id: string) => `/outcomes-for-crime/${id}`;
 const MISS_GUIDANCE = (n: number) =>
   `data.police.uk holds no crime for ${n} of these ids. Take persistent ids from the persistent_id field of ukcrime_search_crimes or ukcrime_search_outcomes results; anti-social behaviour records carry none.`;
 const FAILED_GUIDANCE = (n: number) =>
-  `${n} lookups failed upstream; call ukcrime_get_crime_outcomes again with just those ids.`;
+  `Lookups failed for ${n} of these ids; call ukcrime_get_crime_outcomes again with just those ids.`;
+const REMAINING_GUIDANCE = (n: number) =>
+  `This call left ${n} of these ids unprocessed; call ukcrime_get_crime_outcomes again with remaining_ids as persistent_ids.`;
 const DATA_NOTE =
   'Police outcomes only — court results are not published. Locations are anonymised map points, not crime sites. A crime returned here is the record data.police.uk holds for the id; for Northern Ireland ids it can differ from the record that carried the id, so compare category and month.';
 
@@ -352,7 +355,8 @@ describe('ukcrime_get_crime_outcomes', () => {
       expect(data(first).failed).toEqual([]);
       expect(data(first).not_found).toEqual([]);
       expect(text(first)).toContain(ids[25]);
-      expect(text(first)).toContain('remaining_ids');
+      expect(data(first).guidance).toBe(REMAINING_GUIDANCE(1));
+      expect(text(first)).toContain(`**Guidance:** ${REMAINING_GUIDANCE(1)}`);
       expect(h.upstream.calls).toHaveLength(25);
       const last = data(await call({ persistent_ids: data(first).remaining_ids }));
       expect(last.crimes.map((crime) => crime.persistent_id)).toEqual(ids.slice(25));
@@ -493,6 +497,12 @@ describe('ukcrime_get_crime_outcomes', () => {
   });
 
   describe('failed: any other lookup failure is a result', () => {
+    it('describes failed as covering lookups never sent as well as upstream failures', () => {
+      expect(getCrimeOutcomesTool.output.shape.failed.description).toBe(
+        "Ids whose lookup failed for a reason other than a missing crime: an upstream failure, or a lookup never sent because this server's queue was full or the call ran out of time first. Empty when none.",
+      );
+    });
+
     it('reports one failing id under failed with its error text while the others return', async () => {
       found(A, C);
       h.upstream.route('GET', pathOf(B), status(500));
@@ -612,6 +622,27 @@ describe('ukcrime_get_crime_outcomes', () => {
       expect(out.guidance).toBe(`${MISS_GUIDANCE(1)} ${FAILED_GUIDANCE(2)}`);
     });
 
+    it('called again with just the failed ids once the upstream has recovered, resolves every one, asking upstream for those ids alone', async () => {
+      found(A, C);
+      h.upstream.route('GET', pathOf(B), status(500));
+      h.upstream.route('GET', pathOf(D), status(502));
+      const first = data(await call({ persistent_ids: [A, B, C, D] }));
+      expect(first.crimes.map((c) => c.persistent_id)).toEqual([A, C]);
+      expect(first.failed.map((f) => f.persistent_id)).toEqual([B, D]);
+      expect(first.guidance).toBe(FAILED_GUIDANCE(2));
+
+      found(B, D);
+      const sentBefore = h.upstream.calls.length;
+      const result = await call({ persistent_ids: first.failed.map((f) => f.persistent_id) });
+      const again = data(result);
+      expect(again.crimes.map((c) => c.persistent_id)).toEqual([B, D]);
+      expect([again.not_found, again.failed, again.remaining_ids]).toEqual([[], [], []]);
+      expect(again).not.toHaveProperty('guidance');
+      expect(text(result)).toContain('2 found, 0 not found, 0 failed');
+      const resent = h.upstream.calls.slice(sentBefore).map((c) => c.path);
+      expect(resent.sort()).toEqual([pathOf(B), pathOf(D)].sort());
+    });
+
     it('logs one warning, not an error, for a partial failure', async () => {
       found(A);
       h.upstream.route('GET', pathOf(B), status(500));
@@ -619,7 +650,13 @@ describe('ukcrime_get_crime_outcomes', () => {
       const input = getCrimeOutcomesTool.input.parse({ persistent_ids: [A, B] });
       await settle(Promise.resolve(getCrimeOutcomesTool.handler(input, ctx)));
       const log = ctx.log as MockContextLogger;
-      expect(log.calls.filter((c) => c.level === 'warning')).toHaveLength(1);
+      expect(log.calls.filter((c) => c.level === 'warning')).toEqual([
+        {
+          level: 'warning',
+          msg: 'Some crime outcome lookups failed',
+          data: expect.objectContaining({ failed: 1, requested: 2 }),
+        },
+      ]);
       expect(log.calls.some((c) => c.level === 'error')).toBe(false);
     });
   });
@@ -822,16 +859,53 @@ describe('ukcrime_get_crime_outcomes', () => {
       expect(Date.now() - started).toBeLessThan(50_000);
     });
 
-    it('does not start more than fifteen requests in any second', async () => {
+    it('does not start more than three requests in any second', async () => {
       const ids = persistentIds(25);
       found(...ids);
       await call({ persistent_ids: ids });
       const starts = h.upstream.calls.map((c) => c.at);
-      for (const start of starts) {
-        expect(starts.filter((at) => at >= start && at < start + 1000).length).toBeLessThanOrEqual(
-          15,
+      const perWindow = starts.map(
+        (start) => starts.filter((at) => at >= start && at < start + 1000).length,
+      );
+      expect(Math.max(...perWindow)).toBe(3);
+    });
+
+    it('names a lookup still queued when the call runs out of time as queued, never as data.police.uk not answering', async () => {
+      const ids = persistentIds(9);
+      const [late] = ids.slice(8) as [string];
+      for (const id of ids.slice(0, 8))
+        h.upstream.route('GET', pathOf(id), delayed(16_000, jsonOk(crimeHistoryBody(id))));
+      h.upstream.route('GET', pathOf(late), jsonOk(crimeHistoryBody(late)));
+      for (let i = 0; i < 4; i++) {
+        h.upstream.route(
+          'GET',
+          `/leicestershire/NX${i}/boundary`,
+          delayed(25_000, jsonOk(boundaryBody())),
         );
       }
+      const lookup = runToolContract(getCrimeOutcomesTool, { persistent_ids: ids });
+      // Eight lookups answer in two rounds of 16 s. At 31 s four other reads queue for the slots the
+      // second round frees at 32 s and hold them past the call's 50 s budget, so the ninth lookup,
+      // queued at 32 s, is never sent.
+      const reads = new Promise<void>((resolve) => setTimeout(resolve, 31_000)).then(() =>
+        Promise.all(
+          Array.from({ length: 4 }, (_, i) =>
+            h.service.getBoundary(
+              'leicestershire',
+              `NX${i}`,
+              createMockContext(),
+              h.service.openBudget(),
+            ),
+          ),
+        ),
+      );
+      const [result] = await settle(Promise.all([lookup, reads]), 200);
+      const out = data(result);
+      const queued = 'Too many requests to data.police.uk were queued.';
+      expect(out.crimes.map((crime) => crime.persistent_id)).toEqual(ids.slice(0, 8));
+      expect(out.failed).toEqual([{ persistent_id: late, error: queued }]);
+      expect(text(result)).toContain(`- ${late}: ${queued}`);
+      expect(h.upstream.count(pathOf(late))).toBe(0);
     });
 
     it('does not cache histories: a repeat call asks upstream again', async () => {
@@ -869,7 +943,7 @@ describe('ukcrime_get_crime_outcomes', () => {
       expect(peak).toBe(4);
     });
 
-    it('leaves room in the shared queue for other callers while twelve 25-id calls run', async () => {
+    it('leaves room in the shared queue for other callers while twelve 25-id calls run, naming each lookup it could not send in time as not sent', async () => {
       h.upstream.referenceRoutes();
       const all = persistentIds(300);
       for (const id of all) h.upstream.route('GET', pathOf(id), plainNotFound);
@@ -879,7 +953,19 @@ describe('ukcrime_get_crime_outcomes', () => {
       const reference = runToolContract(listReferenceTool, { topic: 'forces' });
       const [results, forces] = await settle(Promise.all([Promise.all(lookups), reference]));
       expect(forces.isError, JSON.stringify(forces.structuredContent)).toBeFalsy();
-      for (const result of results) expect(data(result).failed).toEqual([]);
+      // Three starts a second fit about 150 of the 300 lookups inside one 50 s budget (0 s and 50 s both start three).
+      const sent = h.upstream.calls.filter((call) => call.path.startsWith('/outcomes-for-crime/'));
+      expect(sent.length).toBeGreaterThanOrEqual(140);
+      expect(sent.length).toBeLessThanOrEqual(3 * 51);
+      const outs = results.map(data);
+      expect(outs.flatMap((out) => out.not_found)).toHaveLength(sent.length);
+      const unsent = new Set([
+        'Too many requests to data.police.uk were queued.',
+        'The call ran out of time before this lookup was sent.',
+      ]);
+      const failed = outs.flatMap((out) => out.failed);
+      expect(failed).toHaveLength(300 - sent.length);
+      expect(failed.filter((entry) => !unsent.has(entry.error))).toEqual([]);
     });
 
     it('shares one 50 s budget: lookups that cannot finish inside it fail instead of running on', async () => {

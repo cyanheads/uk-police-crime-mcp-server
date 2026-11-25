@@ -1251,22 +1251,23 @@ describe('PoliceApiService request boundary', () => {
   });
 
   describe('process-wide pacer', () => {
-    it('never has more than four requests in flight and never starts more than fifteen in a second', async () => {
+    it('never has more than four requests in flight and never starts more than three in any second', async () => {
       let inFlight = 0;
       let peak = 0;
       h.upstream.route('GET', '/crime-last-updated', jsonOk(lastUpdatedBody()));
-      for (let i = 0; i < 40; i++) {
+      // 1.5 s answers: the second second's starts find three slots still held, so four fill.
+      for (let i = 0; i < 24; i++) {
         h.upstream.route('GET', `/leicestershire/NX${i}/boundary`, async (request) => {
           inFlight += 1;
           peak = Math.max(peak, inFlight);
-          await new Promise<void>((resolve) => setTimeout(resolve, 100));
+          await new Promise<void>((resolve) => setTimeout(resolve, 1500));
           inFlight -= 1;
           return jsonOk(boundaryBody())(request);
         });
       }
       const lookups = await settle(
         Promise.all(
-          Array.from({ length: 40 }, (_, i) =>
+          Array.from({ length: 24 }, (_, i) =>
             h.service.getBoundary('leicestershire', `NX${i}`, h.ctx, h.budget()),
           ),
         ),
@@ -1274,11 +1275,26 @@ describe('PoliceApiService request boundary', () => {
       expect(lookups.every((lookup) => lookup.kind === 'found')).toBe(true);
       expect(peak).toBe(4);
       const starts = h.upstream.calls.map((call) => call.at);
-      for (const start of starts) {
-        const inWindow = starts.filter((at) => at >= start && at < start + 1000).length;
-        expect(inWindow).toBeLessThanOrEqual(15);
+      const perWindow = starts.map(
+        (start) => starts.filter((at) => at >= start && at < start + 1000).length,
+      );
+      expect(Math.max(...perWindow)).toBe(3);
+    });
+
+    it('starts three requests at once and the fourth a full second after the first', async () => {
+      for (let i = 0; i < 4; i++) {
+        h.upstream.route('GET', `/leicestershire/NX${i}/boundary`, jsonOk(boundaryBody()));
       }
-      expect(Math.max(...starts) - Math.min(...starts)).toBeGreaterThanOrEqual(1000);
+      const start = Date.now();
+      await settle(
+        Promise.all(
+          Array.from({ length: 4 }, (_, i) =>
+            h.service.getBoundary('leicestershire', `NX${i}`, h.ctx, h.budget()),
+          ),
+        ),
+        10,
+      );
+      expect(h.upstream.calls.map((call) => call.at - start)).toEqual([0, 0, 0, 1000]);
     });
 
     /** Resolves once `ready()` holds, polled on the virtual clock. */
@@ -1394,6 +1410,97 @@ describe('PoliceApiService request boundary', () => {
       expect(held.peak).toBe(3);
       // A's own retry goes out after the full 30 s it was asked to wait.
       expect(later[3]).toBeGreaterThanOrEqual(30_000);
+    });
+
+    /** Settles to the error a call rejects with (`undefined` when it resolves) and when it settled. */
+    const rejection = (promise: Promise<unknown>) =>
+      promise.then(
+        () => ({ at: Date.now(), error: undefined }),
+        (error: unknown) => ({ at: Date.now(), error: error as McpError }),
+      );
+
+    it('fails a request whose retry deadline ends while it is still queued as pacer_shed, never sent', async () => {
+      // Four reads hold every slot for 15 s; /forces queues behind them with a 10 s budget.
+      for (let i = 0; i < 4; i++) {
+        h.upstream.route(
+          'GET',
+          `/leicestershire/NX${i}/boundary`,
+          delayed(15_000, jsonOk(boundaryBody())),
+        );
+      }
+      const reads = Array.from({ length: 4 }, (_, i) =>
+        h.service.getBoundary('leicestershire', `NX${i}`, h.ctx, h.budget()),
+      );
+      const start = Date.now();
+      const queued = rejection(
+        h.service.getForces(h.ctx, h.service.narrowBudget(h.budget(), 10_000)),
+      );
+      const [{ at, error }, found] = await settle(Promise.all([queued, Promise.all(reads)]));
+      expect(found.every((lookup) => lookup.kind === 'found')).toBe(true);
+      expect(at - start).toBeGreaterThanOrEqual(10_000);
+      expect(at - start).toBeLessThan(10_100);
+      expect(error).toBeInstanceOf(McpError);
+      expect(error?.code).toBe(JsonRpcErrorCode.RateLimited);
+      expect(error?.message).toBe(
+        'Too many requests to data.police.uk are queued in this server, so this one was not sent.',
+      );
+      expect(error?.data).toEqual({ reason: 'pacer_shed', retryable: true });
+      expect(h.upstream.count('/forces')).toBe(0);
+    });
+
+    it('fails an area query whose retry deadline ends while it waits for an area slot as pacer_shed, never sent', async () => {
+      const held = heldAreaRoute(15_000);
+      const areas = ['A', 'B', 'C'].map((n) => area({ date: '2026-08', n }));
+      await until(() => held.now >= 3);
+      const waiting = rejection(
+        h.service.queryArea(
+          {
+            path: '/crimes-street/all-crime',
+            params: { date: '2026-08', n: 'D' },
+            normalize: (json) => json as readonly number[],
+          },
+          h.ctx,
+          h.service.narrowBudget(h.budget(), 10_000),
+        ),
+      );
+      const [{ error }] = await settle(Promise.all([waiting, Promise.all(areas)]));
+      expect(error?.code).toBe(JsonRpcErrorCode.RateLimited);
+      expect(error?.data).toEqual({ reason: 'pacer_shed', retryable: true });
+      // Each query first awaits a native SHA-256 cache-key digest, so the three held queries can arrive in any order.
+      expect(
+        h.upstream
+          .callsTo('/crimes-street/all-crime')
+          .map((call) => call.query.get('n'))
+          .sort(),
+      ).toEqual(['A', 'B', 'C']);
+      expect(held.peak).toBe(3);
+    });
+
+    it('keeps retry_deadline_exceeded, attempts counted, for a request sent once whose retry was still queued at the deadline', async () => {
+      // /forces is sent at once and answers 429 (Retry-After 2 s); four reads then hold every slot past its 15 s deadline.
+      h.upstream.route('GET', '/forces', sequence(rateLimited('2'), jsonOk(forcesBody())));
+      for (let i = 0; i < 4; i++) {
+        h.upstream.route(
+          'GET',
+          `/leicestershire/NX${i}/boundary`,
+          delayed(20_000, jsonOk(boundaryBody())),
+        );
+      }
+      const limited = rejection(
+        h.service.getForces(h.ctx, h.service.narrowBudget(h.budget(), 15_000)),
+      );
+      await untilReal(() => h.upstream.count('/forces') === 1);
+      const reads = Array.from({ length: 4 }, (_, i) =>
+        h.service.getBoundary('leicestershire', `NX${i}`, h.ctx, h.budget()),
+      );
+      const [{ error }] = await settle(Promise.all([limited, Promise.all(reads)]));
+      expect(error?.code).toBe(JsonRpcErrorCode.Timeout);
+      expect(error?.data).toMatchObject({
+        reason: 'retry_deadline_exceeded',
+        retryable: true,
+        retryAttempts: 2,
+      });
+      expect(h.upstream.count('/forces')).toBe(1);
     });
 
     it('counts the wait for an area slot against the same 20 s as the wait for a pacer slot', async () => {

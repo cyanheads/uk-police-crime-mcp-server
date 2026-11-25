@@ -21,8 +21,10 @@ import {
   nameContainsInput,
   neighbourhoodIdInput,
   offsetInput,
+  outcomeInput,
   POLYGON_MAX_VERTICES,
   polygonInput,
+  streetNameContainsInput,
 } from '@/mcp-server/tools/shared-schemas.js';
 
 /** Parses a value through a field schema; `ok` false when it is rejected. */
@@ -333,6 +335,60 @@ describe('nameContainsInput', () => {
   );
 });
 
+describe('streetNameContainsInput', () => {
+  const PREFIX_ONLY =
+    "Needs a letter or digit besides 'On or near', which every street name starts with and matching drops.";
+
+  it('trims and keeps case', () => {
+    expect(accepted(streetNameContainsInput, '  Granby St ')).toBe('Granby St');
+  });
+
+  it.each(BLANKS)('reads %j as unset', (blank) => {
+    expect(accepted(streetNameContainsInput, blank)).toBeUndefined();
+  });
+
+  it('accepts 100 characters and rejects 101', () => {
+    accepted(streetNameContainsInput, 'a'.repeat(100));
+    expect(rejected(streetNameContainsInput, 'a'.repeat(101))[0]?.code).toBe('too_big');
+  });
+
+  it.each(['On or near', 'on or near', ' ON OR NEAR ', 'on-or-near', 'On or near ...', '-', '&'])(
+    'rejects %j, which has no word besides On or near',
+    (value) => {
+      expect(rejected(streetNameContainsInput, value)[0]?.message).toBe(PREFIX_ONLY);
+    },
+  );
+
+  it.each(['near', 'on or', 'On or near Granby', 'granby-street', '7', 'Étoile'])(
+    'accepts %j as sent',
+    (value) => {
+      expect(accepted(streetNameContainsInput, value)).toBe(value);
+    },
+  );
+});
+
+describe('outcomeInput', () => {
+  it.each(['Offender given a caution', 'OFFENDER_GIVEN_A_CAUTION', 'cautioned', '(not recorded)'])(
+    'keeps %j as sent',
+    (value) => {
+      expect(accepted(outcomeInput, `  ${value} `)).toBe(value);
+    },
+  );
+
+  it.each(BLANKS)('reads %j as unset', (blank) => {
+    expect(accepted(outcomeInput, blank)).toBeUndefined();
+  });
+
+  it('accepts 100 characters and rejects 101', () => {
+    accepted(outcomeInput, 'a'.repeat(100));
+    rejected(outcomeInput, 'a'.repeat(101));
+  });
+
+  it('rejects a non-string', () => {
+    rejected(outcomeInput, 5);
+  });
+});
+
 describe('latInput and lngInput', () => {
   it.each([0, 51.5, -0.12, 90, -90])('latInput accepts %d', (lat) => {
     expect(accepted(latInput, lat)).toBe(lat);
@@ -542,6 +598,8 @@ describe('a form client submitting every optional field blank', () => {
     month: monthInput,
     category: categoryInput,
     name_contains: nameContainsInput,
+    street_name_contains: streetNameContainsInput,
+    outcome: outcomeInput,
     lat: latInput,
     lng: lngInput,
     polygon: polygonInput,
@@ -575,6 +633,8 @@ describe('a form client submitting every optional field blank', () => {
         month: ' 2026-08 ',
         category: ' Burglary ',
         name_contains: ' east ',
+        street_name_contains: ' Granby St ',
+        outcome: ' Offender given a caution ',
         lat: 52.63,
         lng: -1.13,
         polygon: [],
@@ -586,6 +646,8 @@ describe('a form client submitting every optional field blank', () => {
       month: '2026-08',
       category: 'burglary',
       name_contains: 'east',
+      street_name_contains: 'Granby St',
+      outcome: 'Offender given a caution',
       lat: 52.63,
       lng: -1.13,
     });

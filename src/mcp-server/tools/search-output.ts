@@ -14,7 +14,11 @@ import { cell, inline } from './format-helpers.js';
 export const LocationSchema = z
   .object({
     location_id: z.string().describe("Map point id; pass it as location_id with area 'location'."),
-    street_name: z.string().describe('Street as published: "On or near …".'),
+    street_name: z
+      .string()
+      .describe(
+        'Street as published: "On or near …", or a bare "On or near " with no street after it, as Northern Ireland publishes some.',
+      ),
     map_point: z
       .object({
         latitude: z.number().describe('Latitude, WGS84.'),

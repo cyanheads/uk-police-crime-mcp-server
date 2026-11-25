@@ -8,6 +8,7 @@
  */
 
 import { z } from '@cyanheads/mcp-ts-core';
+import { nameWords, streetWords } from '@/mcp-server/tools/name-matcher.js';
 import { foldForce } from '@/services/police-api/police-api-service.js';
 
 /** OGL v3.0 attribution — the `attribution` enrichment field, written first by every tool. */
@@ -100,18 +101,38 @@ export const categoryInput = blankAsUnset(z.string().max(100).optional(), (value
 );
 
 /**
- * Local name filter (strict token match). Needs a letter or digit: matching
+ * Local name filter, matched by the name matcher. Needs a word: matching
  * ignores punctuation, so a value made only of punctuation would match every name.
  */
 export const nameContainsInput = blankAsUnset(
   z
     .string()
     .max(100)
-    .refine((value) => /[\p{L}\p{N}]/u.test(value.normalize('NFKD')), {
+    .refine((value) => nameWords(value).length > 0, {
       message: 'Needs a letter or digit; punctuation alone would match every name.',
     })
     .optional(),
 );
+
+/**
+ * Local street filter, the name matcher's rule with the "On or near" every
+ * published street name starts with dropped from both sides. Needs a word
+ * besides it: a value of only that prefix, or only punctuation, would match
+ * every street.
+ */
+export const streetNameContainsInput = blankAsUnset(
+  z
+    .string()
+    .max(100)
+    .refine((value) => streetWords(value).length > 0, {
+      message:
+        "Needs a letter or digit besides 'On or near', which every street name starts with and matching drops.",
+    })
+    .optional(),
+);
+
+/** Police outcome name or code, trimmed and otherwise kept as sent for the echo; handlers match it folded by `categoryKey`. */
+export const outcomeInput = blankAsUnset(z.string().max(100).optional());
 
 /** Latitude, WGS84 decimal degrees. */
 export const latInput = blankAsUnset(z.number().min(-90).max(90).optional());

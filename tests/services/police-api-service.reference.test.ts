@@ -313,7 +313,7 @@ describe('PoliceApiService reference methods', () => {
       ).toEqual(BTP_REFUSED);
     });
 
-    it('findForce picks neither force when a name key is shared, naming both ids', async () => {
+    it('findForce picks neither force when a name key is shared: unknown_force naming both ids, declared as literals', async () => {
       h.upstream.route(
         'GET',
         '/forces',
@@ -322,15 +322,15 @@ describe('PoliceApiService reference methods', () => {
           { id: 'southshire', name: 'Southshire Constabulary' },
         ]),
       );
-      expect(
-        await settle(
-          h.service.findForce('southshire-police', h.ctx, h.budget(), { allowBtp: true }),
-        ),
-      ).toEqual({
-        kind: 'unknown',
-        message:
-          "'southshire-police' matches more than one police force: 'northshire', 'southshire'; send one of their ids.",
-      });
+      const error = await failure(
+        h.service.findForce('southshire-police', h.ctx, h.budget(), { allowBtp: true }),
+      );
+      expect(error.code).toBe(JsonRpcErrorCode.ValidationError);
+      expect(error.message).toBe(
+        "'southshire-police' matches more than one police force: 'northshire', 'southshire'; send one of their ids.",
+      );
+      expect(error.data).toEqual({ reason: 'unknown_force' });
+      expect(error.literals).toEqual(['northshire', 'southshire']);
       // An exact id is matched first, so the id itself is never ambiguous.
       expect(
         await settle(h.service.findForce('southshire', h.ctx, h.budget(), { allowBtp: true })),

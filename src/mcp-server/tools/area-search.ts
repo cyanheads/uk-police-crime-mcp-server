@@ -1,20 +1,26 @@
 /**
  * @fileoverview Plumbing shared by the ukcrime area search tools: the described
- * area input fields and key aliases, the named-force check, month-failure
- * messages, month ranges (`month_from` checks and the two-at-a-time month
- * runner), the area run (neighbourhood boundary, the query, and the
- * `/locate-neighbourhood` lookups that find the forces for an area),
- * breakdowns, local paging over cached records, the area echo, and the notice
- * fragments every search composes. Failures come back as values so each
- * handler raises its own declared reason through `ctx.fail`.
+ * input fields they share (area fields, `street_name_contains`) and key
+ * aliases, the area check (the street filter on `force_unplaced`
+ * included), the named-force check, month-failure messages, month ranges
+ * (`month_from` checks and the two-at-a-time month runner), the area run
+ * (neighbourhood boundary, the query, and the `/locate-neighbourhood` lookups
+ * that find the forces for an area), the street predicate, breakdowns, local
+ * paging over cached records, the area echo, and the notice fragments every
+ * search composes, the zero-hit filter sentence and the street-name ones
+ * included. Failures come back as values so each handler raises its own
+ * declared reason through `ctx.fail`.
  * @module mcp-server/tools/area-search
  */
 
 import type { Context } from '@cyanheads/mcp-ts-core';
 import { McpError } from '@cyanheads/mcp-ts-core/errors';
 import {
+  type AreaFields,
+  type AreaKind,
   type AreaSpec,
   type AreaTarget,
+  parseArea,
   resolveTarget,
   type UnknownNeighbourhood,
 } from '@/services/police-api/area.js';
@@ -33,6 +39,8 @@ import type {
   MapPoint,
   MonthResolution,
 } from '@/services/police-api/types.js';
+import { inline } from './format-helpers.js';
+import { streetMatcher, streetPart } from './name-matcher.js';
 import type { AreaEcho, BreakdownRow } from './search-output.js';
 import {
   latInput,
@@ -42,6 +50,7 @@ import {
   neighbourhoodIdInput,
   offsetInput,
   polygonInput,
+  streetNameContainsInput,
 } from './shared-schemas.js';
 
 // --- Input -------------------------------------------------------------------
@@ -70,6 +79,10 @@ export const offsetField = offsetInput.describe(
   'Rows to skip before this page; pass next_offset from the previous result. Default 0.',
 );
 
+export const streetNameContainsField = streetNameContainsInput.describe(
+  "Words that must all appear in a record's street name, in any order, part of a word included ('Granby St' finds Granby Street) — case, accents and punctuation ignored, and the 'On or near' every street name starts with dropped from both sides, so the value needs a word besides it. A record with no location never matches. Narrows the counts and the page together; when the matches span several street names, the notice names them.",
+);
+
 /** Key aliases every search tool declares: the upstream's `date`, and common coordinate spellings. */
 export const AREA_INPUT_ALIASES = {
   date: 'month',
@@ -81,6 +94,23 @@ export const AREA_INPUT_ALIASES = {
 } as const;
 
 // --- Checks before the area query -----------------------------------------------
+
+/**
+ * {@link parseArea}, then the street filter against the arm: `force_unplaced`
+ * holds only crimes with no location, which `street_name_contains` can never
+ * match, so the two together fail as the area arm's `invalid_area` before any
+ * request, the message joined to any area problem found first.
+ */
+export function parseSearchArea(
+  kind: AreaKind,
+  fields: AreaFields & { readonly street_name_contains?: string | undefined },
+): ReturnType<typeof parseArea> {
+  const parsed = parseArea(kind, fields);
+  if (kind !== 'force_unplaced' || fields.street_name_contains === undefined) return parsed;
+  const problem =
+    "area 'force_unplaced' holds only crimes with no location, so street_name_contains can match none; remove it, or search an area with locations.";
+  return { ok: false, message: parsed.ok ? problem : `${parsed.message} ${problem}` };
+}
 
 /**
  * The force an area arm names, matched against the force list by id or display
@@ -744,6 +774,21 @@ export function breakdown<T>(
   );
 }
 
+/** What the street filter and its notice fragments read from a record: its location, or undefined when it has none. */
+type LocationOf<T> = (record: T) => { readonly street_name: string } | undefined;
+
+/**
+ * The `street_name_contains` test for a record's location, by the name
+ * matcher's street rule. A record with no location never matches, nor one
+ * whose street name is blank after "On or near".
+ */
+export function streetPredicate(
+  value: string,
+): (location: { readonly street_name: string } | undefined) => boolean {
+  const matches = streetMatcher(value);
+  return (location) => location !== undefined && matches(location.street_name);
+}
+
 /** A page of already-sorted records; `nextOffset` is set when rows remain after it. */
 export function pageOf<T>(
   records: readonly T[],
@@ -794,6 +839,76 @@ export function partialLocateNote(run: AreaForces): string | undefined {
     return 'Coverage could not be checked because the force lookup failed or ran out of time; records are retained, but coverage gaps may be missing. Search again to retry the lookup.';
   }
   return `The force at ${failed} of this polygon's ${samples.length} sample points could not be looked up, so the forces named here may not be all it falls in; search again to retry the lookup.`;
+}
+
+/** Most values a zero-hit clause lists, the rest counted. */
+const MAX_PRESENT_VALUES = 12;
+
+/** `"a", "b" and N more`: the first {@link MAX_PRESENT_VALUES} rows' values, upstream text kept inert. */
+function listPresent(rows: readonly BreakdownRow[]): string {
+  const listed = rows
+    .slice(0, MAX_PRESENT_VALUES)
+    .map(({ value }) => `"${inline(value)}"`)
+    .join(', ');
+  const more =
+    rows.length > MAX_PRESENT_VALUES ? ` and ${rows.length - MAX_PRESENT_VALUES} more` : '';
+  return `${listed}${more}`;
+}
+
+/** Records' street names without "On or near", by record count; records with no location or a blank street are left out. */
+function streetNames<T>(records: readonly T[], locationOf: LocationOf<T>): BreakdownRow[] {
+  const parts: string[] = [];
+  for (const record of records) {
+    const location = locationOf(record);
+    const part = location && streetPart(location.street_name);
+    if (part !== undefined) parts.push(part);
+  }
+  return breakdown(parts, (part) => part);
+}
+
+/**
+ * A zero-hit clause for one filtered field: `values present for {field}: "a",
+ * "b" and N more`, the values `valueFor` reads, by record count, from the
+ * records before the tool's local filters.
+ */
+export function presentValuesClause<T>(
+  field: string,
+  records: readonly T[],
+  valueFor: (record: T) => string | undefined,
+): string {
+  return `values present for ${field}: ${listPresent(breakdown(records, valueFor))}`;
+}
+
+/**
+ * The zero-hit clause for `street_name_contains`: `street names present: "a",
+ * "b" and N more`, names only, by record count, from the records before the
+ * street filter; `street names present: none` when no record carries one.
+ */
+export function streetNamesPresentClause<T>(
+  records: readonly T[],
+  locationOf: LocationOf<T>,
+): string {
+  const names = streetNames(records, locationOf);
+  return `street names present: ${names.length > 0 ? listPresent(names) : 'none'}`;
+}
+
+/** The zero-hit sentence for a non-empty area: `No {noun} matched the filters; {clause}; {clause}.` */
+export function noFilterMatchNote(noun: string, clauses: readonly string[]): string {
+  return `No ${noun} matched the filters; ${clauses.join('; ')}.`;
+}
+
+/**
+ * When the matched records carry more than one street name: `street_name_contains
+ * matched N street names: "a", "b" and N more.`, by record count, listed as the
+ * zero-hit clauses are. Undefined for one name or none.
+ */
+export function matchedStreetsNote<T>(
+  matched: readonly T[],
+  locationOf: LocationOf<T>,
+): string | undefined {
+  const names = streetNames(matched, locationOf);
+  if (names.length < 2) return;
+  return `street_name_contains matched ${names.length} street names: ${listPresent(names)}.`;
 }
 
 /** An offset past the end, or the range a page shows and where the next one starts. */

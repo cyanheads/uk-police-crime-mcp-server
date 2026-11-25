@@ -46,7 +46,7 @@ Street-level crime, police outcomes, and stop and search records from [data.poli
 
 ### `ukcrime_list_reference` <sub>tool</sub>
 
-- `topic`: `forces`, `categories`, `availability`, or `neighbourhoods` (needs `force`); `name_contains` filters forces and neighbourhoods by name, and `month` narrows `availability` to one row
+- `topic`: `forces`, `categories`, `availability`, or `neighbourhoods` (needs `force`); `name_contains` filters forces and neighbourhoods by name (words in any order, part of a word included, `&` read as `and`), and `month` narrows `availability` to one row
 - `availability` returns `latest_month`, `earliest_month`, and which forces published stop and search each month; with `force`, the months that force did and did not publish
 - `forces` includes British Transport Police (`btp`) and each force's known coverage `gaps`; typed errors: `force_required`, `unknown_force`, `invalid_filter`
 
@@ -55,6 +55,7 @@ Street-level crime, police outcomes, and stop and search records from [data.poli
 ### `ukcrime_search_crimes` <sub>tool</sub>
 
 - `area`: `point` (`lat`, `lng`; a 1-mile radius), `polygon` (3–2,500 vertices), `location` (`location_id`), `neighbourhood` (`force` + `neighbourhood_id`), or `force_unplaced` (`force`: the crimes it could not place); optional `month` (default: latest published), `month_from` (a range of up to 12 months ending at `month`), and `category` (default: every category)
+- `outcome` keeps crimes by latest police outcome name, as `by_outcome` lists it (`(not recorded)` for crimes with none); `street_name_contains` keeps crimes on matching streets (words in any order, part of a word included: `Granby St` finds Granby Street; the notice names the streets when several match; not allowed with `force_unplaced`). Both narrow the counts and the page together, and `unfiltered_total` keeps the count before them
 - Returns `total`, `by_category`, `by_outcome`, up to 10 `top_locations`, and a page of `crimes` with the `persistent_id` that `ukcrime_get_crime_outcomes` takes; `limit` defaults to 25, accepts 1–10,000 and applies at most 200, echoed as `cap`; `next_offset` continues
 - With `month_from`, the totals, breakdowns and `top_locations` cover the range, `by_month` gives each month's total, and rows page across it, oldest month first
 - Failures carry a typed `reason`, such as `month_not_published`, `unknown_category`, or `area_too_large`; a range that cannot be fetched whole in one call fails `range_incomplete` (call again: fetched months stay cached) or `range_too_large`
@@ -64,6 +65,7 @@ Street-level crime, police outcomes, and stop and search records from [data.poli
 ### `ukcrime_search_outcomes` <sub>tool</sub>
 
 - Same areas as `ukcrime_search_crimes` except `force_unplaced`; `month` selects the outcome data published for that month, and `category` counts only outcomes for crimes in that category
+- `outcome` keeps outcomes by code (`cautioned`) or name (`Offender given a caution`), and `street_name_contains` by the street of the crime, as on `ukcrime_search_crimes`; they narrow the counts and the page together with `category`
 - Each outcome keeps its own `month`, which can differ from the month searched, and a crime's earlier steps can be missing from the search; `ukcrime_get_crime_outcomes` gives one crime's full sequence
 - Returns `total`, `unfiltered_total`, `by_category` (crime category and count), `by_outcome` (code, name, count), `by_crime_month`, and a page of `outcomes`, each with its crime; `limit` defaults to 20, accepts 1–10,000 and applies at most 200, echoed as `cap`
 - Police outcomes only: court results are not published, and the result says when a force publishes no outcomes
@@ -85,6 +87,7 @@ Street-level crime, police outcomes, and stop and search records from [data.poli
 - Returns `total`, `unfiltered_total`, `unplaced`, `force_published` (whether every force found for the area — the one it names, or those located at a point, a polygon's centre and outermost vertices, or a location's map point — published stop and search that month, or every month of a range), a breakdown per filterable field, and a page of `stops`; `limit` defaults to 15, accepts 1–10,000 and applies at most 200, echoed as `cap`
 - With `month_from`, `by_month` gives each month's total and its own `force_published`, so a month a force skipped reads as a gap, not a drop; the notice lists the months each force skipped
 - Filters narrow breakdowns and page together, in every month of a range: filter one field and read another's breakdown for a cross-tab
+- `street_name_contains` keeps stops on matching streets, as on `ukcrime_search_crimes`; stops with no location never match, so `unplaced` reads 0 under it
 - A published `outcome: false` is `Nothing found`; blank, null or absent outcomes remain `(not recorded)`, independently of the find-rate flag
 
 ---
@@ -121,6 +124,7 @@ Agent-friendly output:
 - Only the latest 36 months are served; longer trends need the bulk archive at data.police.uk, which this server does not read
 - A range covers at most 12 months, and `ukcrime_search_outcomes` takes one month at a time: an outcomes month not recently asked for can take data.police.uk 10–53 s to answer
 - Greater Manchester Police publishes no crime, outcome or stop and search data; searches there return only other forces' or British Transport Police records
+- British Transport Police has sent no crime data since 2025-02, and Gloucestershire Constabulary no crime or outcome data since 2026-02; area searches never locate British Transport Police, so a search near a station carries no note for it
 - Northern Ireland has no outcomes and no stop and search, and every crime other than anti-social behaviour carries the placeholder outcome `Under investigation`
 - Court outcomes from June 2019 onward are not published
 - data.police.uk can refuse an area holding more than about 10,000 records, whatever the category, and the point radius is fixed at one mile; dense city centres need polygons smaller than a borough
@@ -205,7 +209,7 @@ MCP_TRANSPORT_TYPE=http MCP_HTTP_PORT=3010 bun run start:http
 
 ### Prerequisites
 
-- [Bun v1.4.0](https://bun.sh/) or higher (or Node.js v24+).
+- [Bun v1.4.4](https://bun.sh/) or higher (or Node.js v24+).
 - No API key: data.police.uk is open and keyless.
 
 ### Installation
@@ -230,7 +234,7 @@ bun install
 
 ## Configuration
 
-The server reads no environment variables of its own. It paces requests process-wide under data.police.uk's limit of 15 per second (burst 30); calls queue for their turn. When data.police.uk rate-limits the server, a `Retry-After` that leaves the call time for another attempt is waited out there; a longer one, or a rate limit that outlasts the retries, fails the call as `rate_limited`, naming the wait. A busy queue in this server fails as `pacer_shed`, an outage as `upstream_unavailable`, and a call that runs out of time as `retry_deadline_exceeded`; all four are retryable, and the hint names the wait when one is known.
+The server reads no environment variables of its own. It paces requests process-wide under data.police.uk's rate limit, undocumented and measured at about 3 requests a second; calls queue for their turn. When data.police.uk rate-limits the server, a `Retry-After` that leaves the call time for another attempt is waited out there; a longer one, or a rate limit that outlasts the retries, fails the call as `rate_limited`, naming the wait. A busy queue in this server fails as `pacer_shed`, an outage as `upstream_unavailable`, and a call that runs out of time as `retry_deadline_exceeded`; all four are retryable, and the hint names the wait when one is known.
 
 | Variable | Description | Default |
 |:---|:---|:---|

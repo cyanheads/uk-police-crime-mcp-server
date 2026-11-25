@@ -178,12 +178,12 @@ const OutputSchema = z.object({
       z
         .object({
           persistent_id: z.string().describe('The persistent id.'),
-          error: z.string().describe('Why the lookup failed upstream.'),
+          error: z.string().describe('Why the lookup failed.'),
         })
         .describe('One failed lookup.'),
     )
     .describe(
-      'Ids whose lookup still failed after retries for a reason other than a missing crime (outage, timeout, rate limit). Empty when none.',
+      "Ids whose lookup failed for a reason other than a missing crime: an upstream failure, or a lookup never sent because this server's queue was full or the call ran out of time first. Empty when none.",
     ),
   guidance: z
     .string()
@@ -334,7 +334,7 @@ export const getCrimeOutcomesTool = tool('ukcrime_get_crime_outcomes', {
     const [first] = failures;
     if (first && failures.length === results.length) throw allFailed(first.error, first.at);
     if (failures.length > 0) {
-      ctx.log.warning('Some crime outcome lookups failed upstream', {
+      ctx.log.warning('Some crime outcome lookups failed', {
         failed: failures.length,
         requested: results.length,
       });
@@ -343,7 +343,7 @@ export const getCrimeOutcomesTool = tool('ukcrime_get_crime_outcomes', {
     const guidance: string[] = [];
     if (remainingIds.length > 0)
       guidance.push(
-        `${remainingIds.length} ids remain unprocessed; call ukcrime_get_crime_outcomes again with remaining_ids as persistent_ids.`,
+        `This call left ${remainingIds.length} of these ids unprocessed; call ukcrime_get_crime_outcomes again with remaining_ids as persistent_ids.`,
       );
     if (notFound.length > 0) {
       guidance.push(
@@ -352,7 +352,7 @@ export const getCrimeOutcomesTool = tool('ukcrime_get_crime_outcomes', {
     }
     if (failed.length > 0) {
       guidance.push(
-        `${failed.length} lookups failed upstream; call ukcrime_get_crime_outcomes again with just those ids.`,
+        `Lookups failed for ${failed.length} of these ids; call ukcrime_get_crime_outcomes again with just those ids.`,
       );
     }
     return {

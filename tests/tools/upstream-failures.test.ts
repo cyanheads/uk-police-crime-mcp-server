@@ -16,7 +16,7 @@
 
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { runToolContract } from '@cyanheads/mcp-ts-core/testing';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { findNeighbourhoodTool } from '@/mcp-server/tools/definitions/find-neighbourhood.tool.js';
 import { getCrimeOutcomesTool } from '@/mcp-server/tools/definitions/get-crime-outcomes.tool.js';
 import { listReferenceTool } from '@/mcp-server/tools/definitions/list-reference.tool.js';
@@ -32,6 +32,7 @@ import {
   hang,
   jsonOk,
   locateBody,
+  locateBy,
   neighbourhoodDetailBody,
   networkError,
   plainNotFound,
@@ -39,6 +40,7 @@ import {
   rateLimited,
   rateLimitedUntil,
   STRADDLE_RING,
+  STRADDLE_SAMPLES,
   sequence,
   status,
   stopRecord,
@@ -380,7 +382,7 @@ describe('upstream failures that outlast the retries, on every tool', () => {
         },
       });
       expect(text(result)).toContain('ambiguous_neighbourhood');
-      expect(text(result)).toContain("'NX01', 'nx01'");
+      expect(text(result)).toContain("'`NX01`', '`nx01`'");
       expect(h.upstream.count(c.path)).toBe(0);
       expect(h.upstream.calls.filter((call) => call.path.endsWith('/boundary'))).toHaveLength(1);
     });
@@ -454,7 +456,7 @@ describe('upstream failures that outlast the retries, on every tool', () => {
         recovery: { hint: RATE_LIMITED_HINT(30) },
       });
       expect(text(result)).toContain(`Recovery: ${RATE_LIMITED_HINT(30)}`);
-      expect(text(result)).toContain('(reason rate_limited · retryable)');
+      expect(text(result)).toContain('(reason rate_limited · retryable · retry after `30`)');
       const [first, second] = h.upstream.callsTo(c.path);
       expect(h.upstream.count(c.path)).toBe(2);
       expect((second?.at ?? 0) - (first?.at ?? 0)).toBeGreaterThanOrEqual(30_000);
@@ -494,7 +496,8 @@ describe('upstream failures that outlast the retries, on every tool', () => {
       });
       expect(text(result)).toContain(`Recovery: ${RATE_LIMITED_HINT(44)}`);
       expect(h.upstream.count(c.path)).toBe(1);
-      expect(Date.now() - start).toBeLessThan(1000);
+      // At three starts a second, a call's fourth request (a crime search's area query) goes out a second in.
+      expect(Date.now() - start).toBeLessThan(2000);
     });
 
     it('carries the declared rate_limited hint, naming no figure, for a 429 with no Retry-After', async () => {
@@ -646,6 +649,154 @@ describe('upstream failures that outlast the retries, on every tool', () => {
     }
   });
 
+  describe("a 429 this server's pacer did not cause (Retry-After: 30)", () => {
+    it('skips the sample lookup it refuses and says so on both surfaces, without waiting it out', async () => {
+      h.upstream.route('POST', '/crimes-street/all-crime', jsonOk([crimeRecord()]));
+      h.upstream.route(
+        'GET',
+        '/locate-neighbourhood',
+        locateBy({
+          [STRADDLE_SAMPLES.centre]: 'greater-manchester',
+          [STRADDLE_SAMPLES.north]: 'greater-manchester',
+          [STRADDLE_SAMPLES.south]: 'cheshire',
+          // The last sample sent, so no other lookup waits behind the cooldown gate it closes.
+          [STRADDLE_SAMPLES.east]: rateLimited('30'),
+        }),
+      );
+      const start = Date.now();
+      const result = await settle(
+        runToolContract(searchCrimesTool, {
+          area: 'polygon',
+          polygon: STRADDLE_RING,
+          month: '2026-07',
+        }),
+      );
+      const note =
+        "The force at 1 of this polygon's 4 sample points could not be looked up, so the forces named here may not be all it falls in; search again to retry the lookup.";
+      expect(result.isError).toBeFalsy();
+      expect(result.structuredContent).toMatchObject({
+        total: 1,
+        notice: expect.stringContaining(note),
+      });
+      expect(text(result)).toContain(note);
+      const east = h.upstream
+        .callsTo('/locate-neighbourhood')
+        .filter((sent) => sent.query.get('q') === STRADDLE_SAMPLES.east);
+      expect(east).toHaveLength(1);
+      // The 429 closes the shared cooldown gate (15 s at most), which holds the area query; the lookup's 30 s is never waited.
+      expect(Date.now() - start).toBeLessThan(30_000);
+    });
+
+    it('waits out a range month refused with it, then fails range_incomplete; the months fetched stay cached and a repeat fetches only the rest', async () => {
+      // The first month is refused half a second in, after the second has gone out; every other month takes 2 s.
+      let requests = 0;
+      h.upstream.route('GET', '/crimes-no-location', (request) =>
+        ++requests === 1
+          ? delayed(500, rateLimited('30'))(request)
+          : delayed(2000, emptyArrayOk)(request),
+      );
+      const range = {
+        area: 'force_unplaced',
+        force: 'btp',
+        month_from: '2025-09',
+        month: '2026-08',
+      } as const;
+      const monthOf = (call: { query: URLSearchParams }) => call.query.get('date') ?? '';
+      const result = await settle(runToolContract(searchCrimesTool, range), STEP_MS);
+      const error = errorOf(result);
+      expect(error.code).toBe(JsonRpcErrorCode.Timeout);
+      expect(error.data).toMatchObject({ reason: 'range_incomplete', retryable: true });
+      expect(error.message).toContain('of the 12 months of 2025-09–2026-08');
+      expect(text(result)).toContain('(reason range_incomplete · retryable');
+      const firstCall = h.upstream.callsTo('/crimes-no-location');
+      const refusedMonth = firstCall[0] ? monthOf(firstCall[0]) : '';
+      const [refused, retry, ...more] = firstCall.filter((call) => monthOf(call) === refusedMonth);
+      expect(more).toEqual([]);
+      expect((retry?.at ?? 0) - (refused?.at ?? 0)).toBeGreaterThanOrEqual(30_000);
+      const fetched = new Set(firstCall.map(monthOf));
+      expect(fetched.size).toBeLessThan(12);
+
+      const repeat = await settle(runToolContract(searchCrimesTool, range), STEP_MS);
+      expect(repeat.isError, JSON.stringify(repeat.structuredContent)).toBeFalsy();
+      expect((repeat.structuredContent as { by_month: unknown[] }).by_month).toHaveLength(12);
+      const repeated = h.upstream
+        .callsTo('/crimes-no-location')
+        .slice(firstCall.length)
+        .map(monthOf);
+      expect(repeated.filter((month) => fetched.has(month))).toEqual([]);
+      expect(new Set([...fetched, ...repeated]).size).toBe(12);
+    });
+  });
+
+  describe('candidate ids a caller sends back verbatim', () => {
+    // A leading underscore is one the markdown escaper backslashes; a copied `\_NX01` would miss.
+    it('ambiguous_neighbourhood: raw ids in structuredContent, each candidate a code span in content[]', async () => {
+      h.upstream.route('GET', '/leicestershire/_Nx01/boundary', plainNotFound);
+      h.upstream.route(
+        'GET',
+        '/leicestershire/neighbourhoods',
+        jsonOk([
+          { id: '_NX01', name: 'A' },
+          { id: '_nx01', name: 'B' },
+        ]),
+      );
+      const result = await settle(
+        runToolContract(searchCrimesTool, {
+          area: 'neighbourhood',
+          force: 'leicestershire',
+          neighbourhood_id: '_Nx01',
+          month: '2026-07',
+        }),
+      );
+      const hint = "Send one of these exact neighbourhood ids: '_NX01', '_nx01'.";
+      expect(errorOf(result)).toMatchObject({
+        code: JsonRpcErrorCode.ValidationError,
+        message: `Neighbourhood '_Nx01' matches more than one id in force 'leicestershire'. ${hint}`,
+        data: { reason: 'ambiguous_neighbourhood', recovery: { hint } },
+      });
+      expect(text(result)).toContain(
+        "Send one of these exact neighbourhood ids: '`_NX01`', '`_nx01`'.",
+      );
+      // The id the caller sent is not one to send back; it stays escaped text.
+      expect(text(result)).toContain("Neighbourhood '\\_Nx01'");
+      expect(text(result)).not.toContain('\\_NX01');
+    });
+
+    it('unknown_force naming several forces: raw ids in structuredContent, each a code span in content[]', async () => {
+      h.upstream.route(
+        'GET',
+        '/forces',
+        jsonOk([
+          { id: '_northshire', name: 'Southshire Police' },
+          { id: '_southshire', name: 'Southshire Constabulary' },
+        ]),
+      );
+      const result = await settle(
+        runToolContract(searchCrimesTool, {
+          area: 'force_unplaced',
+          force: 'Southshire Police',
+          month: '2026-07',
+        }),
+      );
+      expect(errorOf(result)).toMatchObject({
+        code: JsonRpcErrorCode.ValidationError,
+        message:
+          "'southshire-police' matches more than one police force: '_northshire', '_southshire'; send one of their ids.",
+        data: {
+          reason: 'unknown_force',
+          recovery: {
+            hint: "Call ukcrime_list_reference with topic 'forces' for valid force ids such as 'leicestershire'.",
+          },
+        },
+      });
+      expect(text(result)).toContain(
+        "matches more than one police force: '`_northshire`', '`_southshire`'; send one of their ids.",
+      );
+      expect(text(result)).not.toContain('\\_northshire');
+      expect(h.upstream.count('/crimes-no-location')).toBe(0);
+    });
+  });
+
   it('ukcrime_list_reference: waits out a Retry-After that fits and answers', async () => {
     h.upstream.route('GET', '/forces', sequence(rateLimited('30'), jsonOk(forcesBody())));
     const result = await settle(runToolContract(listReferenceTool, { topic: 'forces' }), STEP_MS);
@@ -679,7 +830,39 @@ describe('upstream failures that outlast the retries, on every tool', () => {
       recovery: { hint: SHED_HINT(retryAfter) },
     });
     expect(text(result)).toContain(`Recovery: ${SHED_HINT(retryAfter)}`);
-    expect(text(result)).toContain('(reason pacer_shed · retryable)');
+    expect(text(result)).toContain(`(reason pacer_shed · retryable · retry after ${retryAfter})`);
     expect(JSON.stringify(result)).not.toContain('data-police-uk');
+  });
+
+  it('ukcrime_search_crimes: the shed search, called again with the same input once its retryAfter has passed, answers on one request', async () => {
+    h.upstream.route('GET', '/locate-neighbourhood', jsonOk(locateBody()));
+    h.upstream.route('GET', '/crimes-street/all-crime', delayed(25_000, emptyArrayOk));
+    const inputs = [0, 1, 2, 3].map((i) => ({ ...POINT, lat: 52.6 + i / 100 }));
+    const results = await settle(
+      Promise.all(inputs.map((input) => runToolContract(searchCrimesTool, input))),
+      STEP_MS,
+    );
+    expect(results.filter((result) => result.isError)).toHaveLength(1);
+    const shedAt = results.findIndex((result) => result.isError);
+    const error = errorOf(results[shedAt] as Result);
+    expect(error.data.reason).toBe('pacer_shed');
+    const shedInput = inputs[shedAt] as (typeof inputs)[number];
+    const lat = shedInput.lat.toFixed(6);
+    const areaRequestsAtLat = () =>
+      h.upstream
+        .callsTo('/crimes-street/all-crime')
+        .filter((sent) => sent.query.get('lat') === lat);
+    expect(areaRequestsAtLat()).toEqual([]);
+
+    await vi.advanceTimersByTimeAsync((error.data.retryAfter as number) * 1000);
+    h.upstream.route('GET', '/crimes-street/all-crime', jsonOk([crimeRecord()]));
+    const sentBefore = h.upstream.calls.length;
+    const again = await settle(runToolContract(searchCrimesTool, shedInput), STEP_MS);
+    expect(again.isError, JSON.stringify(again.structuredContent)).toBeFalsy();
+    expect(again.structuredContent).toMatchObject({ total: 1, crimes: [{ id: '100000001' }] });
+    expect(
+      h.upstream.calls.slice(sentBefore).map((sent) => `${sent.path} lat=${sent.query.get('lat')}`),
+    ).toEqual([`/crimes-street/all-crime lat=${lat}`]);
+    expect(areaRequestsAtLat()).toHaveLength(1);
   });
 });

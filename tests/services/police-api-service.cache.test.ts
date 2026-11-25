@@ -165,7 +165,12 @@ describe('PoliceApiService caches', () => {
     }) {
       const { cap, pathOf, register, call } = options;
       for (let i = 0; i <= cap; i++) register(i);
-      await settle(Promise.all(Array.from({ length: cap }, (_, i) => call(i))));
+      // Three requests start a second, so the fill goes in batches of 30: ten seconds of starts, inside the pacer's 20 s wait.
+      for (let start = 0; start < cap; start += 30) {
+        await settle(
+          Promise.all(Array.from({ length: Math.min(30, cap - start) }, (_, k) => call(start + k))),
+        );
+      }
       for (let i = 0; i < cap; i++) expect(h.upstream.count(pathOf(i))).toBe(1);
 
       await settle(call(0)); // hit: entry 0 becomes the most recently used
@@ -229,12 +234,12 @@ describe('PoliceApiService caches', () => {
       const point = (i: number) => [50 + i * 1e-5, -1] as const;
       const locate = (i: number) => h.service.locate(...point(i), h.ctx, h.budget());
 
-      // 15 requests start per second, so batch in fifteens and let the pacer window turn over.
+      // Three requests start a second, so batch in fifteens, each batch five seconds of starts, settled in 5 s steps.
       for (let start = 0; start < 10_001; start += 15) {
         const batch = Array.from({ length: Math.min(15, 10_001 - start) }, (_, k) =>
           locate(start + k),
         );
-        await settle(Promise.all(batch), 1000);
+        await settle(Promise.all(batch), 5000);
       }
       expect(h.upstream.count('/locate-neighbourhood')).toBe(10_001);
 

@@ -217,6 +217,189 @@ describe('ukcrime_search_crimes over a month range', () => {
     });
   });
 
+  describe('the result shape over a range', () => {
+    const twoMonths = () => {
+      h.upstream.route(
+        'GET',
+        STREET,
+        perMonth({
+          '2026-07': jsonOk(crimesIn('2026-07', 1)),
+          '2026-08': jsonOk(crimesIn('2026-08', 1)),
+        }),
+      );
+      locates();
+    };
+    const RANGE = { ...POINT, month_from: '2026-07', month: '2026-08' } as const;
+
+    it('carries the one-month keys plus month_from and by_month', async () => {
+      twoMonths();
+      const result = await call(RANGE);
+      expect(Object.keys(result.structuredContent ?? {}).sort()).toEqual([
+        'area',
+        'attribution',
+        'by_category',
+        'by_month',
+        'by_outcome',
+        'cap',
+        'category',
+        'crimes',
+        'data_note',
+        'month',
+        'month_from',
+        'shown',
+        'top_locations',
+        'total',
+        'truncated',
+      ]);
+    });
+
+    it.each<[string, unknown]>([
+      ['outcome', ''],
+      ['outcome', null],
+      ['street_name_contains', '  '],
+      ['street_name_contains', null],
+    ])(
+      'reads %s %j as unset over a range: output byte-identical to leaving it out',
+      async (field, value) => {
+        twoMonths();
+        const absent = await call(RANGE);
+        const blank = await call({ ...RANGE, [field]: value } as Input);
+        expect(JSON.stringify(blank.structuredContent)).toBe(
+          JSON.stringify(absent.structuredContent),
+        );
+        expect(text(blank)).toBe(text(absent));
+      },
+    );
+  });
+
+  describe('outcome and street_name_contains over a range', () => {
+    const granby = wireLocation(1_000_101, 'On or near Granby Street', '52.634400', '-1.131600');
+    const other = wireLocation(1_000_102, 'On or near Highcross Street', '52.635400', '-1.131600');
+    const CAUTION = { category: 'Offender given a caution', date: '2026-08' };
+    const crimeAt = (month: string, i: number, location: unknown, outcome: unknown = CAUTION) =>
+      crimeRecord({
+        month,
+        id: Number(month.replace('-', '')) * 1000 + i,
+        location,
+        outcome_status: outcome,
+      });
+    /** Six crimes, 2026-06..2026-08: three cautioned, three with no outcome; three on Granby Street. 2026-07 holds one uncautioned crime off Granby Street. */
+    const routeMonths = () => {
+      h.upstream.route(
+        'GET',
+        STREET,
+        perMonth({
+          '2026-06': jsonOk([
+            crimeAt('2026-06', 0, granby),
+            crimeAt('2026-06', 1, other, null),
+            crimeAt('2026-06', 2, granby, null),
+          ]),
+          '2026-07': jsonOk([crimeAt('2026-07', 0, other, null)]),
+          '2026-08': jsonOk([crimeAt('2026-08', 0, granby), crimeAt('2026-08', 1, other)]),
+        }),
+      );
+      locates();
+    };
+    const RANGE = { ...POINT, month_from: '2026-06', month: '2026-08' } as const;
+
+    it('outcome narrows each month, so by_month sums to total; a month at zero only after the filter gets no zero-month line; the page runs across months', async () => {
+      routeMonths();
+      const result = await call({ ...RANGE, outcome: 'Offender given a caution', limit: 2 });
+      const out = data(result);
+      expect(out.by_month).toEqual([
+        { month: '2026-06', total: 1 },
+        { month: '2026-07', total: 0 },
+        { month: '2026-08', total: 2 },
+      ]);
+      expect([out.total, out.unfiltered_total]).toEqual([3, 6]);
+      expect(out.by_month?.reduce((sum, row) => sum + row.total, 0)).toBe(out.total);
+      expect(out.crimes.map((crime) => crime.id)).toEqual(['202606000', '202608000']);
+      expect(out.next_offset).toBe(2);
+      expect(out.notice).toBe('Showing 1–2 of 3; call again with offset 2 for more.');
+      expect(text(result)).toContain('| 2026-07 | 0 |');
+      const next = data(
+        await call({ ...RANGE, outcome: 'Offender given a caution', limit: 2, offset: 2 }),
+      );
+      expect(next.crimes.map((crime) => crime.id)).toEqual(['202608001']);
+      expect(h.upstream.count(STREET)).toBe(3);
+    });
+
+    it('street_name_contains narrows each month the same way, with no zero-month line for a month the area did return', async () => {
+      routeMonths();
+      const out = data(await call({ ...RANGE, street_name_contains: 'Granby St' }));
+      expect(out.by_month?.map((row) => row.total)).toEqual([2, 0, 1]);
+      expect([out.total, out.unfiltered_total]).toEqual([3, 6]);
+      expect(out.notice).toBeUndefined();
+    });
+
+    it('still flags a month the area itself returned empty, and only that month, whatever the filters', async () => {
+      h.upstream.route(
+        'GET',
+        STREET,
+        perMonth({
+          '2026-06': jsonOk([crimeAt('2026-06', 0, granby), crimeAt('2026-06', 1, other, null)]),
+          '2026-07': jsonOk([]),
+          '2026-08': jsonOk([crimeAt('2026-08', 0, other, null)]),
+        }),
+      );
+      locates();
+      const result = await call({
+        ...RANGE,
+        outcome: 'Offender given a caution',
+        street_name_contains: 'granby',
+      });
+      const out = data(result);
+      expect(out.by_month?.map((row) => row.total)).toEqual([1, 0, 0]);
+      expect(out.notice).toBe(
+        'Nothing recorded here in 2026-07. A force can miss a month the API still lists as published (https://data.police.uk/changelog/), so a month at zero may be missing data rather than no crime.',
+      );
+      expect(text(result)).toContain(`> ${out.notice}`);
+    });
+
+    it.each<[string, Record<string, string>, string]>([
+      [
+        'outcome',
+        { outcome: 'cautioned' },
+        'values present for outcome: "(not recorded)", "Offender given a caution"',
+      ],
+      [
+        'street_name_contains',
+        { street_name_contains: 'theatre' },
+        'street names present: "Highcross Street", "Granby Street"',
+      ],
+    ])(
+      'still flags a month the area returned empty when %s matches nothing in any month, before the zero-hit sentence',
+      async (_field, filter, present) => {
+        h.upstream.route(
+          'GET',
+          STREET,
+          perMonth({
+            '2026-06': jsonOk([crimeAt('2026-06', 0, granby), crimeAt('2026-06', 1, other, null)]),
+            '2026-07': jsonOk([]),
+            '2026-08': jsonOk([crimeAt('2026-08', 0, other, null)]),
+          }),
+        );
+        locates();
+        const result = await call({ ...RANGE, ...filter });
+        const out = data(result);
+        expect(out.by_month?.map((row) => row.total)).toEqual([0, 0, 0]);
+        expect([out.total, out.unfiltered_total]).toEqual([0, 3]);
+        const note = `Nothing recorded here in 2026-07. A force can miss a month the API still lists as published (https://data.police.uk/changelog/), so a month at zero may be missing data rather than no crime. No crimes matched the filters; ${present}.`;
+        expect(out.notice).toBe(note);
+        expect(text(result)).toContain(`> ${note}`);
+      },
+    );
+
+    it('on a zero over the range, the values present are read from every month', async () => {
+      routeMonths();
+      const out = data(await call({ ...RANGE, outcome: 'cautioned' }));
+      expect(out.by_month?.map((row) => row.total)).toEqual([0, 0, 0]);
+      expect(out.notice).toBe(
+        'No crimes matched the filters; values present for outcome: "(not recorded)", "Offender given a caution".',
+      );
+    });
+  });
+
   describe('a range at a point', () => {
     /** 2025-09..2026-08, with nothing recorded in 2025-10. */
     const COUNTS: Readonly<Record<string, number>> = {
@@ -406,7 +589,7 @@ describe('ukcrime_search_crimes over a month range', () => {
     });
 
     it('orders months and rows oldest first when a later month lands first', async () => {
-      // 2026-07 lands at 1 s and 2026-08, sent then, at 2 s; 2026-06 lands last, at 5 s.
+      // Counted from the first month sent: 2026-07 lands at 1 s and 2026-08, sent then, at 2 s; 2026-06 lands last, at 5 s.
       h.upstream.route(
         'GET',
         STREET,
@@ -417,10 +600,14 @@ describe('ukcrime_search_crimes over a month range', () => {
         }),
       );
       locates();
-      const start = Date.now();
       const result = await call({ ...POINT, month_from: '2026-06', month: '2026-08' });
       const out = data(result);
-      expect(h.upstream.callsTo(STREET).map((sent) => sent.at - start)).toEqual([0, 0, 1000]);
+      // The window's first three starts go to the call's reference reads and its locate, so the months go out a window later.
+      const sent = h.upstream.callsTo(STREET);
+      const first = Math.min(...sent.map((request) => request.at));
+      expect(
+        Object.fromEntries(sent.map((request) => [request.query.get('date'), request.at - first])),
+      ).toEqual({ '2026-06': 0, '2026-07': 0, '2026-08': 1000 });
       expect(out.by_month).toEqual([
         { month: '2026-06', total: 1 },
         { month: '2026-07', total: 1 },
@@ -457,14 +644,32 @@ describe('ukcrime_search_crimes over a month range', () => {
       expect(out.area).toMatchObject({ located_forces: ['leicestershire'] });
     });
 
-    it('polygon: two months and two sample lookups go out at once, together filling the pacer without waiting on it', async () => {
-      h.upstream.route('POST', STREET, delayed(3000, emptyArrayOk));
-      h.upstream.route('GET', '/locate-neighbourhood', delayed(1000, jsonOk(locateBody())));
-      const start = Date.now();
+    it("polygon: two months and two sample lookups are in flight together, filling the pacer's four slots, and each later pair of months goes out as the pair before it lands", async () => {
+      let inFlight = 0;
+      let peak = 0;
+      const counted =
+        (respond: Responder): Responder =>
+        async (request) => {
+          inFlight += 1;
+          peak = Math.max(peak, inFlight);
+          try {
+            return await respond(request);
+          } finally {
+            inFlight -= 1;
+          }
+        };
+      h.upstream.route('POST', STREET, counted(delayed(3000, emptyArrayOk)));
+      h.upstream.route(
+        'GET',
+        '/locate-neighbourhood',
+        counted(delayed(1000, jsonOk(locateBody()))),
+      );
       data(await call({ area: 'polygon', polygon: RING, month_from: '2026-03', month: '2026-08' }));
-      const sentAt = (path: string) => h.upstream.callsTo(path).map((sent) => sent.at - start);
-      expect(sentAt(STREET)).toEqual([0, 0, 3000, 3000, 6000, 6000]);
-      expect(sentAt('/locate-neighbourhood').slice(0, 2)).toEqual([0, 0]);
+      // The window starts three requests a second, so the four never start at once; once out, the months never wait on the pacer.
+      const months = h.upstream.callsTo(STREET).map((sent) => sent.at);
+      const first = Math.min(...months);
+      expect(months.map((at) => at - first)).toEqual([0, 0, 3000, 3000, 6000, 6000]);
+      expect(peak).toBe(4);
     });
 
     it('polygon: a partial located set gets the partial fragment once and keeps the generic zero line for the range', async () => {
@@ -491,7 +696,11 @@ describe('ukcrime_search_crimes over a month range', () => {
       expect(out.area.located_forces).toEqual(['greater-manchester']);
       expect(out.notice).toBe(
         [
-          ...coverageNotes('greater-manchester', ['crime', 'locations', 'asb']),
+          ...coverageNotes(
+            'greater-manchester',
+            ['crime', 'locations', 'asb'],
+            ['2026-06', '2026-07', '2026-08'],
+          ),
           "The force at 2 of this polygon's 4 sample points could not be looked up, so the forces named here may not be all it falls in; search again to retry the lookup.",
           "Nothing recorded here in 2026-06–2026-08. A force can miss a month the API still lists as published (https://data.police.uk/changelog/); try another month, a wider area, or area 'force_unplaced' for crimes the force could not place.",
         ].join(' '),
@@ -762,15 +971,20 @@ describe('ukcrime_search_crimes over a month range', () => {
       const short = (fetched: number, first: string) =>
         `This call ran short of time after fetching ${fetched} of the 12 months of 2025-09–2026-08; ${first} is the earliest month it did not fetch. The months fetched stay cached for 15 minutes, so a repeat call fetches only the rest.`;
       /**
-       * Three area slots, 17 s a month, a 50 s budget: three months go out at 0 s
-       * and the fourth waits. At 17 s it goes out with 33 s left, beside two of the
-       * three months the landed ones start; the third reaches a slot at 34 s with
-       * 16 s left, short of one 30 s attempt, and is never sent.
+       * Three area slots, 17 s a month, a 50 s budget. The window starts three
+       * requests a second, shared with each call's first reference reads and its
+       * locate, so three months go out within the first 2 s and the fourth waits.
+       * As each slot frees, 17 s after its month went out, a waiting month takes
+       * it at once with over 30 s left: the fourth, then two of the three months
+       * the landed ones start. The third would reach a slot past 34 s, short of
+       * one 30 s attempt, and is never sent: no month goes out after 20 s.
        */
       const sent = h.upstream.callsTo(STREET);
-      expect(sent.map((request) => request.at - start).sort((a, b) => a - b)).toEqual([
-        0, 0, 0, 17000, 17000, 17000,
-      ]);
+      const sentAt = sent.map((request) => request.at - start).sort((a, b) => a - b);
+      expect(sentAt).toHaveLength(6);
+      expect(Math.max(...sentAt.slice(0, 3))).toBeLessThanOrEqual(2000);
+      expect(sentAt.slice(3)).toEqual(sentAt.slice(0, 3).map((at) => at + 17_000));
+      expect(Math.max(...sentAt)).toBeLessThanOrEqual(20_000);
       /**
        * Which months get those slots is not fixed: months queued at one instant
        * take them in the order their native cache-key digests finish, so either
@@ -880,7 +1094,7 @@ describe('ukcrime_search_crimes over a month range', () => {
   });
 
   describe('months in flight beside other calls', () => {
-    it('leaves an area slot free: a single-month call issued while a 12-month range runs is sent at once, not queued behind the range', async () => {
+    it('leaves an area slot free: a single-month call issued while a 12-month range runs is sent within one window of its issue, not queued behind the range', async () => {
       h.upstream.route('GET', STREET, delayed(3000, emptyArrayOk));
       locates();
       const start = Date.now();
@@ -910,10 +1124,19 @@ describe('ukcrime_search_crimes over a month range', () => {
           .callsTo(STREET)
           .filter((sent) => sent.query.get('lat') === lat)
           .map((sent) => sent.at - start);
-      expect(sentAt('52.700000')).toEqual([1000]);
+      const singleSent = sentAt('52.700000');
+      expect(singleSent).toHaveLength(1);
+      const singleAt = singleSent[0] ?? Number.NaN;
       const rangeSent = sentAt('52.610000');
       expect(rangeSent).toHaveLength(12);
-      expect(Math.max(...rangeSent)).toBeGreaterThan(1000);
+      /**
+       * Issued at 1 s, it waits at most one window: the window's starts then go to
+       * the range's two months and its own locate. Queued behind the range's area
+       * slots, it would wait for a month to land, 3 s after the first went out.
+       */
+      expect(singleAt).toBeLessThanOrEqual(2000);
+      expect(singleAt).toBeLessThan(Math.min(...rangeSent) + 3000);
+      expect(Math.max(...rangeSent)).toBeGreaterThan(singleAt);
     });
   });
 });

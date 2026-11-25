@@ -1,17 +1,28 @@
 /**
  * @fileoverview Static per-force coverage facts the API cannot express, read
- * from data.police.uk's Known Issues sections and API documentation, and the
+ * from data.police.uk's changelog (its Known Issues section and its monthly
+ * release notes), its About page and its API documentation, and the
  * coverage-notes helper — the only path by which a fact reaches a caller, always
- * with the table's verified date attached. Stop-and-search publication is never
- * recorded here: it is read live from `/crimes-street-dates`.
+ * with the table's verified date attached. A fact can start at a month
+ * (`fromMonth`, for a force that stopped sending a kind of data), and then
+ * applies only to searches reaching that month or later. Stop-and-search
+ * publication is never recorded here: it is read live from `/crimes-street-dates`.
  *
- * Refresh on every maintenance release: re-read the source pages, edit the
- * entries to match, and move {@link KNOWN_GAPS_VERIFIED} in the same commit.
+ * Refresh on every maintenance release: re-read the source pages — the
+ * changelog's Known Issues and every monthly release note since the last
+ * refresh (their "Crime data not provided" lines), the About page's Q&A and the
+ * outcomes API docs — then confirm each entry with a live area query in its
+ * force: a month the entry covers and, for a dated entry, the month before its
+ * `fromMonth`. The release notes miss refreshes, so a month they list as not
+ * provided may since have been published. A force missing a single month gets no
+ * entry (the zero-hit notices carry that caveat); one that has sent nothing for
+ * every month since some month gets a dated entry. Edit the entries to match and
+ * move {@link KNOWN_GAPS_VERIFIED} in the same commit.
  * @module services/police-api/known-gaps
  */
 
 /** Date (YYYY-MM-DD) the whole table was last checked against its sources. */
-export const KNOWN_GAPS_VERIFIED = '2026-10-01';
+export const KNOWN_GAPS_VERIFIED = '2026-11-25';
 
 /** Past this age, startup logs a warning that the table needs a refresh. */
 export const KNOWN_GAPS_MAX_AGE_DAYS = 180;
@@ -24,19 +35,22 @@ export interface KnownGap {
   readonly aspect: KnownGapAspect;
   /** data.police.uk force id (`btp` for British Transport Police). */
   readonly force: string;
-  /** The force publishes none of this aspect's data, so a zero count there is the gap itself, not a measurement. */
+  /** First month (YYYY-MM) the fact holds, and every later month with it; absent when it holds for every month. */
+  readonly fromMonth?: string;
+  /** The force publishes none of this aspect's data (from `fromMonth` on, when set), so a zero count there is the gap itself, not a measurement. */
   readonly nothingPublished?: true;
   /** The data.police.uk page the fact was read from. */
   readonly source: string;
-  /** One sentence, no closing period; the helper appends the dated attribution. */
+  /** One sentence, no closing period, naming `fromMonth` when set; the helper appends the dated attribution. */
   readonly text: string;
 }
 
 const CHANGELOG_KNOWN_ISSUES = 'https://data.police.uk/changelog/#known-issues';
+const CHANGELOG_RELEASE_NOTES = 'https://data.police.uk/changelog/';
 const ABOUT_KNOWN_ISSUES = 'https://data.police.uk/about/#qa';
 const OUTCOMES_API_DOCS = 'https://data.police.uk/docs/method/outcomes-at-location/';
 
-/** The table. Read it through {@link coverageNotes} or {@link forceGaps}, never directly. */
+/** The table. Read it through {@link coverageNotes}, {@link publishesNothing} or {@link forceGaps}, never directly. */
 export const KNOWN_GAPS: readonly KnownGap[] = [
   {
     force: 'greater-manchester',
@@ -50,6 +64,22 @@ export const KNOWN_GAPS: readonly KnownGap[] = [
     aspect: 'outcomes',
     text: 'Greater Manchester Police publishes no outcome data to data.police.uk, so outcome counts there do not measure police outcomes',
     source: CHANGELOG_KNOWN_ISSUES,
+    nothingPublished: true,
+  },
+  {
+    force: 'gloucestershire',
+    aspect: 'crime',
+    fromMonth: '2026-02',
+    text: 'Gloucestershire Constabulary has sent no crime data to data.police.uk since 2026-02, so its crime counts from that month on do not measure crime',
+    source: CHANGELOG_RELEASE_NOTES,
+    nothingPublished: true,
+  },
+  {
+    force: 'gloucestershire',
+    aspect: 'outcomes',
+    fromMonth: '2026-02',
+    text: 'Gloucestershire Constabulary has sent no outcome data to data.police.uk since 2026-02, so its outcome counts from that month on do not measure police outcomes',
+    source: CHANGELOG_RELEASE_NOTES,
     nothingPublished: true,
   },
   {
@@ -74,8 +104,17 @@ export const KNOWN_GAPS: readonly KnownGap[] = [
   {
     force: 'avon-and-somerset',
     aspect: 'locations',
-    text: 'Avon and Somerset Constabulary sends about 2,000 crimes a month without coordinates, so area searches there undercount',
+    // No figure: Known Issues states about 2,000 a month, while `/crimes-no-location` measured 705 (2026-08) and 662 (2026-09); `force_unplaced` gives any month's count.
+    text: 'Avon and Somerset Constabulary sends some crimes each month without coordinates, so area searches there undercount its crimes and their outcomes',
     source: CHANGELOG_KNOWN_ISSUES,
+  },
+  {
+    force: 'btp',
+    aspect: 'crime',
+    fromMonth: '2025-02',
+    text: 'British Transport Police has sent no crime data to data.police.uk since 2025-02, so its crime counts from that month on do not measure crime',
+    source: CHANGELOG_RELEASE_NOTES,
+    nothingPublished: true,
   },
   {
     force: 'btp',
@@ -95,36 +134,56 @@ export const KNOWN_GAPS: readonly KnownGap[] = [
 
 const ATTRIBUTION = `(data.police.uk known issues, verified ${KNOWN_GAPS_VERIFIED})`;
 
+const render = (gap: KnownGap): string => `${gap.text} ${ATTRIBUTION}.`;
+
 /**
- * The coverage-notes helper: a force's table facts, optionally narrowed to some
- * aspects, each rendered as a sentence ending with the table's verified date.
- * Empty when the table holds nothing for the force.
+ * The coverage-notes helper: a force's table facts for some aspects that apply
+ * to a search of `months` (YYYY-MM, at least one), each rendered as a sentence
+ * ending with the table's verified date. An undated fact always applies; a dated
+ * one when any searched month is on or after its `fromMonth`. Empty when none
+ * applies.
  */
-export function coverageNotes(force: string, aspects?: readonly KnownGapAspect[]): string[] {
-  return KNOWN_GAPS.filter(
-    (gap) => gap.force === force && (aspects === undefined || aspects.includes(gap.aspect)),
-  ).map((gap) => `${gap.text} ${ATTRIBUTION}.`);
+export function coverageNotes(
+  force: string,
+  aspects: readonly KnownGapAspect[],
+  months: readonly string[],
+): string[] {
+  return KNOWN_GAPS.filter((gap) => {
+    if (gap.force !== force || !aspects.includes(gap.aspect)) return false;
+    const from = gap.fromMonth;
+    return from === undefined || months.some((month) => month >= from);
+  }).map(render);
 }
 
 /**
  * True when the table says every one of `forces` publishes none of the aspect's
- * data, so a zero count over them needs no explanation beyond their coverage
- * notes. False for an empty list, and when any force publishes some.
+ * data in every one of `months` (YYYY-MM, at least one), so a zero count over
+ * them needs no explanation beyond their coverage notes: a dated fact counts
+ * only when every month is on or after its `fromMonth`. False for an empty list,
+ * and when any force publishes some in any of the months.
  */
-export function publishesNothing(forces: readonly string[], aspect: KnownGapAspect): boolean {
+export function publishesNothing(
+  forces: readonly string[],
+  aspect: KnownGapAspect,
+  months: readonly string[],
+): boolean {
   return (
     forces.length > 0 &&
     forces.every((force) =>
-      KNOWN_GAPS.some(
-        (gap) => gap.force === force && gap.aspect === aspect && gap.nothingPublished === true,
-      ),
+      KNOWN_GAPS.some((gap) => {
+        if (gap.force !== force || gap.aspect !== aspect || gap.nothingPublished !== true) {
+          return false;
+        }
+        const from = gap.fromMonth;
+        return from === undefined || months.every((month) => month >= from);
+      }),
     )
   );
 }
 
-/** Every table fact for a force as one string (the `gaps` field), or `undefined` when none. */
+/** Every table fact for a force, whatever the month, as one string (the `gaps` field), or `undefined` when none. */
 export function forceGaps(force: string): string | undefined {
-  const notes = coverageNotes(force);
+  const notes = KNOWN_GAPS.filter((gap) => gap.force === force).map(render);
   return notes.length > 0 ? notes.join(' ') : undefined;
 }
 

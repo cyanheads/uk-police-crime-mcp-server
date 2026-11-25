@@ -79,7 +79,8 @@ describe('ukcrime_list_reference', () => {
     });
 
     it('attaches the known gaps, dated, to exactly the forces the table names', async () => {
-      const out = data(await call({ topic: 'forces' }));
+      const result = await call({ topic: 'forces' });
+      const out = data(result);
       for (const entry of out.forces ?? []) {
         if (GAP_FORCES.includes(entry.id)) {
           expect(entry.gaps).toBe(forceGaps(entry.id));
@@ -94,6 +95,10 @@ describe('ukcrime_list_reference', () => {
           .filter((id) => [...forcesBody().map((f) => f.id), 'btp'].includes(id))
           .sort(),
       );
+      const btpCrime =
+        'British Transport Police has sent no crime data to data.police.uk since 2025-02';
+      expect(out.forces?.find((entry) => entry.id === 'btp')?.gaps).toContain(btpCrime);
+      expect(text(result)).toContain(btpCrime);
     });
 
     it('strips upstream fields the server does not read', async () => {
@@ -142,6 +147,12 @@ describe('ukcrime_list_reference', () => {
     it('requires every token to appear', async () => {
       const out = data(await call({ topic: 'forces', name_contains: 'manchester leicestershire' }));
       expect(out.forces).toEqual([]);
+    });
+
+    it("reads a name's '&' as 'and', so 'devon and cornwall' finds Devon & Cornwall Police", async () => {
+      const result = await call({ topic: 'forces', name_contains: 'devon and cornwall' });
+      expect(data(result).forces?.map((force) => force.id)).toEqual(['devon-and-cornwall']);
+      expect(text(result)).toContain('| devon-and-cornwall | Devon & Cornwall Police |');
     });
   });
 
@@ -378,6 +389,20 @@ describe('ukcrime_list_reference', () => {
           query,
         ).toEqual([id]);
       }
+    });
+
+    it("splits the value's words at punctuation, so st-marys finds St. Mary's Ward", async () => {
+      lookup('leicestershire', [
+        { id: 'B', name: "St. Mary's Ward" },
+        { id: 'C', name: 'Harbour' },
+      ]);
+      const result = await call({
+        topic: 'neighbourhoods',
+        force: 'leicestershire',
+        name_contains: 'st-marys',
+      });
+      expect(data(result).neighbourhoods?.map((n) => n.id)).toEqual(['B']);
+      expect(text(result)).toContain("| B | St. Mary's Ward |");
     });
 
     it('returns an empty list with a notice when the filter matches nothing (zero-result page)', async () => {

@@ -443,6 +443,65 @@ export const stopsBody = () => [
   }),
 ];
 
+/**
+ * Street names for the street-filter cases, as data.police.uk publishes them,
+ * each with its record count — modelled on a Leicester city-centre point
+ * (2026-09: Granby Street and Granby Place share a word, and `high street`
+ * finds Highcross Street and Highfield Street), plus the shapes other forces
+ * publish: a slash and lower-case word, an apostrophe before a capital
+ * (Cumbria), and a bare `On or near ` with no street after it (Northern
+ * Ireland); the hyphenated name is invented. Synthetic street ids.
+ */
+export const STREET_ROWS = [
+  { id: 1_000_101, name: 'On or near Granby Street', count: 16 },
+  { id: 1_000_102, name: 'On or near Highcross Street', count: 13 },
+  { id: 1_000_103, name: 'On or near Granby Place', count: 4 },
+  { id: 1_000_104, name: 'On or near Theatre/concert Hall', count: 3 },
+  { id: 1_000_105, name: "On or near Siemen'S Street", count: 2 },
+  { id: 1_000_106, name: 'On or near Belgrave-Gate', count: 2 },
+  { id: 1_000_107, name: 'On or near Highfield Street', count: 1 },
+  { id: 1_000_108, name: 'On or near ', count: 2 },
+] as const;
+
+/** Every {@link STREET_ROWS} location in the wire shape, `count` times each in row order; each street its own map point. */
+const streetLocations = () =>
+  STREET_ROWS.flatMap(({ id, name, count }, row) =>
+    Array.from({ length: count }, () =>
+      wireLocation(id, name, `52.63${String(row).padStart(2, '0')}00`, '-1.131600'),
+    ),
+  );
+
+/** `GET /crimes-street/all-crime` over the {@link STREET_ROWS} streets: 43 placed crimes, distinct ids and persistent ids. */
+export const streetCrimesBody = () =>
+  streetLocations().map((location, i) =>
+    crimeRecord({
+      id: 300_000_000 + i,
+      category: ['burglary', 'shoplifting', 'violent-crime'][i % 3],
+      location,
+      persistent_id: (0x300 + i).toString(16).padStart(64, '0'),
+    }),
+  );
+
+/** `GET /outcomes-at-location` over the {@link STREET_ROWS} streets: one outcome for each of {@link streetCrimesBody}'s crimes. */
+export const streetOutcomesBody = () =>
+  streetCrimesBody().map((crime) => areaOutcomeRecord({ crime }));
+
+/**
+ * `GET /stops-street` (or `/stops-force`) over the {@link STREET_ROWS} streets:
+ * 43 placed stops, one a minute from `2026-08-14T00:00`, then one stop with no
+ * location.
+ */
+export const streetStopsBody = () => [
+  ...streetLocations().map((location, i) =>
+    stopRecord({
+      datetime: `2026-08-14T00:${String(i).padStart(2, '0')}:00+00:00`,
+      gender: i % 2 === 0 ? 'Male' : 'Female',
+      location,
+    }),
+  ),
+  sparseStopRecord(),
+];
+
 /** `n` distinct stops (cycling through a few categorical values), for large-month cases; generated, never checked in. */
 export const manyStops = (n: number) =>
   Array.from({ length: n }, (_, i) =>

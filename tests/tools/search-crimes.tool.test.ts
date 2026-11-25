@@ -35,6 +35,7 @@ import {
   locateBy,
   manyCrimes,
   overloaded,
+  perMonth,
   plainNotFound,
   type Responder,
   rateLimited,
@@ -44,6 +45,7 @@ import {
   sparseCrimeRecord,
   status,
   streamOfBytes,
+  streetCrimesBody,
   streetDatesBody,
   unplacedCrimesBody,
   wireLocation,
@@ -103,6 +105,9 @@ const RING = [
 const MONTH_NOTE = 'No month given; searched 2026-08, the latest published month.';
 const ZERO_GENERIC =
   "Nothing recorded here in 2026-08. A force can miss a month the API still lists as published (https://data.police.uk/changelog/); try another month, a wider area, or area 'force_unplaced' for crimes the force could not place.";
+/** The caveat a zero count over months closes with; the range zero-month line carries the same. */
+const ZERO_CAVEAT =
+  'A force can miss a month the API still lists as published (https://data.police.uk/changelog/), so a month at zero may be missing data rather than no crime.';
 
 describe('ukcrime_search_crimes', () => {
   const h = useToolHarness();
@@ -350,6 +355,99 @@ describe('ukcrime_search_crimes', () => {
       expect(h.upstream.callsTo('/crimes-at-location')[0]?.query.has('category')).toBe(false);
     });
 
+    describe('a narrowed category with outcome or street_name_contains (filtered here, after the local category filter)', () => {
+      /**
+       * Seven crimes over four categories, each category with outcomes and a street
+       * of its own: burglary 3 (Under investigation 2, Offender given a caution 1)
+       * on Granby Street; shoplifting 2 (Unable to prosecute suspect) on Highcross
+       * Street; violent-crime 1 (Awaiting court outcome) on Belgrave Gate;
+       * anti-social behaviour 1 (no outcome) on Theatre Lane. The streets differ so
+       * the street names a notice lists show which crimes it read.
+       */
+      const mixedCategories = () => {
+        const at = (id: number, street: string) =>
+          wireLocation(id, `On or near ${street}`, '52.634400', '-1.131600');
+        const outcome = (category: string) => ({ category, date: '2026-07' });
+        return [
+          crimeRecord({ id: 1, location: at(1_000_201, 'Granby Street') }),
+          crimeRecord({ id: 2, location: at(1_000_201, 'Granby Street') }),
+          crimeRecord({
+            id: 3,
+            location: at(1_000_201, 'Granby Street'),
+            outcome_status: outcome('Offender given a caution'),
+          }),
+          ...[4, 5].map((id) =>
+            crimeRecord({
+              id,
+              category: 'shoplifting',
+              location: at(1_000_202, 'Highcross Street'),
+              outcome_status: outcome('Unable to prosecute suspect'),
+            }),
+          ),
+          crimeRecord({
+            id: 6,
+            category: 'violent-crime',
+            location: at(1_000_203, 'Belgrave Gate'),
+            outcome_status: outcome('Awaiting court outcome'),
+          }),
+          sparseCrimeRecord({ id: 7, location: at(1_000_204, 'Theatre Lane') }),
+        ];
+      };
+      const atLocation = (extra: Record<string, unknown>) => {
+        h.upstream.route('GET', '/crimes-at-location', jsonOk(mixedCategories()));
+        h.upstream.route('GET', '/locate-neighbourhood', jsonOk(locateBody()));
+        return callRaw({ area: 'location', location_id: '1000201', month: '2026-07', ...extra });
+      };
+
+      it("on a zero, lists only the category's outcomes and street names, never another category's", async () => {
+        const byOutcome = await atLocation({
+          category: 'burglary',
+          outcome: 'Unable to prosecute suspect',
+        });
+        const outcomeNote =
+          'No crimes matched the filters; values present for outcome: "Under investigation", "Offender given a caution".';
+        expect(data(byOutcome).notice).toBe(outcomeNote);
+        expect(text(byOutcome)).toContain(`> ${outcomeNote}`);
+
+        const byStreet = await atLocation({
+          category: 'burglary',
+          street_name_contains: 'highcross',
+        });
+        const streetNote = 'No crimes matched the filters; street names present: "Granby Street".';
+        expect(data(byStreet).notice).toBe(streetNote);
+        expect(text(byStreet)).toContain(`> ${streetNote}`);
+      });
+
+      it.each<[string, Record<string, unknown>]>([
+        ['outcome', { outcome: 'Under investigation' }],
+        ['street_name_contains', { street_name_contains: 'granby' }],
+      ])(
+        'gives the category fragment, not a values-present sentence, when the category itself has no crimes here (%s)',
+        async (_field, filter) => {
+          const result = await atLocation({ category: 'drugs', ...filter });
+          const out = data(result);
+          expect([out.total, out.unfiltered_total]).toEqual([0, 0]);
+          const note = 'Only Drugs was searched; omit category to search all crime.';
+          expect(out.notice).toBe(note);
+          expect(text(result)).toContain(`> ${note}`);
+        },
+      );
+
+      it('counts unfiltered_total over the category only, with hits and at zero, on both surfaces', async () => {
+        const hits = await atLocation({ category: 'burglary', outcome: 'Under investigation' });
+        expect([data(hits).total, data(hits).unfiltered_total]).toEqual([2, 3]);
+        expect(text(hits)).toContain('**Crimes matched:** 2 of 3\n');
+
+        const onStreet = await atLocation({ category: 'burglary', street_name_contains: 'granby' });
+        expect([data(onStreet).total, data(onStreet).unfiltered_total]).toEqual([3, 3]);
+        expect(text(onStreet)).toContain('**Crimes matched:** 3 of 3\n');
+
+        const zero = await atLocation({ category: 'shoplifting', outcome: 'cautioned' });
+        expect([data(zero).total, data(zero).unfiltered_total]).toEqual([0, 2]);
+        expect(text(zero)).toContain('**Crimes matched:** 0 of 2\n');
+      });
+    });
+
     it('fails unknown_location (NotFound) when the id is not held', async () => {
       h.upstream.route('GET', '/crimes-at-location', plainNotFound);
       const error = errorOf(await call({ area: 'location', location_id: '999', month: '2026-07' }));
@@ -468,7 +566,7 @@ describe('ukcrime_search_crimes', () => {
       [
         'avon-and-somerset',
         'locations',
-        'Avon and Somerset Constabulary sends about 2,000 crimes a month without coordinates',
+        'Avon and Somerset Constabulary sends some crimes each month without coordinates, so area searches there undercount its crimes and their outcomes',
       ],
       ['greater-manchester', 'crime', 'Greater Manchester Police publishes no crime data'],
       [
@@ -484,8 +582,10 @@ describe('ukcrime_search_crimes', () => {
         h.upstream.route('GET', '/forces', jsonOk([{ id: force, name: force }]));
         const out = data(await call({ ...NEIGHBOURHOOD, force }));
         expect(out.notice).toContain(fragment);
-        expect(out.notice).toContain('(data.police.uk known issues, verified 2026-10-01)');
-        expect(out.notice).toBe(coverageNotes(force, ['crime', 'locations', 'asb']).join(' '));
+        expect(out.notice).toContain('(data.police.uk known issues, verified 2026-11-25)');
+        expect(out.notice).toBe(
+          coverageNotes(force, ['crime', 'locations', 'asb'], ['2026-07']).join(' '),
+        );
       },
     );
 
@@ -529,7 +629,7 @@ describe('ukcrime_search_crimes', () => {
       h.upstream.route('GET', '/crimes-no-location', jsonOk(unplacedCrimesBody()));
       const out = data(await call({ ...UNPLACED, force: 'btp' }));
       expect(out.area.force).toBe('btp');
-      expect(out.notice).toBe(coverageNotes('btp', ['crime', 'asb']).join(' '));
+      expect(out.notice).toBe(coverageNotes('btp', ['crime', 'asb'], ['2026-07']).join(' '));
       expect(out.notice).toContain(
         'British Transport Police supplies no anti-social behaviour data',
       );
@@ -552,18 +652,22 @@ describe('ukcrime_search_crimes', () => {
       );
       const out = data(await call({ ...UNPLACED, force: 'greater-manchester' }));
       expect(out.total).toBe(0);
-      expect(out.notice).toBe(coverageNotes('greater-manchester', ['crime', 'asb']).join(' '));
+      expect(out.notice).toBe(
+        coverageNotes('greater-manchester', ['crime', 'asb'], ['2026-07']).join(' '),
+      );
       expect(out.notice).toContain('Greater Manchester Police publishes no crime data');
       expect(out.notice).not.toContain('the crimes it placed');
     });
 
-    it('says the force recorded none when the list is empty', async () => {
+    it('says the force recorded none when the list is empty, with the missing-month caveat, on both surfaces', async () => {
       h.upstream.route('GET', '/crimes-no-location', jsonOk([]));
-      const out = data(await call({ ...UNPLACED }));
+      const result = await call({ ...UNPLACED });
+      const out = data(result);
       expect(out.total).toBe(0);
       expect(out.notice).toBe(
-        'This force recorded no crimes without a location in 2026-07; the other areas cover the crimes it placed.',
+        `This force recorded no crimes without a location in 2026-07; the other areas cover the crimes it placed. ${ZERO_CAVEAT}`,
       );
+      expect(text(result)).toContain(`> ${out.notice}`);
     });
 
     it('keeps the narrowed-category fragment ahead of the unplaced one when both could apply', async () => {
@@ -1049,7 +1153,7 @@ describe('ukcrime_search_crimes', () => {
       expect(out.notice).toBe(
         [
           MONTH_NOTE,
-          ...coverageNotes('avon-and-somerset', ['crime', 'locations', 'asb']),
+          ...coverageNotes('avon-and-somerset', ['crime', 'locations', 'asb'], ['2026-08']),
           ZERO_GENERIC,
         ].join(' '),
       );
@@ -1066,9 +1170,10 @@ describe('ukcrime_search_crimes', () => {
       const out = data(result);
       expect(out.area.located_force).toBe('greater-manchester');
       expect(out.notice).toBe(
-        [MONTH_NOTE, ...coverageNotes('greater-manchester', ['crime', 'locations', 'asb'])].join(
-          ' ',
-        ),
+        [
+          MONTH_NOTE,
+          ...coverageNotes('greater-manchester', ['crime', 'locations', 'asb'], ['2026-08']),
+        ].join(' '),
       );
       expect(text(result)).toContain(`> ${out.notice}`);
     });
@@ -1085,7 +1190,7 @@ describe('ukcrime_search_crimes', () => {
         }),
       );
       expect(out.notice).toBe(
-        coverageNotes('greater-manchester', ['crime', 'locations', 'asb']).join(' '),
+        coverageNotes('greater-manchester', ['crime', 'locations', 'asb'], ['2026-07']).join(' '),
       );
     });
 
@@ -1099,7 +1204,7 @@ describe('ukcrime_search_crimes', () => {
       const out = data(await call({ ...POINT, category: 'burglary', month: '2026-07' }));
       expect(out.notice).toBe(
         [
-          ...coverageNotes('greater-manchester', ['crime', 'locations', 'asb']),
+          ...coverageNotes('greater-manchester', ['crime', 'locations', 'asb'], ['2026-07']),
           'Only Burglary was searched; omit category to search all crime.',
         ].join(' '),
       );
@@ -1109,7 +1214,170 @@ describe('ukcrime_search_crimes', () => {
       pointRoutes();
       h.upstream.route('GET', '/locate-neighbourhood', jsonOk(locateBody({ force: 'btp' })));
       const out = data(await call({ ...POINT, month: '2026-07' }));
-      expect(out.notice).toBe(coverageNotes('btp', ['crime', 'locations', 'asb']).join(' '));
+      expect(out.notice).toBe(
+        coverageNotes('btp', ['crime', 'locations', 'asb'], ['2026-07']).join(' '),
+      );
+    });
+  });
+
+  describe('coverage facts that start at a month', () => {
+    const BTP_UNPLACED = { area: 'force_unplaced', force: 'btp' } as const;
+    const BTP_CRIME =
+      'British Transport Police has sent no crime data to data.police.uk since 2025-02';
+    const GLOUC_CRIME =
+      'Gloucestershire Constabulary has sent no crime data to data.police.uk since 2026-02';
+    const unplacedZero = (span: string) =>
+      `This force recorded no crimes without a location in ${span}; the other areas cover the crimes it placed. ${ZERO_CAVEAT}`;
+    const zeroHere = (span: string) => ZERO_GENERIC.replace('2026-08', span);
+
+    describe('a named single force (force_unplaced, British Transport Police from 2025-02)', () => {
+      it('the month before: no crime-gap note, and the zero line with its caveat on both surfaces', async () => {
+        h.upstream.route('GET', '/crimes-no-location', jsonOk([]));
+        const result = await call({ ...BTP_UNPLACED, month: '2025-01' });
+        const out = data(result);
+        expect(out.total).toBe(0);
+        expect(out.notice).toBe(
+          [...coverageNotes('btp', ['asb'], ['2025-01']), unplacedZero('2025-01')].join(' '),
+        );
+        expect(out.notice).not.toContain(BTP_CRIME);
+        expect(text(result)).toContain(`> ${out.notice}`);
+      });
+
+      it('the from-month itself: the dated note explains the zero, with no zero line', async () => {
+        h.upstream.route('GET', '/crimes-no-location', jsonOk([]));
+        const result = await call({ ...BTP_UNPLACED, month: '2025-02' });
+        const out = data(result);
+        expect(out.total).toBe(0);
+        expect(out.notice).toBe(coverageNotes('btp', ['crime', 'asb'], ['2025-02']).join(' '));
+        expect(out.notice).toContain(BTP_CRIME);
+        expect(out.notice).not.toContain('without a location');
+        expect(text(result)).toContain(BTP_CRIME);
+      });
+
+      it('a range spanning the from-month: the dated note, and the zero line for the range', async () => {
+        h.upstream.route('GET', '/crimes-no-location', jsonOk([]));
+        const out = data(await call({ ...BTP_UNPLACED, month_from: '2024-12', month: '2025-03' }));
+        expect(out.by_month?.map((row) => row.total)).toEqual([0, 0, 0, 0]);
+        expect(out.notice).toBe(
+          [
+            ...coverageNotes('btp', ['crime', 'asb'], ['2025-02']),
+            unplacedZero('2024-12–2025-03'),
+          ].join(' '),
+        );
+        expect(out.notice).toContain(BTP_CRIME);
+      });
+
+      it('a range wholly after the from-month: the dated note alone', async () => {
+        h.upstream.route('GET', '/crimes-no-location', jsonOk([]));
+        const out = data(await call({ ...BTP_UNPLACED, month_from: '2025-02', month: '2025-04' }));
+        expect(out.notice).toBe(coverageNotes('btp', ['crime', 'asb'], ['2025-02']).join(' '));
+      });
+    });
+
+    describe('a located single force (point, Gloucestershire from 2026-02)', () => {
+      const locatedIn = (body: Responder) => {
+        h.upstream.route('GET', '/crimes-street/all-crime', body);
+        h.upstream.route(
+          'GET',
+          '/locate-neighbourhood',
+          jsonOk(locateBody({ force: 'gloucestershire' })),
+        );
+      };
+
+      it('the month before: no note, and the generic zero line', async () => {
+        locatedIn(jsonOk([]));
+        const out = data(await call({ ...POINT, month: '2026-01' }));
+        expect(out.area.located_force).toBe('gloucestershire');
+        expect(out.notice).toBe(zeroHere('2026-01'));
+      });
+
+      it('the from-month itself: the dated note alone', async () => {
+        locatedIn(jsonOk([]));
+        const out = data(await call({ ...POINT, month: '2026-02' }));
+        expect(out.notice).toBe(
+          coverageNotes('gloucestershire', ['crime', 'locations', 'asb'], ['2026-02']).join(' '),
+        );
+        expect(out.notice).toContain(GLOUC_CRIME);
+      });
+
+      it('a range spanning it with hits before it: the dated note, and the zero-month line', async () => {
+        locatedIn(perMonth({ '2026-01': jsonOk([crimeRecord({ month: '2026-01' })]) }));
+        const out = data(await call({ ...POINT, month_from: '2026-01', month: '2026-02' }));
+        expect(out.total).toBe(1);
+        expect(out.notice).toBe(
+          [
+            ...coverageNotes('gloucestershire', ['crime', 'locations', 'asb'], ['2026-02']),
+            `Nothing recorded here in 2026-02. ${ZERO_CAVEAT}`,
+          ].join(' '),
+        );
+        expect(out.notice).toContain(GLOUC_CRIME);
+      });
+    });
+
+    describe('a polygon locating more than one force', () => {
+      const located = (answers: Record<string, string>) => {
+        h.upstream.route('POST', '/crimes-street/all-crime', jsonOk([]));
+        h.upstream.route('GET', '/locate-neighbourhood', locateBy(answers));
+      };
+      const GLOUC_GMP = {
+        [STRADDLE_SAMPLES.centre]: 'gloucestershire',
+        [STRADDLE_SAMPLES.north]: 'greater-manchester',
+        [STRADDLE_SAMPLES.south]: 'gloucestershire',
+        [STRADDLE_SAMPLES.east]: 'greater-manchester',
+      };
+      const STRADDLE = { area: 'polygon', polygon: [...STRADDLE_RING] } as const;
+      const notesFor = (force: string, month: string) =>
+        coverageNotes(force, ['crime', 'locations', 'asb'], [month]);
+
+      it("the month before: the undated force's note and the generic zero line", async () => {
+        located(GLOUC_GMP);
+        const out = data(await call({ ...STRADDLE, month: '2026-01' }));
+        expect(out.area.located_forces).toEqual(['gloucestershire', 'greater-manchester']);
+        expect(out.notice).toBe(
+          [...notesFor('greater-manchester', '2026-01'), zeroHere('2026-01')].join(' '),
+        );
+        expect(out.notice).not.toContain(GLOUC_CRIME);
+      });
+
+      it('the from-month itself: both notes, in force-id order, and no zero line', async () => {
+        located(GLOUC_GMP);
+        const out = data(await call({ ...STRADDLE, month: '2026-02' }));
+        expect(out.notice).toBe(
+          [
+            ...notesFor('gloucestershire', '2026-02'),
+            ...notesFor('greater-manchester', '2026-02'),
+          ].join(' '),
+        );
+        expect(out.notice).toContain(GLOUC_CRIME);
+        expect(out.notice).not.toContain('Nothing recorded here');
+      });
+
+      it('a range spanning it: both notes and the generic zero line for the range', async () => {
+        located(GLOUC_GMP);
+        const out = data(await call({ ...STRADDLE, month_from: '2026-01', month: '2026-02' }));
+        expect(out.notice).toBe(
+          [
+            ...notesFor('gloucestershire', '2026-02'),
+            ...notesFor('greater-manchester', '2026-02'),
+            zeroHere('2026-01–2026-02'),
+          ].join(' '),
+        );
+        expect(out.notice).toContain(GLOUC_CRIME);
+      });
+
+      it('a dated silent force beside one that publishes: its note, and the generic zero line', async () => {
+        located({
+          ...GLOUC_GMP,
+          [STRADDLE_SAMPLES.north]: 'leicestershire',
+          [STRADDLE_SAMPLES.east]: 'leicestershire',
+        });
+        const out = data(await call({ ...STRADDLE, month: '2026-02' }));
+        expect(out.area.located_forces).toEqual(['gloucestershire', 'leicestershire']);
+        expect(out.notice).toBe(
+          [...notesFor('gloucestershire', '2026-02'), zeroHere('2026-02')].join(' '),
+        );
+        expect(out.notice).toContain(GLOUC_CRIME);
+      });
     });
   });
 
@@ -1839,12 +2107,19 @@ describe('ukcrime_search_crimes', () => {
     ];
     const every = (samples: readonly string[], answer: string | Responder) =>
       Object.fromEntries(samples.map((q) => [q, answer]));
-    const GMP_NOTES = coverageNotes('greater-manchester', ['crime', 'locations', 'asb']);
-    const NI_NOTES = coverageNotes('northern-ireland', ['crime', 'locations', 'asb']);
+    const GMP_NOTES = coverageNotes(
+      'greater-manchester',
+      ['crime', 'locations', 'asb'],
+      ['2026-07'],
+    );
+    const NI_NOTES = coverageNotes('northern-ireland', ['crime', 'locations', 'asb'], ['2026-07']);
     const ZERO_JULY = ZERO_GENERIC.replace('2026-08', '2026-07');
 
     it('locates a polygon beside the area query and adds the located force’s coverage notes on both surfaces', async () => {
-      h.upstream.route('POST', '/crimes-street/all-crime', jsonOk(crimesBody()));
+      h.upstream.route('POST', '/crimes-street/all-crime', async (request) => {
+        await new Promise((resolve) => setTimeout(resolve, 5000));
+        return jsonOk(crimesBody())(request);
+      });
       h.upstream.route(
         'GET',
         '/locate-neighbourhood',
@@ -1862,7 +2137,10 @@ describe('ukcrime_search_crimes', () => {
       const locates = h.upstream.callsTo('/locate-neighbourhood');
       expect(locates.map((c) => c.query.get('q')).sort()).toEqual([...GMP_SAMPLES].sort());
       const [area] = h.upstream.callsTo('/crimes-street/all-crime');
-      expect(locates.every((c) => c.at === area?.at)).toBe(true);
+      const areaAt = area?.at ?? Number.NaN;
+      // Beside, neither before nor after: the query goes out with lookups still to send, and every lookup before the query answers 5 s on.
+      expect(locates.some((c) => c.at > areaAt)).toBe(true);
+      expect(locates.every((c) => c.at < areaAt + 5000)).toBe(true);
       const rendered = text(result);
       expect(rendered).toContain(
         '**Area:** polygon · 4 polygon vertices · located forces greater-manchester',
@@ -2319,6 +2597,413 @@ describe('ukcrime_search_crimes', () => {
         'GET /crimes-street-dates ',
         'GET /forces ',
       ]);
+    });
+  });
+
+  describe('outcome and street_name_contains left blank', () => {
+    it.each<[string, unknown]>([
+      ['outcome', ''],
+      ['outcome', '  \t '],
+      ['outcome', null],
+      ['street_name_contains', ''],
+      ['street_name_contains', '  \t '],
+      ['street_name_contains', null],
+    ])(
+      'reads %s %j as unset: output and notices byte-identical to leaving it out',
+      async (field, value) => {
+        pointRoutes();
+        const absent = await call({ ...POINT });
+        const blank = await callRaw({ ...POINT, [field]: value });
+        expect(JSON.stringify(blank.structuredContent)).toBe(
+          JSON.stringify(absent.structuredContent),
+        );
+        expect(text(blank)).toBe(text(absent));
+      },
+    );
+  });
+
+  describe('outcome', () => {
+    /**
+     * crimesBody() plus two cautions, nine crimes: Under investigation 4,
+     * Offender given a caution 2, (not recorded) 2 (the anti-social behaviour),
+     * Unable to prosecute suspect 1.
+     */
+    const cautionCrimes = () => [
+      ...crimesBody(),
+      crimeRecord({
+        id: 100_000_090,
+        category: 'shoplifting',
+        location: wireLocation(1_000_002, 'On or near Example Road', '52.631000', '-1.131000'),
+        outcome_status: { category: 'Offender given a caution', date: '2026-08' },
+        persistent_id: '9'.repeat(64),
+      }),
+      crimeRecord({
+        id: 100_000_091,
+        outcome_status: { category: 'Offender given a caution', date: '2026-08' },
+        persistent_id: '8'.repeat(64),
+      }),
+    ];
+    const PRESENT_OUTCOMES =
+      'values present for outcome: "Under investigation", "(not recorded)", "Offender given a caution", "Unable to prosecute suspect"';
+    const withOutcome = (outcome: unknown, extra: Record<string, unknown> = {}) =>
+      callRaw({ ...POINT, month: '2026-07', outcome, ...extra });
+
+    it('keeps the crimes whose latest outcome name matches, narrowing the total, breakdowns, map points and page together; unfiltered_total and the echo on both surfaces', async () => {
+      pointRoutes(cautionCrimes());
+      const absent = data(await call({ ...POINT, month: '2026-07' }));
+      expect(absent.total).toBe(9);
+      expect(absent).not.toHaveProperty('outcome');
+      expect(absent).not.toHaveProperty('unfiltered_total');
+
+      const result = await withOutcome('Offender given a caution');
+      const out = data(result);
+      expect(out.outcome).toBe('Offender given a caution');
+      expect([out.total, out.unfiltered_total]).toEqual([2, 9]);
+      expect(out.by_category).toEqual([
+        { value: 'burglary', count: 1 },
+        { value: 'shoplifting', count: 1 },
+      ]);
+      expect(out.by_outcome).toEqual([{ value: 'Offender given a caution', count: 2 }]);
+      expect(out.top_locations?.map(({ location_id, count }) => [location_id, count])).toEqual([
+        ['1000001', 1],
+        ['1000002', 1],
+      ]);
+      expect(out.crimes.map((crime) => crime.id)).toEqual(['100000091', '100000090']);
+      expect(out.notice).toBeUndefined();
+      const markdown = text(result);
+      expect(markdown).toContain('**Outcome:** "Offender given a caution"');
+      expect(markdown).toContain('**Crimes matched:** 2 of 9');
+      expect(markdown).toContain('| Offender given a caution | 2 |');
+      expect(h.upstream.count('/crimes-street/all-crime')).toBe(1);
+    });
+
+    it('reads case and runs of spaces, underscores and hyphens alike, echoing the value as sent', async () => {
+      pointRoutes(cautionCrimes());
+      const out = data(await withOutcome('  OFFENDER_given-a   caution '));
+      expect(out.outcome).toBe('OFFENDER_given-a   caution');
+      expect(out.total).toBe(2);
+    });
+
+    it("matches '(not recorded)' to exactly the crimes with no outcome", async () => {
+      pointRoutes(cautionCrimes());
+      const out = data(await withOutcome('(not recorded)'));
+      expect(out.total).toBe(2);
+      expect(out.crimes.map((crime) => crime.id)).toEqual(['100000050', '100000051']);
+      expect(out.crimes.every((crime) => crime.outcome === undefined)).toBe(true);
+      expect(out.by_outcome).toEqual([{ value: '(not recorded)', count: 2 }]);
+    });
+
+    it('matches nothing by an outcome code, which crime records do not carry: zero, with the names present, on both surfaces', async () => {
+      pointRoutes(cautionCrimes());
+      const result = await withOutcome('cautioned');
+      const out = data(result);
+      expect([out.total, out.unfiltered_total]).toEqual([0, 9]);
+      expect(out.by_outcome).toEqual([]);
+      expect(out.top_locations).toEqual([]);
+      expect(out.crimes).toEqual([]);
+      expect(out.notice).toBe(`No crimes matched the filters; ${PRESENT_OUTCOMES}.`);
+      const markdown = text(result);
+      expect(markdown).toContain(`> No crimes matched the filters; ${PRESENT_OUTCOMES}.`);
+      expect(markdown).toContain('**Crimes matched:** 0 of 9');
+    });
+
+    it('keeps the empty-area notice when there was nothing to filter', async () => {
+      pointRoutes([]);
+      const absent = data(await call({ ...POINT }));
+      const out = data(await callRaw({ ...POINT, outcome: 'Offender given a caution' }));
+      expect([out.total, out.unfiltered_total]).toEqual([0, 0]);
+      expect(out.notice).toBe(`${MONTH_NOTE} ${ZERO_GENERIC}`);
+      expect(out.notice).toBe(absent.notice);
+    });
+
+    it('ANDs with category: the category fragment alone when the category matched nothing, the outcome clause alone otherwise', async () => {
+      pointRoutes([], 'burglary');
+      const empty = data(await withOutcome('cautioned', { category: 'burglary' }));
+      expect(empty.notice).toBe('Only Burglary was searched; omit category to search all crime.');
+
+      const burglaries = cautionCrimes().filter((crime) => crime.category === 'burglary');
+      h.upstream.route('GET', '/crimes-street/burglary', jsonOk(burglaries));
+      const both = data(
+        await withOutcome('Offender given a caution', { category: 'burglary', month: '2026-06' }),
+      );
+      expect([both.total, both.unfiltered_total]).toEqual([1, 4]);
+      expect(both.crimes.map((crime) => crime.id)).toEqual(['100000091']);
+      const missed = data(
+        await withOutcome('cautioned', { category: 'burglary', month: '2026-06' }),
+      );
+      expect(missed.notice).toBe(
+        'No crimes matched the filters; values present for outcome: "Under investigation", "Offender given a caution", "Unable to prosecute suspect".',
+      );
+    });
+
+    it('rejects an outcome over 100 characters as invalid_arguments before any request', async () => {
+      const error = errorOf(await withOutcome('a'.repeat(101)));
+      expect(error.code).toBe(JsonRpcErrorCode.InvalidParams);
+      expect(error.data.reason).toBe('invalid_arguments');
+      expect(error.data.issues).toMatchObject([
+        { path: ['outcome'], message: 'Too big: expected string to have <=100 characters' },
+      ]);
+      expect(h.upstream.calls).toHaveLength(0);
+    });
+  });
+
+  describe('street_name_contains', () => {
+    const onStreet = (street: unknown, extra: Record<string, unknown> = {}) =>
+      callRaw({ ...POINT, month: '2026-07', street_name_contains: street, ...extra });
+    const GRANBY = {
+      location_id: '1000101',
+      street_name: 'On or near Granby Street',
+      count: 16,
+      map_point: { latitude: 52.63, longitude: -1.1316 },
+    };
+    const PRESENT_STREETS =
+      'street names present: "Granby Street", "Highcross Street", "Granby Place", "Theatre/concert Hall", "Belgrave-Gate", "Siemen\'S Street", "Highfield Street"';
+
+    it.each([
+      'granby street',
+      'Granby St',
+      'GRANBY STREET',
+      'granby-street',
+      'On or near Granby Street',
+    ])(
+      '%s returns the 16 Granby Street crimes and nothing else, every count narrowed; unfiltered_total and the echo on both surfaces',
+      async (street) => {
+        pointRoutes(streetCrimesBody());
+        const result = await onStreet(street);
+        const out = data(result);
+        expect(out.street_name_contains).toBe(street);
+        expect([out.total, out.unfiltered_total]).toEqual([16, 43]);
+        expect(out.top_locations).toEqual([GRANBY]);
+        expect(out.by_category).toEqual([
+          { value: 'burglary', count: 6 },
+          { value: 'shoplifting', count: 5 },
+          { value: 'violent-crime', count: 5 },
+        ]);
+        expect(out.by_outcome).toEqual([{ value: 'Under investigation', count: 16 }]);
+        expect(out.crimes).toHaveLength(16);
+        expect(new Set(out.crimes.map((crime) => crime.location?.street_name))).toEqual(
+          new Set(['On or near Granby Street']),
+        );
+        expect(out.notice).toBeUndefined();
+        const markdown = text(result);
+        expect(markdown).toContain(`**Street name contains:** "${street}"`);
+        expect(markdown).toContain('**Crimes matched:** 16 of 43');
+        expect(markdown).toContain('| 1000101 | On or near Granby Street | 16 | 52.63, -1.1316 |');
+      },
+    );
+
+    it('high street counts Highcross Street and Highfield Street, and the notice names both', async () => {
+      pointRoutes(streetCrimesBody());
+      const result = await onStreet('high street');
+      const out = data(result);
+      expect(out.total).toBe(14);
+      expect(out.top_locations?.map(({ street_name, count }) => [street_name, count])).toEqual([
+        ['On or near Highcross Street', 13],
+        ['On or near Highfield Street', 1],
+      ]);
+      expect(out.notice).toBe(
+        'street_name_contains matched 2 street names: "Highcross Street", "Highfield Street".',
+      );
+      expect(text(result)).toContain(`> ${out.notice}`);
+    });
+
+    it("on a zero from a non-empty area, lists the street names present, read before the filter ('near' matches no street once 'On or near' is dropped)", async () => {
+      pointRoutes(streetCrimesBody());
+      const result = await onStreet('near');
+      const out = data(result);
+      expect([out.total, out.unfiltered_total]).toEqual([0, 43]);
+      expect(out.top_locations).toEqual([]);
+      expect(out.notice).toBe(`No crimes matched the filters; ${PRESENT_STREETS}.`);
+      expect(text(result)).toContain(`> No crimes matched the filters; ${PRESENT_STREETS}.`);
+    });
+
+    it('keeps the empty-area notice when there was nothing to filter', async () => {
+      pointRoutes([]);
+      const absent = data(await call({ ...POINT }));
+      const out = data(await callRaw({ ...POINT, street_name_contains: 'granby' }));
+      expect(out.notice).toBe(`${MONTH_NOTE} ${ZERO_GENERIC}`);
+      expect(out.notice).toBe(absent.notice);
+    });
+
+    it("fails invalid_area on area 'force_unplaced', whose crimes have no location, before any request", async () => {
+      const error = errorOf(
+        await callRaw({
+          area: 'force_unplaced',
+          force: 'leicestershire',
+          street_name_contains: 'granby',
+        }),
+      );
+      expect(error.code).toBe(JsonRpcErrorCode.ValidationError);
+      expect(error.data.reason).toBe('invalid_area');
+      expect(error.message).toBe(
+        "area 'force_unplaced' holds only crimes with no location, so street_name_contains can match none; remove it, or search an area with locations.",
+      );
+      expect(h.upstream.calls).toHaveLength(0);
+    });
+
+    it("reads a blank street_name_contains on area 'force_unplaced' as unset, not as a rejection", async () => {
+      h.upstream.route('GET', '/crimes-no-location', jsonOk(unplacedCrimesBody()));
+      const unplaced = { area: 'force_unplaced', force: 'leicestershire', month: '2026-07' };
+      const absent = data(await callRaw(unplaced));
+      for (const blank of ['', '   ', null]) {
+        const out = data(await callRaw({ ...unplaced, street_name_contains: blank }));
+        expect(out).toEqual(absent);
+        expect(out).not.toHaveProperty('street_name_contains');
+      }
+    });
+
+    it("keeps all of a location's crimes or none, the location being one map point", async () => {
+      const spot = wireLocation(1_000_101, 'On or near Granby Street', '52.634400', '-1.131600');
+      h.upstream.route(
+        'GET',
+        '/crimes-at-location',
+        jsonOk([1, 2, 3].map((id) => crimeRecord({ id, location: spot }))),
+      );
+      h.upstream.route('GET', '/locate-neighbourhood', jsonOk(locateBody()));
+      const at = (street: string) =>
+        callRaw({
+          area: 'location',
+          location_id: '1000101',
+          month: '2026-07',
+          street_name_contains: street,
+        });
+      expect(data(await at('granby')).total).toBe(3);
+      const none = data(await at('highcross'));
+      expect([none.total, none.unfiltered_total]).toEqual([0, 3]);
+      expect(none.notice).toBe(
+        'No crimes matched the filters; street names present: "Granby Street".',
+      );
+    });
+
+    it('pages the filtered set in its own index space, and says when offset is past the filtered end', async () => {
+      pointRoutes(streetCrimesBody());
+      const first = data(await onStreet('granby street', { limit: 5 }));
+      expect([first.shown, first.truncated, first.cap, first.next_offset]).toEqual([5, true, 5, 5]);
+      expect(first.notice).toBe('Showing 1–5 of 16; call again with offset 5 for more.');
+      const second = data(await onStreet('granby street', { limit: 5, offset: 5 }));
+      expect(second.crimes.map((crime) => crime.id)).not.toContain(first.crimes[0]?.id);
+      expect(second.next_offset).toBe(10);
+      const last = data(await onStreet('granby street', { offset: 15 }));
+      expect(last.crimes).toHaveLength(1);
+      expect(last).not.toHaveProperty('next_offset');
+      expect(last.notice).toBeUndefined();
+      expect(data(await onStreet('granby street', { offset: 16 })).notice).toBe(
+        'offset 16 is past the last of 16 crimes; omit offset to start from the first.',
+      );
+      expect(h.upstream.count('/crimes-street/all-crime')).toBe(1);
+    });
+
+    it('caps a filtered page at 200 rows', async () => {
+      pointRoutes(manyCrimes(500, 2));
+      const out = data(await onStreet('Street 1', { limit: 10_000 }));
+      expect([out.total, out.unfiltered_total]).toEqual([250, 500]);
+      expect([out.cap, out.shown, out.truncated, out.next_offset]).toEqual([200, 200, true, 200]);
+      expect(out.notice).toBe('Showing 1–200 of 250; call again with offset 200 for more.');
+    });
+
+    it.each<[string, unknown, string]>([
+      [
+        'nothing but On or near',
+        'on or near',
+        "Needs a letter or digit besides 'On or near', which every street name starts with and matching drops.",
+      ],
+      [
+        'punctuation alone',
+        '--',
+        "Needs a letter or digit besides 'On or near', which every street name starts with and matching drops.",
+      ],
+      ['over 100 characters', 'a'.repeat(101), 'Too big: expected string to have <=100 characters'],
+    ])(
+      'rejects a value of %s as invalid_arguments before any request',
+      async (_name, street, message) => {
+        const error = errorOf(await onStreet(street));
+        expect(error.code).toBe(JsonRpcErrorCode.InvalidParams);
+        expect(error.data.reason).toBe('invalid_arguments');
+        expect(error.data.issues).toMatchObject([{ path: ['street_name_contains'], message }]);
+        expect(h.upstream.calls).toHaveLength(0);
+      },
+    );
+  });
+
+  describe('category, outcome and street_name_contains together', () => {
+    /** The 15 burglaries of streetCrimesBody(), alternately cautioned and without an outcome: 8 cautions, 7 not recorded. */
+    const mixedBurglaries = () =>
+      streetCrimesBody()
+        .filter((crime) => crime.category === 'burglary')
+        .map((crime, i) => ({
+          ...crime,
+          outcome_status:
+            i % 2 === 0 ? { category: 'Offender given a caution', date: '2026-08' } : null,
+        }));
+    const together = (outcome: string, extra: Record<string, unknown> = {}) =>
+      callRaw({
+        ...POINT,
+        category: 'burglary',
+        outcome,
+        street_name_contains: 'granby',
+        ...extra,
+      });
+
+    it('ANDs all three, and one notice carries every fragment', async () => {
+      pointRoutes(mixedBurglaries(), 'burglary');
+      const result = await together('offender given a caution', { limit: 2 });
+      const out = data(result);
+      expect([out.total, out.unfiltered_total]).toEqual([4, 15]);
+      expect(out.by_category).toEqual([{ value: 'burglary', count: 4 }]);
+      expect(out.by_outcome).toEqual([{ value: 'Offender given a caution', count: 4 }]);
+      expect(out.top_locations?.map(({ street_name, count }) => [street_name, count])).toEqual([
+        ['On or near Granby Street', 3],
+        ['On or near Granby Place', 1],
+      ]);
+      expect(out.notice).toBe(
+        `${MONTH_NOTE} street_name_contains matched 2 street names: "Granby Street", "Granby Place". Showing 1–2 of 4; call again with offset 2 for more.`,
+      );
+      const markdown = text(result);
+      expect(markdown).toContain(
+        '**Category:** Burglary (burglary)\n**Outcome:** "offender given a caution"\n**Street name contains:** "granby"\n**Crimes matched:** 4 of 15\n',
+      );
+      expect(markdown).toContain(`> ${out.notice}`);
+    });
+
+    it('on a zero, one sentence carries the outcome values and the street names present after the category', async () => {
+      pointRoutes(mixedBurglaries(), 'burglary');
+      const out = data(await together('Unable to prosecute suspect'));
+      expect([out.total, out.unfiltered_total]).toEqual([0, 15]);
+      expect(out.notice).toBe(
+        `${MONTH_NOTE} No crimes matched the filters; values present for outcome: "Offender given a caution", "(not recorded)"; street names present: "Granby Street", "Highcross Street", "Belgrave-Gate", "Granby Place", "Siemen'S Street", "Theatre/concert Hall".`,
+      );
+    });
+
+    it('format() renders the echoes and the unfiltered count only when present, caller text kept inert', () => {
+      const render = (extra: Partial<z.output<typeof searchCrimesTool.output>>) =>
+        (
+          searchCrimesTool.format?.({
+            month: '2026-08',
+            area: { type: 'point', lat: LAT, lng: LNG },
+            category: { slug: 'all-crime', name: 'All crime' },
+            total: 0,
+            by_category: [],
+            by_outcome: [],
+            top_locations: [],
+            crimes: [],
+            ...extra,
+          }) ?? []
+        )
+          .map((block) => (block.type === 'text' ? block.text : ''))
+          .join('');
+      const bare = render({});
+      expect(bare).toContain('**Category:** All crime (all-crime)\n**Crimes matched:** 0\n');
+      expect(bare).not.toContain('Outcome:**');
+      expect(bare).not.toContain('Street name contains');
+      expect(
+        render({
+          outcome: 'x\r\n# [y](z)',
+          street_name_contains: 'a <b>',
+          unfiltered_total: 3,
+        }),
+      ).toContain(
+        '**Outcome:** "x # \\[y\\](z)"\n**Street name contains:** "a \\<b\\>"\n**Crimes matched:** 0 of 3\n',
+      );
     });
   });
 });

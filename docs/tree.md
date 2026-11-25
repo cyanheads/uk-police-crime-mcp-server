@@ -1,6 +1,6 @@
 # uk-police-crime-mcp-server - Directory Structure
 
-Generated on: 2026-10-29 18:31:27
+Generated on: 2026-11-25 08:43:05
 
 ```text
 uk-police-crime-mcp-server/
@@ -153,6 +153,7 @@ uk-police-crime-mcp-server/
 │   │       │   └── search-stops.tool.ts
 │   │       ├── area-search.ts
 │   │       ├── format-helpers.ts
+│   │       ├── name-matcher.ts
 │   │       ├── search-output.ts
 │   │       └── shared-schemas.ts
 │   ├── services/
@@ -189,6 +190,7 @@ uk-police-crime-mcp-server/
 │   │   └── records.test.ts
 │   ├── shared/
 │   │   ├── format-helpers.test.ts
+│   │   ├── name-matcher.test.ts
 │   │   └── shared-schemas.test.ts
 │   └── tools/
 │       ├── area-search.test.ts
@@ -212,6 +214,7 @@ uk-police-crime-mcp-server/
 ├── bun.lock
 ├── bunfig.toml
 ├── CHANGELOG.md
+├── CITATION.cff
 ├── CLAUDE.md
 ├── devcheck.config.json
 ├── Dockerfile

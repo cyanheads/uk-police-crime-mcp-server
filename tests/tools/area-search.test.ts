@@ -19,20 +19,27 @@ import {
   areaEcho,
   breakdown,
   checkNamedForce,
+  matchedStreetsNote,
   monthDefaultedNote,
   monthFailureMessage,
   NOT_RECORDED,
+  noFilterMatchNote,
   outsideCoverageNote,
   pageOf,
   pagingNote,
+  parseSearchArea,
   partialLocateNote,
+  presentValuesClause,
   runAreaQuery,
   samplePoints,
+  streetNamesPresentClause,
+  streetPredicate,
 } from '@/mcp-server/tools/area-search.js';
 import {
   type AreaSpec,
   crimesQuery,
   outcomesQuery,
+  parseArea,
   stopsQuery,
 } from '@/services/police-api/area.js';
 import type {
@@ -430,8 +437,14 @@ describe('runAreaQuery', () => {
       });
 
     it('locates the sample points beside the area query and returns their distinct forces, sorted', async () => {
-      h.upstream.route('POST', '/crimes-street/all-crime', jsonOk(crimesBody()));
-      h.upstream.route('GET', '/locate-neighbourhood', straddleAnswers());
+      h.upstream.route('POST', '/crimes-street/all-crime', async (request) => {
+        await new Promise((resolve) => setTimeout(resolve, 5000));
+        return jsonOk(crimesBody())(request);
+      });
+      h.upstream.route('GET', '/locate-neighbourhood', async (request) => {
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        return straddleAnswers()(request);
+      });
       const run = await crimes(STRADDLE);
       if (run.kind !== 'ok') throw new Error(`got ${run.kind}`);
       expect(run.forces).toEqual(['cheshire', 'greater-manchester']);
@@ -450,7 +463,12 @@ describe('runAreaQuery', () => {
         STRADDLE_SAMPLES.east,
       ]);
       const [area] = h.upstream.callsTo('/crimes-street/all-crime');
-      expect(locates.every((call) => call.at === area?.at)).toBe(true);
+      /**
+       * The window starts three requests a second: the query goes out with the
+       * first two lookups, and the other two once the window reopens, before the
+       * query answers 5 s on.
+       */
+      expect(locates.map((call) => call.at - (area?.at ?? Number.NaN))).toEqual([0, 0, 1000, 1000]);
     });
 
     it('keeps at most two sample lookups queued or in flight, leaving the area query a pacer slot', async () => {
@@ -614,15 +632,18 @@ describe('runAreaQuery', () => {
       const controller = new AbortController();
       const ctx = h.ctxWith(controller.signal);
       h.upstream.route('POST', '/crimes-street/all-crime', jsonOk([]));
+      // The south lookup hangs; the call is cancelled 3 s after it goes out, once the window has let the query and the other lookups out and they have answered.
+      const hangThenCancel: Responder = (request) => {
+        setTimeout(() => controller.abort(), 3000);
+        return hang(request);
+      };
       h.upstream.route(
         'GET',
         '/locate-neighbourhood',
-        straddleAnswers({ [STRADDLE_SAMPLES.south]: hang }),
+        straddleAnswers({ [STRADDLE_SAMPLES.south]: hangThenCancel }),
       );
-      const pending = startCrimes(STRADDLE, 'all-crime', ctx);
-      await untilReal(() => h.upstream.count('/locate-neighbourhood') === 4);
-      setTimeout(() => controller.abort(), 1000);
-      const error = await settle(pending).catch((e: unknown) => e);
+      const error = await crimes(STRADDLE, 'all-crime', ctx).catch((e: unknown) => e);
+      expect(h.upstream.count('/locate-neighbourhood')).toBe(4);
       expect(error).toBeInstanceOf(Error);
       expect(error).not.toHaveProperty('kind');
       const degraded = (ctx.log as MockContextLogger).calls.some(
@@ -1017,6 +1038,58 @@ describe('areaEcho', () => {
   });
 });
 
+describe('parseSearchArea', () => {
+  const UNPLACED_STREET =
+    "area 'force_unplaced' holds only crimes with no location, so street_name_contains can match none; remove it, or search an area with locations.";
+
+  it('rejects street_name_contains on force_unplaced, whose crimes have no location', () => {
+    expect(
+      parseSearchArea('force_unplaced', {
+        force: 'leicestershire',
+        street_name_contains: 'granby',
+      }),
+    ).toEqual({ ok: false, message: UNPLACED_STREET });
+  });
+
+  it('joins the street problem to an area problem found first', () => {
+    expect(parseSearchArea('force_unplaced', { street_name_contains: 'granby' })).toEqual({
+      ok: false,
+      message: `area 'force_unplaced' needs force; force is missing. ${UNPLACED_STREET}`,
+    });
+  });
+
+  it.each<[string, Parameters<typeof parseSearchArea>]>([
+    ['force_unplaced without the street filter', ['force_unplaced', { force: 'leicestershire' }]],
+    [
+      'force_unplaced with the street filter unset',
+      ['force_unplaced', { force: 'leicestershire', street_name_contains: undefined }],
+    ],
+    [
+      'a point with the street filter',
+      ['point', { lat: 52.63, lng: -1.13, street_name_contains: 'x' }],
+    ],
+    ['area force with the street filter', ['force', { force: 'btp', street_name_contains: 'x' }]],
+  ])('answers as parseArea for %s', (_name, [kind, fields]) => {
+    expect(parseSearchArea(kind, fields)).toEqual(parseArea(kind, fields));
+    expect(parseSearchArea(kind, fields).ok).toBe(true);
+  });
+});
+
+describe('streetPredicate', () => {
+  const onGranby = streetPredicate('granby st');
+
+  it('tests the street part of a location against the value', () => {
+    expect(onGranby({ street_name: 'On or near Granby Street' })).toBe(true);
+    expect(onGranby({ street_name: 'On or near Highcross Street' })).toBe(false);
+    expect(streetPredicate('near')({ street_name: 'On or near Granby Street' })).toBe(false);
+  });
+
+  it('never matches a record with no location, or a bare "On or near "', () => {
+    expect(onGranby(undefined)).toBe(false);
+    expect(streetPredicate('near')({ street_name: 'On or near ' })).toBe(false);
+  });
+});
+
 describe('breakdown', () => {
   it('counts by value, most first, then by value in code-unit order', () => {
     expect(breakdown(['b', 'a', 'b', 'C', 'a', 'z', 'b'], (value) => value)).toEqual([
@@ -1242,6 +1315,127 @@ describe('notice fragments', () => {
       { forces: [], coverageLookupIncomplete: true },
     ])('discloses unresolved coverage without a resolved force: %j', (run) => {
       expect(partialLocateNote(run)).toContain('Coverage could not be checked');
+    });
+  });
+
+  describe('the zero-hit filter sentence and the street-name fragments', () => {
+    type Placed = { readonly location?: { readonly street_name: string } };
+    const at = (street_name?: string): Placed =>
+      street_name === undefined ? {} : { location: { street_name } };
+    const locationOf = (record: Placed) => record.location;
+    const streets = (...counts: Array<readonly [string, number]>): Placed[] =>
+      counts.flatMap(([name, count]) => Array.from({ length: count }, () => at(name)));
+    const two = (i: number) => String(i + 1).padStart(2, '0');
+    const numbered = (n: number) =>
+      Array.from({ length: n }, (_, i) => at(`On or near Street ${two(i)}`));
+    const quoted = (n: number) =>
+      Array.from({ length: n }, (_, i) => `"Street ${two(i)}"`).join(', ');
+
+    it('noFilterMatchNote names the records and joins its clauses', () => {
+      expect(
+        noFilterMatchNote('crimes', [
+          'values present for outcome: "x"',
+          'street names present: none',
+        ]),
+      ).toBe(
+        'No crimes matched the filters; values present for outcome: "x"; street names present: none.',
+      );
+    });
+
+    describe('presentValuesClause', () => {
+      it('lists the values by record count, then value, unrecorded ones as (not recorded)', () => {
+        const records = [{ v: 'b' }, { v: 'a' }, { v: 'b' }, { v: undefined }];
+        expect(presentValuesClause('gender', records, (record) => record.v)).toBe(
+          'values present for gender: "b", "(not recorded)", "a"',
+        );
+      });
+
+      it('lists 12 and counts the rest; exactly 12 has no tail', () => {
+        const values = (n: number) => Array.from({ length: n }, (_, i) => `V${two(i)}`);
+        const listed = values(12)
+          .map((value) => `"${value}"`)
+          .join(', ');
+        expect(presentValuesClause('type', values(15), (value) => value)).toBe(
+          `values present for type: ${listed} and 3 more`,
+        );
+        expect(presentValuesClause('type', values(12), (value) => value)).toBe(
+          `values present for type: ${listed}`,
+        );
+      });
+
+      it('keeps upstream text inert', () => {
+        expect(presentValuesClause('outcome', ['a[b](c) <i>'], (value) => value)).toBe(
+          'values present for outcome: "a\\[b\\](c) \\<i\\>"',
+        );
+      });
+    });
+
+    describe('streetNamesPresentClause', () => {
+      it('lists street names without "On or near", by record count, skipping unplaced records and bare prefixes', () => {
+        const records = [
+          ...streets(
+            ['On or near Granby Place', 1],
+            ['On or near Granby Street', 3],
+            ['On or near ', 5],
+          ),
+          at(),
+          at(),
+          ...streets(['On or near Belgrave-Gate', 1]),
+        ];
+        expect(streetNamesPresentClause(records, locationOf)).toBe(
+          'street names present: "Granby Street", "Belgrave-Gate", "Granby Place"',
+        );
+      });
+
+      it('lists 12 and counts the rest; exactly 12 has no tail', () => {
+        expect(streetNamesPresentClause(numbered(14), locationOf)).toBe(
+          `street names present: ${quoted(12)} and 2 more`,
+        );
+        expect(streetNamesPresentClause(numbered(12), locationOf)).toBe(
+          `street names present: ${quoted(12)}`,
+        );
+      });
+
+      it('says none when no record carries a street name', () => {
+        expect(streetNamesPresentClause([at(), ...streets(['On or near ', 2])], locationOf)).toBe(
+          'street names present: none',
+        );
+      });
+
+      it('keeps street names inert', () => {
+        expect(streetNamesPresentClause([at('On or near [x](y)\r\nz')], locationOf)).toBe(
+          'street names present: "\\[x\\](y) z"',
+        );
+      });
+    });
+
+    describe('matchedStreetsNote', () => {
+      it('names every street name the matched records carry, by record count, when there are several', () => {
+        expect(
+          matchedStreetsNote(
+            streets(['On or near Highfield Street', 1], ['On or near Highcross Street', 13]),
+            locationOf,
+          ),
+        ).toBe(
+          'street_name_contains matched 2 street names: "Highcross Street", "Highfield Street".',
+        );
+      });
+
+      it('lists 12 and counts the rest; exactly 12 has no tail', () => {
+        expect(matchedStreetsNote(numbered(14), locationOf)).toBe(
+          `street_name_contains matched 14 street names: ${quoted(12)} and 2 more.`,
+        );
+        expect(matchedStreetsNote(numbered(12), locationOf)).toBe(
+          `street_name_contains matched 12 street names: ${quoted(12)}.`,
+        );
+      });
+
+      it('says nothing for one street name or none', () => {
+        expect(
+          matchedStreetsNote(streets(['On or near Granby Street', 16]), locationOf),
+        ).toBeUndefined();
+        expect(matchedStreetsNote([], locationOf)).toBeUndefined();
+      });
     });
   });
 

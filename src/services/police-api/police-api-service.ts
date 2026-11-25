@@ -247,13 +247,33 @@ const SHED_MESSAGE =
  * wait when its last answer carried a `Retry-After`; the retry
  * deadline keeps `retry_deadline_exceeded`, with the request's own hint when it
  * has one, and so does a last attempt that timed out before the deadline (a
- * `Timeout` with no reason and no status). Any other failure, one that already
- * names a reason, and one marked `retryable: false` (a 501) pass through. A
- * hint left unset is the calling tool's declared recovery.
+ * `Timeout` with no reason and no status). A deadline that ends before any
+ * attempt was `sent` — the request never left this server's queues — is a
+ * `pacer_shed` instead, with no wait named, since no queue position is known
+ * from here. Any other failure, one that already names a reason, and one marked
+ * `retryable: false` (a 501) pass through. A hint left unset is the calling
+ * tool's declared recovery.
  */
-function typedFailure(error: unknown, request: UpstreamRequest, now: number): unknown {
+function typedFailure(
+  error: unknown,
+  request: UpstreamRequest,
+  now: number,
+  sent: boolean,
+): unknown {
   if (!(error instanceof McpError)) return error;
   const data = error.data ?? {};
+  if (
+    !sent &&
+    error.code === JsonRpcErrorCode.Timeout &&
+    data.reason === 'retry_deadline_exceeded'
+  ) {
+    return new McpError(
+      JsonRpcErrorCode.RateLimited,
+      SHED_MESSAGE,
+      { reason: 'pacer_shed', retryable: true },
+      { cause: error },
+    );
+  }
   const typed = (
     code: JsonRpcErrorCode,
     message: string,
@@ -294,8 +314,11 @@ function typedFailure(error: unknown, request: UpstreamRequest, now: number): un
   return error;
 }
 
-/** A category's match key: lower-cased, each run of spaces, underscores and hyphens folded to one `-`. */
-const categoryKey = (value: string): string => value.toLowerCase().replace(/[\s_-]+/g, '-');
+/**
+ * A category's or outcome's match key: lower-cased, each run of spaces, underscores and hyphens
+ * folded to one `-`.
+ */
+export const categoryKey = (value: string): string => value.toLowerCase().replace(/[\s_-]+/g, '-');
 
 /**
  * A force id or display name folded the way the `force` inputs read it:
@@ -318,7 +341,7 @@ const FORCE_SUFFIX = /-(police-service|police|constabulary)$/;
  */
 const forceKey = (value: string): string => foldForce(value).replace(FORCE_SUFFIX, '');
 
-/** What a `force` input matched: the one force it names, or the `unknown_force` message saying why none was chosen. */
+/** What a `force` input matched: the one force it names, or the `unknown_force` message for a name no force has or a `btp` the route refuses. */
 export type ForceMatch =
   | { readonly force: Force; readonly kind: 'found' }
   | { readonly kind: 'unknown'; readonly message: string };
@@ -391,10 +414,13 @@ async function areaCacheKey(
 }
 
 /**
- * data.police.uk client. One instance per process: the pacer enforces the
- * upstream's per-IP limit (15 requests/s, burst 30) across every caller, area
- * requests hold at most three of its four slots, and the caches hold public data
- * shared by every caller and tenant.
+ * data.police.uk client. One instance per process: the pacer starts at most 3
+ * requests in any 1000 ms across every caller and keeps 4 in flight, area
+ * requests holding at most three of those slots, and the caches hold public data
+ * shared by every caller and tenant. The upstream's per-IP limit is undocumented;
+ * measured, it answers sustained bursts above about 3 requests a second with 429
+ * and `Retry-After: 30`, while 5 requests in flight together, started 400 ms
+ * apart, all answer, so the window binds starts and not concurrency.
  */
 export class PoliceApiService {
   private readonly fetchFn: PoliceApiServiceOptions['fetch'];
@@ -422,7 +448,7 @@ export class PoliceApiService {
     const now = options.now;
     this.pacer = createPacer({
       name: 'data-police-uk',
-      limits: [{ requests: 15, perMs: 1000 }],
+      limits: [{ requests: 3, perMs: 1000 }],
       maxConcurrent: 4,
       maxQueueDepth: 200,
       cooldown: { baseMs: 1000, maxMs: 15_000 },
@@ -536,7 +562,9 @@ export class PoliceApiService {
    * Police`, `Metropolitan Police`, `Devon & Cornwall Police`) against the cached
    * list and {@link BTP_FORCE}. An exact id wins; otherwise the input, each id
    * and each name are compared by {@link forceKey}, and a key two forces share
-   * picks neither. `btp` matches like any force but is returned only with
+   * picks neither: it throws `unknown_force` naming each id, declared as
+   * literals so `content[]` shows them unescaped, the way an ambiguous
+   * neighbourhood throws. `btp` matches like any force but is returned only with
    * `allowBtp`, on the routes that answer for it; an exact `btp` needs no list.
    */
   async findForce(
@@ -556,10 +584,12 @@ export class PoliceApiService {
     const [force, ...others] = matches;
     if (!force) return { kind: 'unknown', message: `No police force '${input}'.` };
     if (others.length > 0) {
-      return {
-        kind: 'unknown',
-        message: `'${input}' matches more than one police force: ${matches.map(({ id }) => `'${id}'`).join(', ')}; send one of their ids.`,
-      };
+      const ids = matches.map(({ id }) => id);
+      throw validationError(
+        `'${input}' matches more than one police force: ${ids.map((id) => `'${id}'`).join(', ')}; send one of their ids.`,
+        { reason: 'unknown_force' },
+        { literals: ids },
+      );
     }
     if (force.id === BTP_FORCE.id && !options.allowBtp) {
       return { kind: 'unknown', message: 'British Transport Police has no neighbourhoods.' };
@@ -646,7 +676,11 @@ export class PoliceApiService {
 
   // --- Area lookups ----------------------------------------------------------
 
-  /** After a genuine detail/boundary miss, find an exact or uniquely case-folded catalog id. */
+  /**
+   * After a genuine detail/boundary miss, find an exact or uniquely case-folded
+   * catalog id. Several case-folded matches throw `ambiguous_neighbourhood`
+   * naming each one, declared as literals so `content[]` shows them unescaped.
+   */
   async matchNeighbourhoodAfterMiss(
     force: string,
     id: string,
@@ -672,6 +706,7 @@ export class PoliceApiService {
           reason: 'ambiguous_neighbourhood',
           recovery: { hint },
         },
+        { literals: candidates },
       );
     }
     return candidates[0];
@@ -1001,8 +1036,9 @@ export class PoliceApiService {
    * `min(45 s, what remains of the call budget)`; an upstream `Retry-After` that
    * leaves the next attempt {@link MIN_ATTEMPT_AFTER_WAIT_MS} of it is waited out
    * between attempts, holding no slot, and one that does not fails at once. A
-   * failure that leaves the loop is typed by {@link typedFailure}; a cancelled
-   * call rethrows untouched.
+   * failure that leaves the loop is typed by {@link typedFailure}, which reads a
+   * deadline reached before any attempt was sent as a shed; a cancelled call
+   * rethrows untouched.
    */
   private send(
     request: UpstreamRequest & { readonly area: true },
@@ -1025,6 +1061,8 @@ export class PoliceApiService {
     const deadlineMs = Math.min(SERVICE_CALL_DEADLINE_MS, remainingMs);
     const latestRetryAt = this.now() + deadlineMs - MIN_ATTEMPT_AFTER_WAIT_MS;
     let attempts = 0;
+    /** Whether any attempt left the queues for the upstream; a deadline before one did is a shed, not a slow upstream. */
+    let sent = false;
     /** The framework's verdict, except that a `Retry-After` ending after `latestRetryAt` is not waited out. */
     const isTransient = (error: unknown): boolean => {
       if (!defaultIsTransient(error)) return false;
@@ -1043,10 +1081,11 @@ export class PoliceApiService {
             : Math.min(ATTEMPT_TIMEOUT_MS, attemptBudgetMs);
           const paced = (pacedSignal: AbortSignal, maxWaitMs: number) =>
             this.pacer.run(
-              (runSignal) =>
-                mustFit && !this.fitsAttempt(budget)
-                  ? Promise.resolve(LATE)
-                  : this.attempt(request, runSignal, timeoutMs, ctx),
+              (runSignal) => {
+                if (mustFit && !this.fitsAttempt(budget)) return Promise.resolve(LATE);
+                sent = true;
+                return this.attempt(request, runSignal, timeoutMs, ctx);
+              },
               { signal: pacedSignal, maxWaitMs },
             );
           if (!request.area) return paced(signal, PACER_MAX_WAIT_MS);
@@ -1071,7 +1110,7 @@ export class PoliceApiService {
       );
     } catch (error) {
       if (ctx.signal.aborted) throw error;
-      throw typedFailure(error, request, this.now());
+      throw typedFailure(error, request, this.now(), sent);
     }
   }
 

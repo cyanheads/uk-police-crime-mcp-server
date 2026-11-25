@@ -794,6 +794,66 @@ describe('ukcrime_search_stops over a month range', () => {
     });
   });
 
+  describe('street_name_contains over a range', () => {
+    const granby = wireLocation(1_000_101, 'On or near Granby Street', '52.634400', '-1.131600');
+    const other = wireLocation(1_000_102, 'On or near Highcross Street', '52.635400', '-1.131600');
+    const at = (datetime: string, location: unknown) => stopRecord({ datetime, location });
+
+    it('narrows each month, so by_month sums to total, and pages the matched stops across months', async () => {
+      h.upstream.route(
+        'GET',
+        STREET,
+        perMonth({
+          '2026-06': jsonOk([
+            at('2026-06-01T10:00:00+00:00', granby),
+            at('2026-06-02T10:00:00+00:00', other),
+            at('2026-06-03T10:00:00+00:00', granby),
+          ]),
+          '2026-07': jsonOk([at('2026-07-01T10:00:00+00:00', other)]),
+          '2026-08': jsonOk([
+            at('2026-08-01T10:00:00+00:00', null),
+            at('2026-08-02T10:00:00+00:00', granby),
+          ]),
+        }),
+      );
+      locates();
+      const range = {
+        ...POINT,
+        month_from: '2026-06',
+        month: '2026-08',
+        street_name_contains: 'Granby St',
+        limit: 2,
+      } as const;
+      const result = await call(range);
+      const out = data(result);
+      expect(out.by_month).toEqual([
+        { month: '2026-06', total: 2, force_published: true },
+        { month: '2026-07', total: 0, force_published: true },
+        { month: '2026-08', total: 1, force_published: true },
+      ]);
+      expect([out.total, out.unfiltered_total, out.unplaced]).toEqual([3, 6, 0]);
+      expect(out.stops.map((stop) => stop.datetime)).toEqual([
+        '2026-06-01T10:00:00+00:00',
+        '2026-06-03T10:00:00+00:00',
+      ]);
+      expect(out.next_offset).toBe(2);
+      expect(out.notice).toBe('Showing 1–2 of 3; call again with offset 2 for more.');
+      expect(text(result)).toContain('| 2026-07 | 0 | yes |');
+      const next = data(await call({ ...range, offset: 2 }));
+      expect(next.stops.map((stop) => stop.datetime)).toEqual(['2026-08-02T10:00:00+00:00']);
+      expect(next).not.toHaveProperty('next_offset');
+      expect(h.upstream.count(STREET)).toBe(3);
+    });
+
+    it('one month: the one-month keys plus the echo', async () => {
+      h.upstream.route('GET', STREET, jsonOk([at('2026-07-01T10:00:00+00:00', granby)]));
+      locates();
+      const out = data(await call({ ...POINT, month: '2026-07', street_name_contains: 'granby' }));
+      expect(Object.keys(out).sort()).toEqual([...ONE_MONTH_KEYS, 'street_name_contains'].sort());
+      expect(out.total).toBe(1);
+    });
+  });
+
   describe('every area arm', () => {
     it('location: one request a month, located once from the first stop carrying a map point, each month flagged for that force', async () => {
       const spot = wireLocation(1_000_005, 'On or near Spot Street', '52.640000', '-1.140000');

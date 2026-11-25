@@ -61,6 +61,15 @@ describe('LocationSchema', () => {
       expect(property.description, name).toBeTruthy();
     }
   });
+
+  it('describes a street name as "On or near …", allowing the bare prefix with no street after it', () => {
+    expect(LocationSchema.shape.street_name.description).toBe(
+      'Street as published: "On or near …", or a bare "On or near " with no street after it, as Northern Ireland publishes some.',
+    );
+    expect(
+      LocationSchema.safeParse({ location_id: '2294587', street_name: 'On or near ' }).success,
+    ).toBe(true);
+  });
 });
 
 describe('AreaEchoSchema', () => {

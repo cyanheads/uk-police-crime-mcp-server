@@ -8,6 +8,7 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { cell, inline } from '@/mcp-server/tools/format-helpers.js';
+import { filterByName } from '@/mcp-server/tools/name-matcher.js';
 import {
   ATTRIBUTION,
   forceInput,
@@ -114,27 +115,6 @@ const OutputSchema = z.object({
 
 type ListReferenceOutput = z.infer<typeof OutputSchema>;
 
-/** Lower-cases, strips diacritics and punctuation, keeps letters, digits and whitespace. */
-const normalizeName = (text: string): string =>
-  text
-    .toLowerCase()
-    .normalize('NFKD')
-    .replace(/\p{M}/gu, '')
-    .replace(/[^\p{L}\p{N}\s]/gu, '');
-
-/** Strict token match over `name`: every token of `query` must appear. No query keeps every entry. */
-function filterByName<T extends { readonly name: string }>(
-  entries: readonly T[],
-  query: string | undefined,
-): readonly T[] {
-  if (query === undefined) return entries;
-  const tokens = normalizeName(query).split(/\s+/).filter(Boolean);
-  return entries.filter((entry) => {
-    const haystack = normalizeName(entry.name);
-    return tokens.every((token) => haystack.includes(token));
-  });
-}
-
 export const listReferenceTool = tool('ukcrime_list_reference', {
   title: 'List UK Police Reference Data',
   description:
@@ -150,7 +130,7 @@ export const listReferenceTool = tool('ukcrime_list_reference', {
       "Force id such as 'leicestershire', or its name such as 'Leicestershire Police'; case-insensitive, spaces, underscores and hyphens match each other, '&' matches 'and', and a trailing 'Police', 'Police Service' or 'Constabulary' is optional. Required for topic 'neighbourhoods'. On 'availability', where 'btp' (British Transport Police) is also accepted, adds the months this force did and did not publish stop and search. Not accepted on 'forces' or 'categories'.",
     ),
     name_contains: nameContainsInput.describe(
-      "Words that must all appear in the name, in any order — case, accents and punctuation ignored, so the value needs at least one letter or digit. Topics 'forces' and 'neighbourhoods' only.",
+      "Words that must all appear in the name, in any order, part of a word included — case, accents and punctuation ignored, punctuation in the value splitting words, and a name's '&' also matching 'and' — so the value needs at least one letter or digit. Topics 'forces' and 'neighbourhoods' only.",
     ),
     month: monthInput.describe(
       "Month as YYYY-MM. Topic 'availability' only: return just that month's row.",

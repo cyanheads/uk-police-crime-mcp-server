@@ -142,6 +142,26 @@ describe('PoliceApiService neighbourhood and crime-history reads', () => {
       expect(h.upstream.count(`/${FORCE}/neighbourhoods`)).toBe(1);
     });
 
+    it('declares the candidate ids, and only those, as literals the caller sends back verbatim', async () => {
+      h.upstream.route(
+        'GET',
+        `/${FORCE}/neighbourhoods`,
+        jsonOk([
+          { id: '_NX01', name: 'A' },
+          { id: '_nx01', name: 'B' },
+        ]),
+      );
+      const error = await failure(
+        h.service.matchNeighbourhoodAfterMiss(FORCE, '_Nx01', h.ctx, h.budget()),
+      );
+      const hint = "Send one of these exact neighbourhood ids: '_NX01', '_nx01'.";
+      expect(error.message).toBe(
+        `Neighbourhood '_Nx01' matches more than one id in force '${FORCE}'. ${hint}`,
+      );
+      expect(error.data).toEqual({ reason: 'ambiguous_neighbourhood', recovery: { hint } });
+      expect(error.literals).toEqual(['_NX01', '_nx01']);
+    });
+
     it('treats repeated copies of the same catalog id as one match', async () => {
       h.upstream.route(
         'GET',

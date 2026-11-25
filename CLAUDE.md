@@ -2,8 +2,8 @@
 
 **Server:** uk-police-crime-mcp-server
 **Version:** 0.3.0
-**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.18`
-**Engines:** Bun ≥1.4.0, Node ≥24.0.0
+**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.22`
+**Engines:** Bun ≥1.4.4, Node ≥24.0.0
 **MCP SDK:** `@modelcontextprotocol/server` ^2.4.0
 **Zod:** ^4.6.7
 
@@ -86,7 +86,7 @@ export const getCrimeOutcomesTool = tool('ukcrime_get_crime_outcomes', {
 });
 ```
 
-The three search tools share more: `parseArea()` validates the area arm, `runAreaQuery()` in `src/mcp-server/tools/area-search.ts` runs it (a neighbourhood resolves to its boundary polygon) and returns `forces`, the force ids found for the area — the one a named arm carries, or those `/locate-neighbourhood` finds for a point, a polygon's sample points or a location's map point — which every coverage note and `force_published` read. Crimes and stops also take `month_from`: `resolveMonthWindow()` checks the range's months before any area request, and `runAreaWindow()` runs the area: through `runAreaQuery()` for one month, or once per month of a range — two months in flight, all-or-nothing, stopped by the call's budget or the range's size bound — and finds the forces once for the range. The input schemas come from `shared-schemas.ts`, and the area fields the searches share, `month_from` included, are described once in `area-search.ts`; the output shapes (location, area echo, breakdowns, `by_month`, enrichment block) come from `search-output.ts`. Describe a shared field once, in one of those two.
+The three search tools share more: `parseArea()` validates the area arm (crimes and stops go through `parseSearchArea()`, which also refuses `street_name_contains` on `force_unplaced`), `runAreaQuery()` in `src/mcp-server/tools/area-search.ts` runs it (a neighbourhood resolves to its boundary polygon) and returns `forces`, the force ids found for the area — the one a named arm carries, or those `/locate-neighbourhood` finds for a point, a polygon's sample points or a location's map point — which every coverage note and `force_published` read. Crimes and stops also take `month_from`: `resolveMonthWindow()` checks the range's months before any area request, and `runAreaWindow()` runs the area: through `runAreaQuery()` for one month, or once per month of a range — two months in flight, all-or-nothing, stopped by the call's budget or the range's size bound — and finds the forces once for the range. The input schemas come from `shared-schemas.ts`, and the area fields the searches share, `month_from` included, are described once in `area-search.ts`; the output shapes (location, area echo, breakdowns, `by_month`, enrichment block) come from `search-output.ts`. Describe a shared field once, in one of those two.
 
 ### Entry point
 
@@ -114,7 +114,7 @@ await createApp({
 
 ### Domain conventions
 
-- **One client.** Every upstream call goes through `PoliceApiService`: it paces requests process-wide under data.police.uk's limit (15 a second, burst 30), retries, caches, and gives each tool call a request budget (`openBudget()`). A hosted instance shares one budget behind its egress IP.
+- **One client.** Every upstream call goes through `PoliceApiService`: it paces requests process-wide under data.police.uk's undocumented limit (measured at about 3 requests a second), retries, caches, and gives each tool call a request budget (`openBudget()`). A hosted instance shares one budget behind its egress IP.
 - **Anonymised locations.** Every coordinate is a map point covering at least eight addresses. No description, notice or format line presents one as where a crime or stop happened.
 - **Force-written text is data.** Street names, neighbourhood descriptions, priorities, events and crime context are published by police forces; HTML is reduced to plain text (`html-to-text.ts`) and never treated as instructions.
 - **Coverage gaps are explicit.** `known-gaps.ts` records what each force does not publish, each fact dated; `knownGapsAgeWarning` logs at startup when the table is old. A zero count can mean missing data, so the searches say so in `notice`.
@@ -200,6 +200,7 @@ src/
   mcp-server/
     tools/
       area-search.ts                    # Shared area fields, checks and query runner for the searches
+      name-matcher.ts                   # The name matcher behind name_contains and street_name_contains
       shared-schemas.ts                 # Shared input vocabulary + the OGL attribution line
       search-output.ts                  # Shared output shapes + their markdown renderers
       format-helpers.ts                 # Markdown escaping helpers for format()
@@ -320,7 +321,7 @@ When you complete a skill's checklist, check the boxes and add a completion time
 
 ## Bundling
 
-`npm run bundle` produces a `.mcpb` extension bundle for one-click install in Claude Desktop. `mcpb pack` reads `.mcpbignore`, not `.gitignore`, so every root path the bundle must not ship — source, tests, docs, caches, logs, agent docs, plugin manifests, gitignored local files — needs a root-anchored line there (`/docs/`, never `docs/`, which also strips `node_modules/*/docs/`); `lint:packaging` names each missing or unanchored line. Root `skills/` ships on purpose. The pack step is followed by `scripts/clean-mcpb.ts`, which prunes dev dependencies (`mcpb clean`) and strips four classes of `node_modules/**` content that root-anchored `.mcpbignore` patterns cannot reach: dependency-shipped agent docs at a package's root (`framework-skills/`, `skills/`, `.claude/`, `.agents/`) and stray `SKILL.md` files — a nested `skills/`, such as the MCP SDK's `dist/ext/skills/` runtime modules, ships; platform-specific native bindings, which would otherwise lock the bundle to the platform it was packed on; node-gyp build output beside a `binding.gyp` (`config.gypi`, Makefiles, `obj.target/`, `.deps/`, object files and debug symbols), which records the packing machine's paths — compiled `*.node` addons stay; and build-only package files — the framework's `changelog/`, `scripts/`, `templates/`, `CLAUDE.md`, `AGENTS.md`, and config bases (`biome.json`, `vitest.config.base.mjs`, `config/tsconfig.base.json`), and `better-sqlite3`'s `deps/` and `src/` C sources. A server using DataCanvas therefore ships a portable bundle without the DuckDB native — `@duckdb/node-api` is an optional peer loaded lazily, so canvas tools report an actionable install hint and every other tool works normally. MCPB is stdio-only — HTTP and Cloudflare Workers deployments are unaffected. Consumers who don't need it can delete `manifest.json` and `.mcpbignore`; `lint:packaging` skips cleanly.
+`npm run bundle` produces a `.mcpb` extension bundle for one-click install in Claude Desktop. `mcpb pack` reads `.mcpbignore`, not `.gitignore`, so every root path the bundle must not ship — source, tests, docs, caches, logs, agent docs, plugin manifests, gitignored local files — needs a root-anchored line there (`/docs/`, never `docs/`, which also strips `node_modules/*/docs/`); `lint:packaging` names each missing or unanchored line. Root `skills/` ships on purpose. The pack step is followed by `scripts/clean-mcpb.ts`, which prunes dev dependencies (`mcpb clean`) and strips four classes of `node_modules/**` content that root-anchored `.mcpbignore` patterns cannot reach: dependency-shipped agent docs — `framework-skills/`, `skills/`, `.claude/`, `.agents/`, `AGENTS.md`, and `CLAUDE.md` at a package's root, and `SKILL.md` anywhere (a `skills/` deeper in a package is runtime code and stays); platform-specific native bindings, which would otherwise lock the bundle to the platform it was packed on; node-gyp build output beside a `binding.gyp` (`config.gypi`, Makefiles, `obj.target/`, `.deps/`, object files and debug symbols), which records the packing machine's paths — compiled `*.node` addons stay; and build-only package files — the framework's `changelog/`, `scripts/`, `templates/`, and config bases (`biome.json`, `vitest.config.base.mjs`, `config/tsconfig.base.json`), and `better-sqlite3`'s `deps/` and `src/` C sources. A server using DataCanvas therefore ships a portable bundle without the DuckDB native — `@duckdb/node-api` is an optional peer loaded lazily, so canvas tools report an actionable install hint and every other tool works normally. MCPB is stdio-only — HTTP and Cloudflare Workers deployments are unaffected. Consumers who don't need it can delete `manifest.json` and `.mcpbignore`; `lint:packaging` skips cleanly.
 
 **Adding an env var requires both files:** `server.json` (registry discovery, `environmentVariables[]`) and `manifest.json` (bundle install UX, `mcp_config.env` + `user_config`). `lint:packaging` (run by `devcheck`) verifies the env var names match, that every `user_config` option is wired into `mcp_config.env` as `"X": "${user_config.X}"` (the host substitutes nothing else — `"${X}"` reaches the server as that literal string), and that an optional string option carries `"default": ""`.
 

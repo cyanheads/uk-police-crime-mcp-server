@@ -2,8 +2,10 @@
  * @fileoverview ukcrime_search_outcomes through `runToolContract` (the
  * production parse of output extended with enrichment): every area arm, the
  * month and category inputs (local category filter, breakdowns after it), the
- * breakdown sort orders, paging and `next_offset`, every zero-hit notice and its
- * fragment order, coverage notes for the outcomes aspect, every declared error
+ * outcome and street_name_contains filters (their wiring; the matching rules
+ * are tabled at their own seams), the breakdown sort orders, paging and
+ * `next_offset`, every zero-hit notice and its
+ * fragment order, coverage notes for the outcomes and locations aspects, every declared error
  * reason, the enrichment fields on the zero-result page and the under-cap page
  * and their write order, upstream failure classes, blank form values, and
  * `format()` carrying the same data as `structuredContent` with upstream text
@@ -40,6 +42,7 @@ import {
   STRADDLE_RING,
   STRADDLE_SAMPLES,
   status,
+  streetOutcomesBody,
   wireLocation,
 } from '../fixtures/police-api-upstream.js';
 import { manyOutcomes, outcomeFor } from '../fixtures/police-api-upstream-w3.js';
@@ -106,6 +109,23 @@ const OUTSIDE_POINT =
   'This point is outside data.police.uk coverage (England, Wales and Northern Ireland; Scotland only through British Transport Police); check that lat and lng are not swapped.';
 const POINT_TOO_LARGE =
   "A 1-mile circle here holds more than 10,000 outcomes; search area 'polygon' with a smaller ring around the point.";
+
+const CAUTION = { code: 'cautioned', name: 'Offender given a caution' };
+
+/**
+ * {@link streetOutcomesBody} with every fifth outcome a caution: 9 of 43, the
+ * outcomes for crimes 0, 5, …, 40 — three each of burglary (0, 15, 30),
+ * shoplifting and violent-crime — on Granby Street (0, 5, 10, 15), Highcross
+ * Street (20, 25), Granby Place (30), Theatre/concert Hall (35) and Highfield
+ * Street (40).
+ */
+const withCautions = () =>
+  streetOutcomesBody().map((outcome, i) =>
+    i % 5 === 0 ? { ...outcome, category: CAUTION } : outcome,
+  );
+
+/** Crime ids of {@link streetOutcomesBody} entries, by index. */
+const crimeIds = (indexes: readonly number[]) => indexes.map((i) => String(300_000_000 + i));
 
 describe('ukcrime_search_outcomes', () => {
   const h = useToolHarness();
@@ -640,6 +660,449 @@ describe('ukcrime_search_outcomes', () => {
     });
   });
 
+  /** Output with neither outcome nor street_name_contains, and with either sent blank, which reads exactly as absent. */
+  describe('without outcome or street_name_contains', () => {
+    const KEYS = [
+      'area',
+      'attribution',
+      'by_category',
+      'by_crime_month',
+      'by_outcome',
+      'cap',
+      'data_note',
+      'month',
+      'outcomes',
+      'shown',
+      'total',
+      'truncated',
+      'unfiltered_total',
+    ];
+
+    it('keeps the key set, the notice and the header lines', async () => {
+      pointRoutes();
+      const result = await call({ ...POINT, month: '2026-07' });
+      expect(Object.keys(result.structuredContent ?? {}).sort()).toEqual(KEYS);
+      expect(text(result)).toContain(
+        '## Police outcomes — 2026-07\n\n**Area:** point · lat 52.63 · lng -1.13 · located force leicestershire · located neighbourhood NX01\n**Outcomes matched:** 3 of 3 published for this month\n',
+      );
+      const paged = await call({ ...POINT, limit: 2 });
+      expect(Object.keys(paged.structuredContent ?? {}).sort()).toEqual(
+        [...KEYS, 'next_offset', 'notice'].sort(),
+      );
+      expect(data(paged).notice).toBe(
+        `${MONTH_NOTE} Showing 1–2 of 3; call again with offset 2 for more.`,
+      );
+    });
+
+    it.each<[string, Record<string, unknown>]>([
+      ['empty strings', { outcome: '', street_name_contains: '' }],
+      ['whitespace', { outcome: '  \t ', street_name_contains: ' ' }],
+      ['null', { outcome: null, street_name_contains: null }],
+    ])(
+      'reads %s as unset: output and notices byte-identical to leaving both out',
+      async (_name, blanks) => {
+        pointRoutes(withCautions());
+        const absent = await call({ ...POINT, limit: 10 });
+        const blank = await callRaw({ ...POINT, limit: 10, ...blanks });
+        expect(JSON.stringify(blank.structuredContent)).toBe(
+          JSON.stringify(absent.structuredContent),
+        );
+        expect(text(blank)).toBe(text(absent));
+        expect(text(blank)).not.toContain('**Outcome:**');
+        expect(text(blank)).not.toContain('Street name contains');
+      },
+    );
+
+    it.each<[string, Record<string, unknown>]>([
+      ['neither filter', {}],
+      ['both filters (no request added)', { outcome: 'cautioned', street_name_contains: 'granby' }],
+    ])('sends the same three requests with %s', async (_name, filters) => {
+      pointRoutes(withCautions());
+      await callRaw({ ...POINT, month: '2026-07', ...filters });
+      expect(h.upstream.calls.map((c) => `${c.method} ${c.path} ${c.query}`).sort()).toEqual([
+        'GET /crimes-street-dates ',
+        'GET /locate-neighbourhood q=52.630000%2C-1.130000',
+        'GET /outcomes-at-location lat=52.630000&lng=-1.130000&date=2026-07',
+      ]);
+    });
+  });
+
+  /** The outcome fold (`categoryKey`) and the notice builders are tabled at their own seams; these prove the wiring. */
+  describe('outcome', () => {
+    const CAUTION_IDS = crimeIds([0, 5, 10, 15, 20, 25, 30, 35, 40]);
+
+    it.each([
+      'cautioned',
+      'Offender given a caution',
+      'OFFENDER_GIVEN_A_CAUTION',
+      'offender  given-a_caution',
+    ])(
+      'keeps the 9 cautions for %j: the total, every breakdown and the page narrow; unfiltered_total stays; echoed as sent',
+      async (outcome) => {
+        pointRoutes(withCautions());
+        const result = await call({ ...POINT, month: '2026-07', outcome });
+        const out = data(result);
+        expect(out.outcome).toBe(outcome);
+        expect([out.total, out.unfiltered_total]).toEqual([9, 43]);
+        expect(out.by_outcome).toEqual([{ ...CAUTION, count: 9 }]);
+        expect(out.by_category).toEqual([
+          { value: 'burglary', count: 3 },
+          { value: 'shoplifting', count: 3 },
+          { value: 'violent-crime', count: 3 },
+        ]);
+        expect(out.by_crime_month).toEqual([{ month: '2026-08', count: 9 }]);
+        expect(out.outcomes.map((o) => o.crime.id)).toEqual(CAUTION_IDS);
+        expect(out.outcomes.every((o) => o.code === 'cautioned')).toBe(true);
+        expect([out.shown, out.truncated]).toEqual([9, false]);
+        expect(out.notice).toBeUndefined();
+        expect(text(result)).toContain('| Offender given a caution | cautioned | 9 |');
+      },
+    );
+
+    it('prints the echo after the category line and before the count', async () => {
+      pointRoutes(withCautions());
+      const markdown = text(
+        await call({ ...POINT, month: '2026-07', category: 'burglary', outcome: 'cautioned' }),
+      );
+      expect(markdown).toContain(
+        '**Crime category:** Burglary (burglary)\n**Outcome:** "cautioned"\n**Outcomes matched:** 3 of 43 published for this month\n',
+      );
+    });
+
+    it.each(['caution', 'under', '(not recorded)'])(
+      'matches whole values only: %j keeps nothing',
+      async (outcome) => {
+        pointRoutes(withCautions());
+        const out = data(await call({ ...POINT, month: '2026-07', outcome }));
+        expect([out.total, out.unfiltered_total]).toEqual([0, 43]);
+      },
+    );
+
+    it('on a zero from a non-empty area, lists the outcome codes present, by count', async () => {
+      pointRoutes(withCautions());
+      const result = await call({ ...POINT, month: '2026-07', outcome: 'awaiting-court-result' });
+      const out = data(result);
+      expect([out.total, out.unfiltered_total, out.shown]).toEqual([0, 43, 0]);
+      expect([out.by_outcome, out.by_category, out.by_crime_month, out.outcomes]).toEqual([
+        [],
+        [],
+        [],
+        [],
+      ]);
+      const note =
+        'No outcomes matched the filters; values present for outcome: "under-investigation", "cautioned".';
+      expect(out.notice).toBe(note);
+      expect(text(result)).toContain(`> ${note}`);
+      expect(text(result)).toContain('**Outcome:** "awaiting-court-result"');
+    });
+
+    it('ANDs with category, reads the values present after it, and gives the category fragment only when the category set is itself empty', async () => {
+      pointRoutes([
+        outcomeFor(1, '2026-07', 'cautioned', 'Offender given a caution', 'burglary'),
+        outcomeFor(2, '2026-07', 'local-resolution', 'Local resolution', 'drugs'),
+        outcomeFor(3, '2026-07', 'under-investigation', 'Under investigation', 'burglary'),
+      ]);
+      const anded = data(
+        await call({ ...POINT, month: '2026-07', category: 'burglary', outcome: 'cautioned' }),
+      );
+      expect([anded.total, anded.unfiltered_total]).toEqual([1, 3]);
+      expect(anded.outcomes.map((o) => o.crime.id)).toEqual(['1']);
+      const outcomeEmptied = data(
+        await call({
+          ...POINT,
+          month: '2026-07',
+          category: 'burglary',
+          outcome: 'local-resolution',
+        }),
+      );
+      expect(outcomeEmptied.notice).toBe(
+        'No outcomes matched the filters; values present for outcome: "cautioned", "under-investigation".',
+      );
+      const categoryEmptied = data(
+        await call({ ...POINT, month: '2026-07', category: 'robbery', outcome: 'cautioned' }),
+      );
+      expect(categoryEmptied.notice).toBe(
+        'Only outcomes for Robbery crimes were counted; omit category for all.',
+      );
+    });
+
+    it('caps a filtered page at 200 and numbers the paging fragment against the filtered total', async () => {
+      pointRoutes(manyOutcomes(700));
+      const input = { ...POINT, month: '2026-07', outcome: 'Under investigation', limit: 500 };
+      const first = data(await call(input));
+      expect([first.total, first.unfiltered_total]).toEqual([234, 700]);
+      expect([first.cap, first.shown, first.truncated, first.next_offset]).toEqual([
+        200,
+        200,
+        true,
+        200,
+      ]);
+      expect(first.notice).toBe('Showing 1–200 of 234; call again with offset 200 for more.');
+      const rest = data(await call({ ...input, offset: 200 }));
+      expect([rest.shown, rest.truncated]).toEqual([34, false]);
+      expect(rest).not.toHaveProperty('next_offset');
+      expect(rest.outcomes.every((o) => o.code === 'under-investigation')).toBe(true);
+      expect(h.upstream.count('/outcomes-at-location')).toBe(1);
+    });
+
+    it('keeps the empty-area notice when there was nothing to filter', async () => {
+      pointRoutes([]);
+      const out = data(await call({ ...POINT, month: '2026-07', outcome: 'cautioned' }));
+      expect(out.notice).toBe(
+        'No outcomes published here for 2026-07; try another month or a wider area.',
+      );
+    });
+
+    it('lets the coverage note alone explain a zero where the force publishes no outcomes', async () => {
+      pointRoutes([], locateBody({ force: 'northern-ireland', neighbourhood: 'ZZ1' }));
+      const out = data(await call({ ...POINT, month: '2026-07', outcome: 'cautioned' }));
+      expect(out.notice).toBe(
+        coverageNotes('northern-ireland', ['outcomes'], ['2026-07']).join(' '),
+      );
+    });
+
+    it('joins the zero-hit sentence after the coverage lines, which keep their place', async () => {
+      pointRoutes(
+        withCautions(),
+        locateBody({ force: 'devon-and-cornwall', neighbourhood: 'DC1' }),
+      );
+      const out = data(await call({ ...POINT, outcome: 'awaiting-court-result' }));
+      expect(out.notice).toBe(
+        [
+          MONTH_NOTE,
+          ...coverageNotes('devon-and-cornwall', ['outcomes'], ['2026-08']),
+          'No outcomes matched the filters; values present for outcome: "under-investigation", "cautioned".',
+        ].join(' '),
+      );
+    });
+
+    it('rejects an outcome over 100 characters as invalid_arguments before any request', async () => {
+      const error = errorOf(await callRaw({ ...POINT, outcome: 'a'.repeat(101) }));
+      expect(error.code).toBe(JsonRpcErrorCode.InvalidParams);
+      expect(error.data.reason).toBe('invalid_arguments');
+      expect(error.data.issues).toMatchObject([
+        { path: ['outcome'], message: 'Too big: expected string to have <=100 characters' },
+      ]);
+      expect(h.upstream.calls).toHaveLength(0);
+    });
+  });
+
+  /** The street matching rule is tabled in tests/shared/name-matcher.test.ts; these prove the wiring. */
+  describe('street_name_contains', () => {
+    const GRANBY_IDS = crimeIds(Array.from({ length: 16 }, (_, i) => i));
+    const PRESENT =
+      'street names present: "Granby Street", "Highcross Street", "Granby Place", "Theatre/concert Hall", "Belgrave-Gate", "Siemen\'S Street", "Highfield Street"';
+    const onStreet = (street: string, extra: Partial<Input> = {}) =>
+      call({ ...POINT, month: '2026-07', street_name_contains: street, ...extra });
+
+    it.each([
+      'granby street',
+      'Granby St',
+      'GRANBY STREET',
+      'granby-street',
+      'On or near Granby Street',
+    ])(
+      'keeps the 16 Granby Street outcomes and nothing else for %j; unfiltered_total stays; echoed as sent',
+      async (street) => {
+        pointRoutes(streetOutcomesBody());
+        const out = data(await onStreet(street));
+        expect(out.street_name_contains).toBe(street);
+        expect([out.total, out.unfiltered_total]).toEqual([16, 43]);
+        expect(out.by_category).toEqual([
+          { value: 'burglary', count: 6 },
+          { value: 'shoplifting', count: 5 },
+          { value: 'violent-crime', count: 5 },
+        ]);
+        expect(out.by_outcome).toEqual([
+          { code: 'under-investigation', name: 'Under investigation', count: 16 },
+        ]);
+        expect(out.by_crime_month).toEqual([{ month: '2026-08', count: 16 }]);
+        expect(out.outcomes.map((o) => o.crime.id)).toEqual(GRANBY_IDS);
+        expect(new Set(out.outcomes.map((o) => o.crime.location?.street_name))).toEqual(
+          new Set(['On or near Granby Street']),
+        );
+        expect(out.notice).toBeUndefined();
+      },
+    );
+
+    it('prints the echo before the count', async () => {
+      pointRoutes(streetOutcomesBody());
+      expect(text(await onStreet('granby street'))).toContain(
+        'located neighbourhood NX01\n**Street name contains:** "granby street"\n**Outcomes matched:** 16 of 43 published for this month\n',
+      );
+    });
+
+    it('names each street matched when there are several, before the paging fragment', async () => {
+      pointRoutes(streetOutcomesBody());
+      const out = data(await onStreet('high street', { limit: 10 }));
+      expect([out.total, out.next_offset]).toEqual([14, 10]);
+      expect(new Set(out.outcomes.map((o) => o.crime.location?.street_name))).toEqual(
+        new Set(['On or near Highcross Street']),
+      );
+      expect(out.notice).toBe(
+        'street_name_contains matched 2 street names: "Highcross Street", "Highfield Street". Showing 1–10 of 14; call again with offset 10 for more.',
+      );
+    });
+
+    it('on a zero from a non-empty area, lists the street names present, read before the filter, without the blank one', async () => {
+      pointRoutes(streetOutcomesBody());
+      const result = await onStreet('near');
+      const out = data(result);
+      expect([out.total, out.unfiltered_total]).toEqual([0, 43]);
+      expect(out.notice).toBe(`No outcomes matched the filters; ${PRESENT}.`);
+      expect(text(result)).toContain(`> No outcomes matched the filters; ${PRESENT}.`);
+    });
+
+    it('never matches an outcome whose crime has no location', async () => {
+      pointRoutes([areaOutcomeRecord({ crime: crimeRecord({ location: null }) })]);
+      const out = data(await onStreet('example'));
+      expect([out.total, out.unfiltered_total]).toEqual([0, 1]);
+      expect(out.notice).toBe('No outcomes matched the filters; street names present: none.');
+    });
+
+    it("on area 'location', keeps every outcome or none", async () => {
+      h.upstream.route('GET', '/outcomes-at-location', jsonOk(streetOutcomesBody().slice(0, 16)));
+      h.upstream.route('GET', '/locate-neighbourhood', jsonOk(locateBody()));
+      const at = (street: string) =>
+        call({
+          area: 'location',
+          location_id: '1000101',
+          month: '2026-07',
+          street_name_contains: street,
+        });
+      expect(data(await at('granby')).total).toBe(16);
+      const none = data(await at('highcross'));
+      expect([none.total, none.unfiltered_total]).toEqual([0, 16]);
+      expect(none.notice).toBe(
+        'No outcomes matched the filters; street names present: "Granby Street".',
+      );
+    });
+
+    it('pages the filtered set in its own index space, on one area request', async () => {
+      pointRoutes(streetOutcomesBody());
+      const first = data(await onStreet('granby street', { limit: 10 }));
+      expect(first.outcomes.map((o) => o.crime.id)).toEqual(GRANBY_IDS.slice(0, 10));
+      expect([first.next_offset, first.truncated, first.shown, first.cap]).toEqual([
+        10,
+        true,
+        10,
+        10,
+      ]);
+      expect(first.notice).toBe('Showing 1–10 of 16; call again with offset 10 for more.');
+      const second = data(await onStreet('granby street', { limit: 10, offset: 10 }));
+      expect(second.outcomes.map((o) => o.crime.id)).toEqual(GRANBY_IDS.slice(10));
+      expect(second).not.toHaveProperty('next_offset');
+      expect([second.truncated, second.shown]).toEqual([false, 6]);
+      expect(second.notice).toBeUndefined();
+      const past = data(await onStreet('granby street', { offset: 16 }));
+      expect([past.total, past.shown]).toEqual([16, 0]);
+      expect(past.outcomes).toEqual([]);
+      expect(past.notice).toBe(
+        'offset 16 is past the last of 16 outcomes; omit offset to start from the first.',
+      );
+      expect(h.upstream.count('/outcomes-at-location')).toBe(1);
+    });
+
+    it('keeps the empty-area notice when there was nothing to filter', async () => {
+      pointRoutes([]);
+      expect(data(await onStreet('granby')).notice).toBe(
+        'No outcomes published here for 2026-07; try another month or a wider area.',
+      );
+    });
+
+    it.each<[string, string, string]>([
+      [
+        'nothing but On or near',
+        'On or near',
+        "Needs a letter or digit besides 'On or near', which every street name starts with and matching drops.",
+      ],
+      [
+        'punctuation alone',
+        '--/',
+        "Needs a letter or digit besides 'On or near', which every street name starts with and matching drops.",
+      ],
+      ['over 100 characters', 'a'.repeat(101), 'Too big: expected string to have <=100 characters'],
+    ])(
+      'rejects a value of %s as invalid_arguments before any request',
+      async (_name, street, message) => {
+        const error = errorOf(await callRaw({ ...POINT, street_name_contains: street }));
+        expect(error.code).toBe(JsonRpcErrorCode.InvalidParams);
+        expect(error.data.reason).toBe('invalid_arguments');
+        expect(error.data.issues).toMatchObject([{ path: ['street_name_contains'], message }]);
+        expect(h.upstream.calls).toHaveLength(0);
+      },
+    );
+  });
+
+  describe('category, outcome and street_name_contains together', () => {
+    it('ANDs all three; one notice carries the month, matched-street and paging fragments; every echo prints, in order', async () => {
+      pointRoutes(withCautions());
+      const result = await call({
+        ...POINT,
+        category: 'burglary',
+        outcome: 'cautioned',
+        street_name_contains: 'granby',
+        limit: 2,
+      });
+      const out = data(result);
+      expect([out.month, out.total, out.unfiltered_total]).toEqual(['2026-08', 3, 43]);
+      expect(out.outcomes.map((o) => o.crime.id)).toEqual(crimeIds([0, 15]));
+      expect(out.by_category).toEqual([{ value: 'burglary', count: 3 }]);
+      expect(out.by_outcome).toEqual([{ ...CAUTION, count: 3 }]);
+      expect(out.notice).toBe(
+        `${MONTH_NOTE} street_name_contains matched 2 street names: "Granby Street", "Granby Place". Showing 1–2 of 3; call again with offset 2 for more.`,
+      );
+      expect(text(result)).toContain(
+        '**Crime category:** Burglary (burglary)\n**Outcome:** "cautioned"\n**Street name contains:** "granby"\n**Outcomes matched:** 3 of 43 published for this month\n',
+      );
+    });
+
+    it('on a zero from a non-empty category set, one sentence carries the outcome and street clauses, both read after category', async () => {
+      pointRoutes(withCautions());
+      const out = data(
+        await call({
+          ...POINT,
+          month: '2026-07',
+          category: 'burglary',
+          outcome: 'awaiting-court-result',
+          street_name_contains: 'granby',
+        }),
+      );
+      expect([out.total, out.unfiltered_total]).toEqual([0, 43]);
+      expect(out.notice).toBe(
+        'No outcomes matched the filters; values present for outcome: "under-investigation", "cautioned"; street names present: "Granby Street", "Highcross Street", "Belgrave-Gate", "Granby Place", "Siemen\'S Street", "Theatre/concert Hall".',
+      );
+    });
+
+    it('format() renders the outcome and street echoes only when present, caller text kept inert', () => {
+      const render = (extra: Partial<z.output<typeof searchOutcomesTool.output>>) =>
+        (
+          searchOutcomesTool.format?.({
+            month: '2026-08',
+            area: { type: 'point', lat: LAT, lng: LNG },
+            total: 0,
+            by_category: [],
+            unfiltered_total: 3,
+            by_outcome: [],
+            by_crime_month: [],
+            outcomes: [],
+            ...extra,
+          }) ?? []
+        )
+          .map((block) => (block.type === 'text' ? block.text : ''))
+          .join('');
+      const bare = render({});
+      expect(bare).toContain('\n**Outcomes matched:** 0 of 3 published for this month\n');
+      expect(bare).not.toContain('**Outcome:**');
+      expect(bare).not.toContain('Street name contains');
+      expect(
+        render({ outcome: 'a\\b [c](d)\n<e>', street_name_contains: 'x\\y\r\n[z] <w>' }),
+      ).toContain(
+        '\n**Outcome:** "a\\\\b \\[c\\](d) \\<e\\>"\n**Street name contains:** "x\\\\y \\[z\\] \\<w\\>"\n**Outcomes matched:** 0 of 3 published for this month\n',
+      );
+    });
+  });
+
   describe('month', () => {
     it('adds the defaulted-month fragment only when no month was given', async () => {
       pointRoutes();
@@ -887,7 +1350,11 @@ describe('ukcrime_search_outcomes', () => {
       pointRoutes([], locateBody({ force: 'devon-and-cornwall', neighbourhood: 'DC1' }));
       const out = data(await call({ ...POINT }));
       expect(out.notice).toBe(
-        [MONTH_NOTE, ...coverageNotes('devon-and-cornwall', ['outcomes']), ZERO_GENERIC].join(' '),
+        [
+          MONTH_NOTE,
+          ...coverageNotes('devon-and-cornwall', ['outcomes'], ['2026-08']),
+          ZERO_GENERIC,
+        ].join(' '),
       );
     });
 
@@ -898,7 +1365,9 @@ describe('ukcrime_search_outcomes', () => {
         const result = await call({ area: 'point', lat: 54.595, lng: -5.93 });
         const out = data(result);
         expect(out.total).toBe(0);
-        expect(out.notice).toBe([MONTH_NOTE, ...coverageNotes(force, ['outcomes'])].join(' '));
+        expect(out.notice).toBe(
+          [MONTH_NOTE, ...coverageNotes(force, ['outcomes'], ['2026-08'])].join(' '),
+        );
         expect(text(result)).toContain(`> ${out.notice}`);
       },
     );
@@ -906,7 +1375,9 @@ describe('ukcrime_search_outcomes', () => {
     it('drops the generic fragment with a category too, when the force publishes no outcomes', async () => {
       pointRoutes([], locateBody({ force: 'northern-ireland', neighbourhood: 'ZZ1' }));
       const out = data(await call({ ...POINT, month: '2026-07', category: 'burglary' }));
-      expect(out.notice).toBe(coverageNotes('northern-ireland', ['outcomes']).join(' '));
+      expect(out.notice).toBe(
+        coverageNotes('northern-ireland', ['outcomes'], ['2026-07']).join(' '),
+      );
     });
 
     it('does the same on the neighbourhood arm of a force that publishes no outcomes', async () => {
@@ -920,7 +1391,9 @@ describe('ukcrime_search_outcomes', () => {
           month: '2026-07',
         }),
       );
-      expect(out.notice).toBe(coverageNotes('greater-manchester', ['outcomes']).join(' '));
+      expect(out.notice).toBe(
+        coverageNotes('greater-manchester', ['outcomes'], ['2026-07']).join(' '),
+      );
     });
 
     it('no zero-hit fragment when a point lookup failed (no coverage claim is possible)', async () => {
@@ -934,21 +1407,124 @@ describe('ukcrime_search_outcomes', () => {
     });
   });
 
-  describe('coverage notes (the outcomes aspect only)', () => {
+  describe('coverage facts that start at a month (Gloucestershire outcomes from 2026-02)', () => {
+    const GLOUC_OUTCOMES =
+      'Gloucestershire Constabulary has sent no outcome data to data.police.uk since 2026-02';
+    const zeroIn = (month: string) =>
+      `No outcomes published here for ${month}; try another month or a wider area.`;
+
+    describe('a located single force (point)', () => {
+      const inGloucestershire = () =>
+        pointRoutes([], locateBody({ force: 'gloucestershire', neighbourhood: 'GL1' }));
+
+      it('the month before: no note, and the zero line', async () => {
+        inGloucestershire();
+        const out = data(await call({ ...POINT, month: '2026-01' }));
+        expect(out.area.located_force).toBe('gloucestershire');
+        expect(out.notice).toBe(zeroIn('2026-01'));
+      });
+
+      it('the from-month itself: the dated note alone, on both surfaces', async () => {
+        inGloucestershire();
+        const result = await call({ ...POINT, month: '2026-02' });
+        const out = data(result);
+        expect(out.notice).toBe(
+          coverageNotes('gloucestershire', ['outcomes'], ['2026-02']).join(' '),
+        );
+        expect(out.notice).toContain(GLOUC_OUTCOMES);
+        expect(out.notice).not.toContain('No outcomes published here');
+        expect(text(result)).toContain(`> ${out.notice}`);
+      });
+
+      it('a later month with outcomes: the dated note beside them', async () => {
+        pointRoutes(outcomesBody(), locateBody({ force: 'gloucestershire', neighbourhood: 'GL1' }));
+        const out = data(await call({ ...POINT, month: '2026-08' }));
+        expect(out.total).toBeGreaterThan(0);
+        expect(out.notice).toBe(
+          coverageNotes('gloucestershire', ['outcomes'], ['2026-08']).join(' '),
+        );
+      });
+    });
+
+    describe('a polygon locating more than one force', () => {
+      const located = (north: string) => {
+        h.upstream.route('POST', '/outcomes-at-location', jsonOk([]));
+        h.upstream.route(
+          'GET',
+          '/locate-neighbourhood',
+          locateBy({
+            [STRADDLE_SAMPLES.centre]: 'gloucestershire',
+            [STRADDLE_SAMPLES.north]: north,
+            [STRADDLE_SAMPLES.south]: 'gloucestershire',
+            [STRADDLE_SAMPLES.east]: north,
+          }),
+        );
+      };
+      const STRADDLE = { area: 'polygon', polygon: [...STRADDLE_RING] } as const;
+
+      it('the month before: the undated force note and the zero line', async () => {
+        located('greater-manchester');
+        const out = data(await call({ ...STRADDLE, month: '2026-01' }));
+        expect(out.area.located_forces).toEqual(['gloucestershire', 'greater-manchester']);
+        expect(out.notice).toBe(
+          [
+            ...coverageNotes('greater-manchester', ['outcomes'], ['2026-01']),
+            zeroIn('2026-01'),
+          ].join(' '),
+        );
+        expect(out.notice).not.toContain(GLOUC_OUTCOMES);
+      });
+
+      it('the from-month itself: both notes in force-id order, and no zero line', async () => {
+        located('greater-manchester');
+        const out = data(await call({ ...STRADDLE, month: '2026-02' }));
+        expect(out.notice).toBe(
+          [
+            ...coverageNotes('gloucestershire', ['outcomes'], ['2026-02']),
+            ...coverageNotes('greater-manchester', ['outcomes'], ['2026-02']),
+          ].join(' '),
+        );
+        expect(out.notice).toContain(GLOUC_OUTCOMES);
+      });
+
+      it('beside a force that publishes: the dated note and the zero line', async () => {
+        located('leicestershire');
+        const out = data(await call({ ...STRADDLE, month: '2026-02' }));
+        expect(out.area.located_forces).toEqual(['gloucestershire', 'leicestershire']);
+        expect(out.notice).toBe(
+          [...coverageNotes('gloucestershire', ['outcomes'], ['2026-02']), zeroIn('2026-02')].join(
+            ' ',
+          ),
+        );
+        expect(out.notice).toContain(GLOUC_OUTCOMES);
+      });
+    });
+  });
+
+  describe('coverage notes (the outcomes and locations aspects)', () => {
     it.each(['greater-manchester', 'northern-ireland', 'devon-and-cornwall'])(
       'adds the dated outcomes fact for a located %s point',
       async (force) => {
         pointRoutes(outcomesBody(), locateBody({ force, neighbourhood: 'ZZ1' }));
         const out = data(await call({ ...POINT, month: '2026-07' }));
-        const facts = coverageNotes(force, ['outcomes']);
+        const facts = coverageNotes(force, ['outcomes'], ['2026-07']);
         expect(facts).toHaveLength(1);
         expect(out.notice).toBe(facts[0]);
-        expect(out.notice).toContain('(data.police.uk known issues, verified 2026-10-01)');
+        expect(out.notice).toContain('(data.police.uk known issues, verified 2026-11-25)');
       },
     );
 
-    it('says nothing for forces whose table facts concern other aspects', async () => {
-      for (const force of ['avon-and-somerset', 'leicestershire', 'metropolitan']) {
+    it("adds Avon and Somerset's missing-coordinates fact, since an area search misses the outcomes of crimes with no location", async () => {
+      pointRoutes(outcomesBody(), locateBody({ force: 'avon-and-somerset', neighbourhood: 'ZZ1' }));
+      const result = await call({ ...POINT, month: '2026-07' });
+      const note =
+        'Avon and Somerset Constabulary sends some crimes each month without coordinates, so area searches there undercount its crimes and their outcomes (data.police.uk known issues, verified 2026-11-25).';
+      expect(data(result).notice).toBe(note);
+      expect(text(result)).toContain(`> ${note}`);
+    });
+
+    it('says nothing for forces the table has no facts for', async () => {
+      for (const force of ['leicestershire', 'metropolitan']) {
         pointRoutes(outcomesBody(), locateBody({ force, neighbourhood: 'ZZ1' }));
         const out = data(
           await call({ ...POINT, month: '2026-07', lat: LAT + 0.01 * force.length }),
@@ -968,7 +1544,9 @@ describe('ukcrime_search_outcomes', () => {
           month: '2026-07',
         }),
       );
-      expect(out.notice).toBe(coverageNotes('greater-manchester', ['outcomes']).join(' '));
+      expect(out.notice).toBe(
+        coverageNotes('greater-manchester', ['outcomes'], ['2026-07']).join(' '),
+      );
     });
 
     it('carries no crime-aspect fact (Northern Ireland placeholder outcomes are a crimes note)', async () => {
@@ -994,7 +1572,7 @@ describe('ukcrime_search_outcomes', () => {
     ];
     const every = (samples: readonly string[], force: string) =>
       Object.fromEntries(samples.map((q) => [q, force]));
-    const NI_NOTE = coverageNotes('northern-ireland', ['outcomes']);
+    const NI_NOTE = coverageNotes('northern-ireland', ['outcomes'], ['2026-07']);
     const JULY_GENERIC =
       'No outcomes published here for 2026-07; try another month or a wider area.';
 
@@ -1041,7 +1619,11 @@ describe('ukcrime_search_outcomes', () => {
         'northern-ireland',
       ]);
       expect(out.notice).toBe(
-        [...coverageNotes('devon-and-cornwall', ['outcomes']), ...NI_NOTE, JULY_GENERIC].join(' '),
+        [
+          ...coverageNotes('devon-and-cornwall', ['outcomes'], ['2026-07']),
+          ...NI_NOTE,
+          JULY_GENERIC,
+        ].join(' '),
       );
     });
 
@@ -1061,7 +1643,7 @@ describe('ukcrime_search_outcomes', () => {
         await call({ area: 'polygon', polygon: [...STRADDLE_RING], month: '2026-07' }),
       );
       expect(out.notice).toBe(
-        [...coverageNotes('greater-manchester', ['outcomes']), ...NI_NOTE].join(' '),
+        [...coverageNotes('greater-manchester', ['outcomes'], ['2026-07']), ...NI_NOTE].join(' '),
       );
     });
 
@@ -1147,7 +1729,9 @@ describe('ukcrime_search_outcomes', () => {
         located_force: 'devon-and-cornwall',
         located_neighbourhood: 'NX01',
       });
-      expect(out.notice).toBe(coverageNotes('devon-and-cornwall', ['outcomes']).join(' '));
+      expect(out.notice).toBe(
+        coverageNotes('devon-and-cornwall', ['outcomes'], ['2026-07']).join(' '),
+      );
       expect(h.upstream.calls.map((c) => c.path).indexOf('/locate-neighbourhood')).toBeGreaterThan(
         h.upstream.calls.map((c) => c.path).indexOf('/outcomes-at-location'),
       );
